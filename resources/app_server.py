@@ -175,14 +175,14 @@ def draw_counts(frame, class_counters, label):
     class_names = {
     0: "",
     1: "100plus",
-    2: "cocacola",
-    3: "coconut",
-    4: "lemon",
-    5: "orange",
-    6: "chickenKatsuCurry",
-    7: "chickenKatsuCurry",
-    8: "kimchiFriedRice",
-    9: "kimchiTuna",
+    2: "chickenKatsuCurry",
+    3: "cocacola",
+    4: "coconut", 
+    5: "dakgangjeongRice",
+    6: "kimchiFriedRice", 
+    7: "kimchiTuna",
+    8: "lemon", 
+    9: "orange",
         
         
         
