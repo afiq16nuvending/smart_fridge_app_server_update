@@ -178,6 +178,14 @@ def draw_counts(frame, class_counters, label):
     2: "cocacola",
     3: "coconut",
     4: "lemon",
+    5: "orange",
+    6: "chickenKatsuCurry",
+    7: "chickenKatsuCurry",
+    8: "kimchiFriedRice",
+    9: "kimchiTuna",
+        
+        
+        
  
 }
     
