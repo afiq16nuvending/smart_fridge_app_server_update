@@ -151,7 +151,7 @@ GPIO.setwarnings(False)             # Suppress warnings
 # Setup outputs with initial states
 GPIO.setup(BUZZER_PIN, GPIO.OUT, initial=GPIO.HIGH)      # Buzzer OFF (active low)
 GPIO.setup(LED_GREEN, GPIO.OUT, initial=GPIO.HIGH)       # Green LED OFF
-GPIO.setup(LED_RED, GPIO.OUT, initial=GPIO.HIGH)         # Red LED OFF (will turn on when alert)
+GPIO.setup(LED_RED, GPIO.OUT, initial=GPIO.HIGH)         # Red LED ON (will turn on when alert)
 GPIO.setup(DOOR_LOCK_PIN, GPIO.OUT, initial=GPIO.HIGH)   # Door LOCKED
 
 # Setup input
@@ -5124,7 +5124,7 @@ async def websocket_endpoint(websocket: WebSocket):
     # =================================================================
     GPIO.output(DOOR_LOCK_PIN, GPIO.LOW)   # Unlock door
     GPIO.output(LED_RED, GPIO.LOW)          # Turn off red LED
-    GPIO.output(LED_GREEN, GPIO.LOW)        # Turn off green LED
+    GPIO.output(LED_GREEN, GPIO.LOW)        # Turn on green LED
     
     try:
         # =============================================================
