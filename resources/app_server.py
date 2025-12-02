@@ -151,7 +151,7 @@ GPIO.setwarnings(False)             # Suppress warnings
 # Setup outputs with initial states
 GPIO.setup(BUZZER_PIN, GPIO.OUT, initial=GPIO.HIGH)      # Buzzer OFF (active low)
 GPIO.setup(LED_GREEN, GPIO.OUT, initial=GPIO.HIGH)       # Green LED OFF
-GPIO.setup(LED_RED, GPIO.OUT, initial=GPIO.HIGH)         # Red LED ON (will turn on when alert)
+GPIO.setup(LED_RED, GPIO.OUT, initial=GPIO.HIGH)         # Red LED ON 
 GPIO.setup(DOOR_LOCK_PIN, GPIO.OUT, initial=GPIO.HIGH)   # Door LOCKED
 
 # Setup input
@@ -283,9 +283,9 @@ def blink_led(pin, times, delay):
         blink_led(LED_RED, 5, 0.5)    # Blink red LED 5 times slowly
     """
     for _ in range(times):
-        GPIO.output(pin, GPIO.HIGH)  # Turn LED ON
+        GPIO.output(pin, GPIO.HIGH)  # Turn LED_RED ON , Turn LED_GREEN OFF
         time.sleep(delay)            # Wait
-        GPIO.output(pin, GPIO.LOW)   # Turn LED OFF
+        GPIO.output(pin, GPIO.LOW)   # Turn LED_RED OFF , Turn LED_GREEN ON
         time.sleep(delay)            # Wait before next cycle
           
 
@@ -969,7 +969,7 @@ def display_user_data_frame(user_data):
             # Clean GPIO - reset all outputs to safe state
             GPIO.output(DOOR_LOCK_PIN, GPIO.HIGH)   # Lock door
             GPIO.output(LED_GREEN, GPIO.HIGH)        # Turn off green LED
-            GPIO.output(LED_RED, GPIO.HIGH)          # Turn off red LED
+            GPIO.output(LED_RED, GPIO.HIGH)          # Turn on red LED
         except Exception as e:
             print(f"Error cleaning up GPIO: {e}")
         
@@ -5237,7 +5237,7 @@ async def websocket_endpoint(websocket: WebSocket):
         GPIO.output(DOOR_LOCK_PIN, GPIO.HIGH)  # Lock door
         time.sleep(0.3)                         # Small delay
         GPIO.output(LED_GREEN, GPIO.HIGH)       # Turn off green LED
-        GPIO.output(LED_RED, GPIO.HIGH)         # Turn off red LED
+        GPIO.output(LED_RED, GPIO.HIGH)         # Turn on red LED
         
         # -------------------------------------------------------------
         # Print memory statistics every 10 transactions
