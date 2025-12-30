@@ -415,26 +415,6 @@ def draw_trail(frame, track_id, center, color, global_id=None):
 # =====================================================================
 
 def draw_counts(frame, class_counters, label):
- """
-    Draw entry/exit counts on the video frame.
-    
-    Displays:
-    1. Total entry count (all products)
-    2. Total exit count (all products)
-    3. Per-product entry and exit counts
-    
-    Args:
-        frame (numpy.ndarray): Video frame to draw on
-        class_counters (dict): Dictionary with 'entry' and 'exit' counts
-        label (str): Current product label being processed
-        
-    Layout on screen:
-        Top: Total Entry: X
-             Total Exit: Y
-        Below: [Product Name] Entry: X, Exit: Y (color-coded)
-    """
-    # Product name mapping (class ID to product name)
-    
     
     class_names = {
     0: "",
@@ -453,43 +433,35 @@ def draw_counts(frame, class_counters, label):
  
 }
     
-    # Calculate total counts across all products
+    """Draw both entry and exit counts on frame"""
+    # Calculate totals
     total_entry = sum(class_counters["entry"].values())
     total_exit = sum(class_counters["exit"].values())
     
-    # Draw total entry count (green text, top left)
+    # Draw total counts
     cv2.putText(frame, f'Total Entry: {total_entry}', (30, 50),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-    
-    # Draw total exit count (green text, below entry)
     cv2.putText(frame, f'Total Exit: {total_exit}', (30, 80),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
     
-    # Starting Y position for per-product counts
-    y_offset = 110
+    # Draw class-specific counts (combined entry and exit on same line)
+    y_offset = 110  # Starting y position for class counts
     
-    # Get all unique product labels from both entry and exit
+    # Get all unique labels from both entry and exit counters
     all_labels = set(class_counters["entry"].keys()) | set(class_counters["exit"].keys())
     
-    # Draw counts for each product
     for label in all_labels:
-        # Get counts (default to 0 if not present)
         entry_count = class_counters["entry"].get(label, 0)
         exit_count = class_counters["exit"].get(label, 0)
         
-        # Get class ID for color coding
         class_id = next(k for k, v in class_names.items() if v == label)
         color = compute_color_for_labels(class_id)
         
-        # Format text: "ProductName Entry: X, Exit: Y"
         text = f'{label} Entry: {entry_count}, Exit: {exit_count}'
-        
-        # Draw product count (color-coded by product)
         cv2.putText(frame, text, (30, y_offset),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-        
-        # Move down for next product
         y_offset += 30
+
 
 # =====================================================================
 # DETECTION ZONE VISUALIZATION
