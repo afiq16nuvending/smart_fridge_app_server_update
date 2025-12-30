@@ -415,7 +415,7 @@ def draw_trail(frame, track_id, center, color, global_id=None):
 # =====================================================================
 
 def draw_counts(frame, class_counters, label):
-    """
+ """
     Draw entry/exit counts on the video frame.
     
     Displays:
@@ -434,13 +434,24 @@ def draw_counts(frame, class_counters, label):
         Below: [Product Name] Entry: X, Exit: Y (color-coded)
     """
     # Product name mapping (class ID to product name)
-        class_names = {
-                0: "",                      # Empty for person class
-                1: "chickenKatsuCurry",
-                2: "dakgangjeongRice",
-                3: "kimchiFriedRice", 
-                4: "kimchiTuna",
-        }
+    
+    
+    class_names = {
+    0: "",
+    1: "100plus",
+    2: "chickenKatsuCurry",
+    3: "cocacola",
+    4: "coconut", 
+    5: "dakgangjeongRice",
+    6: "kimchiFriedRice", 
+    7: "kimchiTuna",
+    8: "lemon", 
+    9: "orange",
+        
+        
+        
+ 
+}
     
     # Calculate total counts across all products
     total_entry = sum(class_counters["entry"].values())
