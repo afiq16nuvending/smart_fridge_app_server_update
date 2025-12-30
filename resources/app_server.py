@@ -415,7 +415,25 @@ def draw_trail(frame, track_id, center, color, global_id=None):
 # =====================================================================
 
 def draw_counts(frame, class_counters, label):
+     """
+    Draw entry/exit counts on the video frame.
     
+    Displays:
+    1. Total entry count (all products)
+    2. Total exit count (all products)
+    3. Per-product entry and exit counts
+    
+    Args:
+        frame (numpy.ndarray): Video frame to draw on
+        class_counters (dict): Dictionary with 'entry' and 'exit' counts
+        label (str): Current product label being processed
+        
+    Layout on screen:
+        Top: Total Entry: X
+             Total Exit: Y
+        Below: [Product Name] Entry: X, Exit: Y (color-coded)
+    """
+    # Product name mapping (class ID to product name)
     class_names = {
     0: "",
     1: "100plus",
