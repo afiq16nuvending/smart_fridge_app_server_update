@@ -434,13 +434,13 @@ def draw_counts(frame, class_counters, label):
         Below: [Product Name] Entry: X, Exit: Y (color-coded)
     """
     # Product name mapping (class ID to product name)
- class_names = {
-        0: "",                      # Empty for person class
-        1: "chickenKatsuCurry",
-        2: "dakgangjeongRice",
-        3: "kimchiFriedRice", 
-        4: "kimchiTuna",
-    }
+        class_names = {
+                0: "",                      # Empty for person class
+                1: "chickenKatsuCurry",
+                2: "dakgangjeongRice",
+                3: "kimchiFriedRice", 
+                4: "kimchiTuna",
+        }
     
     # Calculate total counts across all products
     total_entry = sum(class_counters["entry"].values())
