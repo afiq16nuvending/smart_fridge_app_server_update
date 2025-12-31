@@ -441,7 +441,6 @@ def draw_counts(frame, class_counters, label):
     3: "kimchiFriedRice",
     4: "kimchiTuna", 
       
- 
 }
     
     """Draw both entry and exit counts on frame"""
