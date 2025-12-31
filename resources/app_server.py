@@ -415,7 +415,7 @@ def draw_trail(frame, track_id, center, color, global_id=None):
 # =====================================================================
 
 def draw_counts(frame, class_counters, label):
-     """
+    """
     Draw entry/exit counts on the video frame.
     
     Displays:
@@ -435,18 +435,20 @@ def draw_counts(frame, class_counters, label):
     """
     # Product name mapping (class ID to product name)
     class_names = {
-            0: "",                      # Empty for person class
-            1: "100plus",
-            2: "chickenKatsuCurry",
-            3: "cocacola",
-            4: "coconut", 
-            5: "dakgangjeongRice",
-            6: "kimchiFriedRice", 
-            7: "kimchiTuna",
-            8: "lemon", 
-            9: "orange",       
-    
-         
+    0: "",
+    1: "100plus",
+    2: "chickenKatsuCurry",
+    3: "cocacola",
+    4: "coconut", 
+    5: "dakgangjeongRice",
+    6: "kimchiFriedRice", 
+    7: "kimchiTuna",
+    8: "lemon", 
+    9: "orange",
+        
+        
+        
+ 
 }
     
     """Draw both entry and exit counts on frame"""
@@ -477,7 +479,6 @@ def draw_counts(frame, class_counters, label):
         cv2.putText(frame, text, (30, y_offset),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
         y_offset += 30
-
 
 # =====================================================================
 # DETECTION ZONE VISUALIZATION
