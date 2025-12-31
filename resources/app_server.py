@@ -447,7 +447,6 @@ def draw_counts(frame, class_counters, label):
             9: "orange",
     
          
- 
 }
     
     """Draw both entry and exit counts on frame"""
