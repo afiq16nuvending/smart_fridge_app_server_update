@@ -3299,7 +3299,7 @@ async def run_tracking(websocket: WebSocket):
             print("\n" + "-"*30)
             print("CAMERA 1 CAPTURE PHASE")
             print("-"*30)
-            camera1_images = capture_images(0, image_count)
+            camera1_images = capture_images(2, image_count)
             
             # ---------------------------------------------------
             # Process Results
