@@ -2523,6 +2523,7 @@ Result: Only count once, not twice!
 
 def get_global_track_id(camera_id, local_track_id, features=None, label=None):
     """
+
     Get or create a global track ID for cross-camera tracking.
     
     This is the HEART of the cross-camera tracking system. It implements
@@ -2558,54 +2559,95 @@ def get_global_track_id(camera_id, local_track_id, features=None, label=None):
         local_to_global_id_map: Mapping of (camera_id, local_id) → global_id
         global_track_labels: Stores label for each global_id
         active_objects_per_camera: Tracks active objects per camera/label
+        
+    Get or create a global track ID for cross-camera tracking.
+    
+    UPDATED: Now checks recently_lost_objects to reuse global IDs
+    when objects move between cameras instead of creating duplicates.
     """
     global global_track_counter, local_to_global_id_map, global_track_labels
     global active_objects_per_camera
+    global recently_lost_objects, global_id_lock_until
     
-    # STEP 1: Check if this local track already has a global ID (RULE 1)
+    # Check if this local track already has a global ID
     if (camera_id, local_track_id) in local_to_global_id_map:
         return local_to_global_id_map[(camera_id, local_track_id)]
     
-    # STEP 2: Handle case where no label provided
+    # ============================================================
+    # CRITICAL FIX: Check if same label was recently lost
+    # This prevents double-counting when objects move between cameras
+    # ============================================================
+    if label:
+        current_time = time.time()
+        
+        # Look for recently lost objects with same label
+        for global_id, lost_time in list(recently_lost_objects.items()):
+            # Check if:
+            # 1. This global_id has the right label
+            # 2. It was lost within grace period (1.0 second - tuned for your 0.5-1.5s handoff)
+            # 3. It's currently locked to prevent premature reuse
+            if (global_id in global_track_labels and 
+                global_track_labels[global_id] == label and
+                current_time - lost_time < 1.0 and  # 1.0s grace period
+                global_id in global_id_lock_until and
+                current_time < global_id_lock_until[global_id]):
+                
+                # REUSE the recently lost global_id instead of creating new one
+                local_to_global_id_map[(camera_id, local_track_id)] = global_id
+                if label not in active_objects_per_camera[camera_id]:
+                    active_objects_per_camera[camera_id][label] = {}
+                active_objects_per_camera[camera_id][label][local_track_id] = global_id
+                
+                # Remove from recently_lost since it's active again
+                recently_lost_objects.pop(global_id, None)
+                global_id_lock_until.pop(global_id, None)
+                
+                print(f"[REUSE] Camera {camera_id} reusing Global ID {global_id} for {label}")
+                
+                return global_id
+    # ============================================================
+    
     if not label:
-        # No label = can't match across cameras, create new global ID
+        # If no label, just create a new global ID
         new_global_id = global_track_counter
         global_track_counter += 1
         local_to_global_id_map[(camera_id, local_track_id)] = new_global_id
         return new_global_id
     
-    # STEP 3: Check for cross-camera matching opportunity (RULE 3)
-    other_camera = 1 if camera_id == 0 else 0  # Get opposite camera
+    # Check for cross-camera matching opportunity
+    other_camera = 1 if camera_id == 0 else 0
     
-    # Look for objects with same label on other camera
+    # Look for objects with the same label on the other camera that aren't matched yet
     available_matches = []
     if label in active_objects_per_camera[other_camera]:
-        # Iterate through all objects with this label on other camera
         for other_local_id, other_global_id in active_objects_per_camera[other_camera][label].items():
-            # Check if this global_id is already matched to another object on our camera
+            # Check if this global_id is already being used by another object on our camera
             already_matched_on_this_camera = False
-            for our_local_id, our_global_id in active_objects_per_camera[camera_id][label].items():
-                if our_global_id == other_global_id:
-                    already_matched_on_this_camera = True
-                    break
+            if label in active_objects_per_camera[camera_id]:
+                for our_local_id, our_global_id in active_objects_per_camera[camera_id][label].items():
+                    if our_global_id == other_global_id:
+                        already_matched_on_this_camera = True
+                        break
             
-            # If not already matched, this is an available match
             if not already_matched_on_this_camera:
                 available_matches.append((other_local_id, other_global_id))
     
-    # STEP 4: Use available match if found
+    # If we found an available match on the other camera, use its global ID
     if available_matches:
-        # Use first available match (could add distance-based matching here)
         matched_local_id, matched_global_id = available_matches[0]
         local_to_global_id_map[(camera_id, local_track_id)] = matched_global_id
+        if label not in active_objects_per_camera[camera_id]:
+            active_objects_per_camera[camera_id][label] = {}
         active_objects_per_camera[camera_id][label][local_track_id] = matched_global_id
         global_track_labels[matched_global_id] = label
         return matched_global_id
     
-    # STEP 5: No match found, create new global ID (RULE 2 or RULE 4)
+    # No cross-camera match found, create a new global ID
     new_global_id = global_track_counter
     global_track_counter += 1
     local_to_global_id_map[(camera_id, local_track_id)] = new_global_id
+    if label not in active_objects_per_camera[camera_id]:
+        active_objects_per_camera[camera_id][label] = {}
     active_objects_per_camera[camera_id][label][local_track_id] = new_global_id
     global_track_labels[new_global_id] = label
     
