@@ -2611,9 +2611,10 @@ def get_global_track_id(camera_id, local_track_id, features=None, label=None):
     
     return new_global_id
 
+
 def cleanup_inactive_tracks(camera_id, active_local_track_ids):
     """
-    Clean up tracking data for tracks that are no longer active.
+  Clean up tracking data for tracks that are no longer active.
     
     Why Needed?
     - Objects leave the frame (customer puts item back)
@@ -2639,7 +2640,8 @@ def cleanup_inactive_tracks(camera_id, active_local_track_ids):
         Frame: Only tracks [5, 12] detected
         After: Track 8 data cleaned up (no longer active)
     """
-   global local_to_global_id_map
+
+    global local_to_global_id_map
     global active_objects_per_camera
     global recently_lost_objects
     global global_id_lock_until
