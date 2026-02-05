@@ -120,6 +120,15 @@ from scipy.spatial import distance
 import weakref
 import setproctitle
 
+class TrackingData:
+    def __init__(self):
+        self.counted_tracks = {
+            'entry': set(),
+            'exit': set()
+        }
+
+tracking_data = TrackingData()
+
 # =====================================================================
 # GLOBAL VARIABLES AND CONFIGURATION
 # =====================================================================
@@ -208,6 +217,9 @@ global_trails = defaultdict(lambda: deque(maxlen=30))
 # CROSS-CAMERA TRACKING STRUCTURES
 # =====================================================================
 # These structures enable tracking the same object across multiple cameras
+
+recently_lost_objects = {}      # Tracks objects that just disappeared
+global_id_lock_until = {}       # Prevents reusing IDs too quickly
 
 # Global track counter for assigning unique IDs across cameras
 global_track_counter = 0
@@ -2613,6 +2625,9 @@ def cleanup_inactive_tracks(camera_id, active_local_track_ids):
     - Removes from active_objects_per_camera
     - Frees up global IDs for reuse
     
+    IMPORTANT UPGRADE:
+    Instead of deleting immediately, we mark objects as "recently lost"
+    to prevent double counting when switching between cameras.	
     Called every frame after processing detections.
     
     Args:
@@ -2624,28 +2639,64 @@ def cleanup_inactive_tracks(camera_id, active_local_track_ids):
         Frame: Only tracks [5, 12] detected
         After: Track 8 data cleaned up (no longer active)
     """
-    global local_to_global_id_map, active_objects_per_camera
-    
-    # Find inactive tracks for this camera
+   global local_to_global_id_map
+    global active_objects_per_camera
+    global recently_lost_objects
+    global global_id_lock_until
+    global global_track_labels
+
+    current_time = time.time()
+
+    # ============================================================
+    # STEP 1: Find inactive tracks
+    # ============================================================
     inactive_tracks = []
-    for (cam_id, local_id), global_id in local_to_global_id_map.items():
+
+    for (cam_id, local_id), global_id in list(local_to_global_id_map.items()):
         if cam_id == camera_id and local_id not in active_local_track_ids:
             inactive_tracks.append((cam_id, local_id, global_id))
-    
-    # Remove inactive tracks
+
+    # ============================================================
+    # STEP 2: Handle inactive tracks (SAFE CLEANUP)
+    # ============================================================
     for cam_id, local_id, global_id in inactive_tracks:
-        # Remove from local_to_global_id_map
+
+        # --------------------------------------------------------
+        # NEW: Mark as recently lost instead of deleting instantly
+        # --------------------------------------------------------
+        if global_id not in recently_lost_objects:
+            recently_lost_objects[global_id] = current_time
+
+        # Lock global ID briefly to prevent reassignment
+        global_id_lock_until[global_id] = current_time + 1.5  # seconds
+
+        # --------------------------------------------------------
+        # Remove LOCAL mapping only (keep global memory alive)
+        # --------------------------------------------------------
         del local_to_global_id_map[(cam_id, local_id)]
-        
-        # Remove from active_objects_per_camera
+
         label = global_track_labels.get(global_id)
+
         if label and label in active_objects_per_camera[cam_id]:
             if local_id in active_objects_per_camera[cam_id][label]:
                 del active_objects_per_camera[cam_id][label][local_id]
-                
-                # Clean up empty label entries
+
                 if not active_objects_per_camera[cam_id][label]:
                     del active_objects_per_camera[cam_id][label]
+
+    # ============================================================
+    # STEP 3: FULL CLEANUP after grace period expires
+    # ============================================================
+    GRACE_PERIOD = 2.0  # seconds
+
+    expired_ids = [
+        gid for gid, lost_time in recently_lost_objects.items()
+        if current_time - lost_time > GRACE_PERIOD
+    ]
+
+    for gid in expired_ids:
+        recently_lost_objects.pop(gid, None)
+        global_id_lock_until.pop(gid, None)
 
 # =====================================================================
 # MOVEMENT DIRECTION ANALYSIS
