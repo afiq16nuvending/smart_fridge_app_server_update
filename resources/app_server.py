@@ -436,21 +436,17 @@ def draw_counts(frame, class_counters, label):
     # Product name mapping (class ID to product name)
     class_names = {
     0: "",
-    1: "100plus",
-    2: "chickenKatsuCurry",
-    3: "cocacola",
-    4: "coconut", 
-    5: "dakgangjeongRice",
-    6: "dragonFruit", 
-    7: "guava",
-    8: "kimchiFriedRice", 
-    9: "kimchiTuna", 
-    10: "lemon",
-    11: "mango", 
-    12: "mangoMilk", 
-    13: "orange",
-    14: "pineappleHoney", 
-    15: "pinkGuava",  
+    1: "chickenKatsuCurry",
+    2: "dakgangjeongRice",
+    3: "dragonFruit",
+    4: "guava", 
+    5: "kimchiFriedRice",
+    6: "kimchiTuna", 
+    7: "mango",
+    8: "mangoMilk", 
+    9: "pineappleHoney", 
+   10: "pinkGuava", 
+   
       
 }
     
