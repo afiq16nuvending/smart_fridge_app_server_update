@@ -33,9 +33,9 @@ WORKFLOW:
 5. Door closes → Video saved → Refund processed
 6. System cleans up memory → Ready for next customer
 
-AUTHOR: Mike
-VERSION: 1.1
-LAST UPDATED: 23/2/2026
+AUTHOR: Afiq
+VERSION: 1.0
+LAST UPDATED: 2/12/2025
 =====================================================================
 """
 
@@ -2565,6 +2565,8 @@ def get_global_track_id(camera_id, local_track_id, features=None, label=None):
         global_track_labels: Stores label for each global_id
         active_objects_per_camera: Tracks active objects per camera/label
         
+    Get or create a global track ID for cross-camera tracking.
+    
     UPDATED: Now checks recently_lost_objects to reuse global IDs
     when objects move between cameras instead of creating duplicates.
     """
@@ -2583,14 +2585,11 @@ def get_global_track_id(camera_id, local_track_id, features=None, label=None):
     if label:
         current_time = time.time()
         
-        if recently_lost_objects:
-            print(f"[DEBUG] Camera {camera_id} new {label} | Lost objects: {recently_lost_objects} | Lock: {global_id_lock_until}")
-        
         # Look for recently lost objects with same label
         for global_id, lost_time in list(recently_lost_objects.items()):
             # Check if:
             # 1. This global_id has the right label
-            # 2. It was lost within grace period (1.0 second)
+            # 2. It was lost within grace period (1.0 second - tuned for your 0.5-1.5s handoff)
             # 3. It's currently locked to prevent premature reuse
             if (global_id in global_track_labels and 
                 global_track_labels[global_id] == label and
@@ -2662,7 +2661,7 @@ def get_global_track_id(camera_id, local_track_id, features=None, label=None):
 
 def cleanup_inactive_tracks(camera_id, active_local_track_ids):
     """
-    Clean up tracking data for tracks that are no longer active.
+  Clean up tracking data for tracks that are no longer active.
     
     Why Needed?
     - Objects leave the frame (customer puts item back)
@@ -2676,7 +2675,7 @@ def cleanup_inactive_tracks(camera_id, active_local_track_ids):
     
     IMPORTANT UPGRADE:
     Instead of deleting immediately, we mark objects as "recently lost"
-    to prevent double counting when switching between cameras.
+    to prevent double counting when switching between cameras.	
     Called every frame after processing detections.
     
     Args:
@@ -2712,7 +2711,7 @@ def cleanup_inactive_tracks(camera_id, active_local_track_ids):
     for cam_id, local_id, global_id in inactive_tracks:
 
         # --------------------------------------------------------
-        # Mark as recently lost instead of deleting instantly
+        # NEW: Mark as recently lost instead of deleting instantly
         # --------------------------------------------------------
         if global_id not in recently_lost_objects:
             recently_lost_objects[global_id] = current_time
@@ -2747,7 +2746,7 @@ def cleanup_inactive_tracks(camera_id, active_local_track_ids):
     for gid in expired_ids:
         recently_lost_objects.pop(gid, None)
         global_id_lock_until.pop(gid, None)
-        
+
 # =====================================================================
 # MOVEMENT DIRECTION ANALYSIS
 # =====================================================================
@@ -2968,7 +2967,7 @@ def detection_callback(pad, info, callback_data):
     # Extract callback data
     user_data = callback_data["user_data"]
     stream_id = callback_data["stream_id"]
- 
+    
     # Get buffer from probe info
     buffer = info.get_buffer()
     if buffer is None:
