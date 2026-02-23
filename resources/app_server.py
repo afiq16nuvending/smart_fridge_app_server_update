@@ -2567,6 +2567,7 @@ def get_global_track_id(camera_id, local_track_id, features=None, label=None):
         global_id_lock_until: Maps global_id → lock expiry time
         
     UPGRADED: 
+    - Detects mid-track label changes (AI reclassification) and re-evaluates
     - Reuses recently lost global IDs during blind handoffs
     - Scores cross-camera matches by lowest global_id (most stable)
     - Adds label count cap to prevent impossible duplicates
@@ -2575,11 +2576,41 @@ def get_global_track_id(camera_id, local_track_id, features=None, label=None):
     global active_objects_per_camera
     global recently_lost_objects, global_id_lock_until
     
+    # ============================================================
     # STEP 1: Check if this local track already has a global ID (RULE 1)
+    # UPGRADED: Now detects label changes mid-track.
+    # When AI reclassifies (e.g., dragonFruit → mango), the old
+    # mapping is removed so the track can be re-matched correctly.
+    # ============================================================
     if (camera_id, local_track_id) in local_to_global_id_map:
-        return local_to_global_id_map[(camera_id, local_track_id)]
+        existing_global_id = local_to_global_id_map[(camera_id, local_track_id)]
+        
+        # Check if the label changed for this track
+        if label and existing_global_id in global_track_labels:
+            old_label = global_track_labels[existing_global_id]
+            
+            if old_label != label:
+                # Label changed! Clean up old label tracking
+                if old_label in active_objects_per_camera[camera_id]:
+                    if local_track_id in active_objects_per_camera[camera_id][old_label]:
+                        del active_objects_per_camera[camera_id][old_label][local_track_id]
+                        if not active_objects_per_camera[camera_id][old_label]:
+                            del active_objects_per_camera[camera_id][old_label]
+                
+                # Remove old mapping so it gets re-evaluated below
+                del local_to_global_id_map[(camera_id, local_track_id)]
+                
+                print(f"[RELABEL] Camera {camera_id} track {local_track_id} changed {old_label} → {label}, re-evaluating G:{existing_global_id}")
+                
+                # Don't return — fall through to matching logic
+            else:
+                return existing_global_id
+        else:
+            return existing_global_id
     
+    # ============================================================
     # STEP 2: Handle case where no label provided
+    # ============================================================
     if not label:
         # No label = can't match across cameras, create new global ID
         new_global_id = global_track_counter
@@ -2700,7 +2731,9 @@ def get_global_track_id(camera_id, local_track_id, features=None, label=None):
             print(f"[CAP] Camera {camera_id} reusing Global ID {best_existing_id} for {label} (label count cap)")
             return best_existing_id
     
+    # ============================================================
     # STEP 6: Truly new object, create new global ID (RULE 2 or RULE 4)
+    # ============================================================
     new_global_id = global_track_counter
     global_track_counter += 1
     local_to_global_id_map[(camera_id, local_track_id)] = new_global_id
