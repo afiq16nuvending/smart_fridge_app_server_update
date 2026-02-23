@@ -2568,11 +2568,10 @@ def get_global_track_id(camera_id, local_track_id, features=None, label=None):
         
     UPDATED: Now checks recently_lost_objects to reuse global IDs
     when objects move between cameras instead of creating duplicates.
-    Uses frame counting instead of time.time() for Pi-friendly performance.
     """
     global global_track_counter, local_to_global_id_map, global_track_labels
     global active_objects_per_camera
-    global recently_lost_objects, global_id_lock_until, global_frame_counter
+    global recently_lost_objects, global_id_lock_until
     
     # Check if this local track already has a global ID
     if (camera_id, local_track_id) in local_to_global_id_map:
@@ -2581,24 +2580,24 @@ def get_global_track_id(camera_id, local_track_id, features=None, label=None):
     # ============================================================
     # CRITICAL FIX: Check if same label was recently lost
     # This prevents double-counting when objects move between cameras
-    # Uses frame counter instead of time.time() for consistent
-    # behavior even when Pi is under heavy load
     # ============================================================
     if label:
-        current_frame = global_frame_counter
+        current_time = time.time()
+        
         if recently_lost_objects:
-        	print(f"[DEBUG] Camera {camera_id} new {label} | Lost objects: {recently_lost_objects} | Lock: {global_id_lock_until}")
+            print(f"[DEBUG] Camera {camera_id} new {label} | Lost objects: {recently_lost_objects} | Lock: {global_id_lock_until}")
+        
         # Look for recently lost objects with same label
-        for global_id, lost_frame in list(recently_lost_objects.items()):
+        for global_id, lost_time in list(recently_lost_objects.items()):
             # Check if:
             # 1. This global_id has the right label
-            # 2. It was lost within grace period (15 frames ≈ 1.0s at 15fps)
+            # 2. It was lost within grace period (1.0 second)
             # 3. It's currently locked to prevent premature reuse
             if (global_id in global_track_labels and 
                 global_track_labels[global_id] == label and
-                current_frame - lost_frame < 15 and  # 15 frame grace period
+                current_time - lost_time < 1.0 and  # 1.0s grace period
                 global_id in global_id_lock_until and
-                current_frame < global_id_lock_until[global_id]):
+                current_time < global_id_lock_until[global_id]):
                 
                 # REUSE the recently lost global_id instead of creating new one
                 local_to_global_id_map[(camera_id, local_track_id)] = global_id
@@ -2679,7 +2678,6 @@ def cleanup_inactive_tracks(camera_id, active_local_track_ids):
     IMPORTANT UPGRADE:
     Instead of deleting immediately, we mark objects as "recently lost"
     to prevent double counting when switching between cameras.
-    Uses frame counting instead of time.time() for Pi-friendly performance.
     Called every frame after processing detections.
     
     Args:
@@ -2695,10 +2693,10 @@ def cleanup_inactive_tracks(camera_id, active_local_track_ids):
     global local_to_global_id_map
     global active_objects_per_camera
     global recently_lost_objects
-    global global_id_lock_until, global_frame_counter
+    global global_id_lock_until
     global global_track_labels
 
-    current_frame = global_frame_counter
+    current_time = time.time()
 
     # ============================================================
     # STEP 1: Find inactive tracks
@@ -2718,11 +2716,10 @@ def cleanup_inactive_tracks(camera_id, active_local_track_ids):
         # Mark as recently lost instead of deleting instantly
         # --------------------------------------------------------
         if global_id not in recently_lost_objects:
-            recently_lost_objects[global_id] = current_frame
+            recently_lost_objects[global_id] = current_time
 
         # Lock global ID briefly to prevent reassignment
-        # 20 frames ≈ 1.5s at 15fps
-        global_id_lock_until[global_id] = current_frame + 20
+        global_id_lock_until[global_id] = current_time + 1.5  # seconds
 
         # --------------------------------------------------------
         # Remove LOCAL mapping only (keep global memory alive)
@@ -2740,13 +2737,12 @@ def cleanup_inactive_tracks(camera_id, active_local_track_ids):
 
     # ============================================================
     # STEP 3: FULL CLEANUP after grace period expires
-    # 30 frames ≈ 2.0s at 15fps
     # ============================================================
-    GRACE_PERIOD = 30  # frames
+    GRACE_PERIOD = 2.0  # seconds
 
     expired_ids = [
-        gid for gid, lost_frame in recently_lost_objects.items()
-        if current_frame - lost_frame > GRACE_PERIOD
+        gid for gid, lost_time in recently_lost_objects.items()
+        if current_time - lost_time > GRACE_PERIOD
     ]
 
     for gid in expired_ids:
@@ -2973,9 +2969,7 @@ def detection_callback(pad, info, callback_data):
     # Extract callback data
     user_data = callback_data["user_data"]
     stream_id = callback_data["stream_id"]
-    global global_frame_counter
-    global_frame_counter += 1
-    
+ 
     # Get buffer from probe info
     buffer = info.get_buffer()
     if buffer is None:
