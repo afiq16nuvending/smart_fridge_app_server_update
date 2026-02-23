@@ -218,7 +218,6 @@ global_trails = defaultdict(lambda: deque(maxlen=30))
 # =====================================================================
 # These structures enable tracking the same object across multiple cameras
 
-global_frame_counter = 0
 recently_lost_objects = {}      # Tracks objects that just disappeared
 global_id_lock_until = {}       # Prevents reusing IDs too quickly
 
