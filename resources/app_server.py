@@ -2586,7 +2586,8 @@ def get_global_track_id(camera_id, local_track_id, features=None, label=None):
     # ============================================================
     if label:
         current_frame = global_frame_counter
-        
+        if recently_lost_objects:
+        	print(f"[DEBUG] Camera {camera_id} new {label} | Lost objects: {recently_lost_objects} | Lock: {global_id_lock_until}")
         # Look for recently lost objects with same label
         for global_id, lost_frame in list(recently_lost_objects.items()):
             # Check if:
