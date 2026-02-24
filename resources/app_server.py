@@ -120,6 +120,15 @@ from scipy.spatial import distance
 import weakref
 import setproctitle
 
+class TrackingData:
+    def __init__(self):
+        self.counted_tracks = {
+            'entry': set(),
+            'exit': set()
+        }
+
+tracking_data = TrackingData()
+
 # =====================================================================
 # GLOBAL VARIABLES AND CONFIGURATION
 # =====================================================================
@@ -208,6 +217,9 @@ global_trails = defaultdict(lambda: deque(maxlen=30))
 # CROSS-CAMERA TRACKING STRUCTURES
 # =====================================================================
 # These structures enable tracking the same object across multiple cameras
+
+recently_lost_objects = {}      # Tracks objects that just disappeared
+global_id_lock_until = {}       # Prevents reusing IDs too quickly
 
 # Global track counter for assigning unique IDs across cameras
 global_track_counter = 0
@@ -436,17 +448,22 @@ def draw_counts(frame, class_counters, label):
     # Product name mapping (class ID to product name)
     class_names = {
     0: "",
-    1: "chickenKatsuCurry",
-    2: "dakgangjeongRice",
-    3: "dragonFruit", 
-    4: "guava",
-    5: "kimchiFriedRice", 
-    6: "kimchiTuna", 
-    7: "mango", 
-    8: "mangoMilk", 
-    9: "pineappleHoney", 
-   10: "pinkGuava",  
-      
+    1: "100plus",
+    2: "chickenKatsuCurry",
+    3: "cocacola",
+    4: "coconut", 
+    5: "dakgangjeongRice",
+    6: "dragonFruit", 
+    7: "guava",
+    8: "kimchiFriedRice", 
+    9: "kimchiTuna", 
+    10: "lemon",
+    11: "mango", 
+    12: "mangoMilk", 
+    13: "orange",
+    14: "pineappleHoney", 
+    15: "pinkGuava",  
+    
 }
     
     """Draw both entry and exit counts on frame"""
@@ -2546,15 +2563,54 @@ def get_global_track_id(camera_id, local_track_id, features=None, label=None):
         local_to_global_id_map: Mapping of (camera_id, local_id) → global_id
         global_track_labels: Stores label for each global_id
         active_objects_per_camera: Tracks active objects per camera/label
+        recently_lost_objects: Maps global_id → time lost (for handoff reuse)
+        global_id_lock_until: Maps global_id → lock expiry time
+        
+    UPGRADED: 
+    - Detects mid-track label changes (AI reclassification) and re-evaluates
+    - Reuses recently lost global IDs during blind handoffs
+    - Scores cross-camera matches by lowest global_id (most stable)
+    - Adds label count cap to prevent impossible duplicates
     """
     global global_track_counter, local_to_global_id_map, global_track_labels
     global active_objects_per_camera
+    global recently_lost_objects, global_id_lock_until
     
+    # ============================================================
     # STEP 1: Check if this local track already has a global ID (RULE 1)
+    # UPGRADED: Now detects label changes mid-track.
+    # When AI reclassifies (e.g., dragonFruit → mango), the old
+    # mapping is removed so the track can be re-matched correctly.
+    # ============================================================
     if (camera_id, local_track_id) in local_to_global_id_map:
-        return local_to_global_id_map[(camera_id, local_track_id)]
+        existing_global_id = local_to_global_id_map[(camera_id, local_track_id)]
+        
+        # Check if the label changed for this track
+        if label and existing_global_id in global_track_labels:
+            old_label = global_track_labels[existing_global_id]
+            
+            if old_label != label:
+                # Label changed! Clean up old label tracking
+                if old_label in active_objects_per_camera[camera_id]:
+                    if local_track_id in active_objects_per_camera[camera_id][old_label]:
+                        del active_objects_per_camera[camera_id][old_label][local_track_id]
+                        if not active_objects_per_camera[camera_id][old_label]:
+                            del active_objects_per_camera[camera_id][old_label]
+                
+                # Remove old mapping so it gets re-evaluated below
+                del local_to_global_id_map[(camera_id, local_track_id)]
+                
+                print(f"[RELABEL] Camera {camera_id} track {local_track_id} changed {old_label} → {label}, re-evaluating G:{existing_global_id}")
+                
+                # Don't return — fall through to matching logic
+            else:
+                return existing_global_id
+        else:
+            return existing_global_id
     
+    # ============================================================
     # STEP 2: Handle case where no label provided
+    # ============================================================
     if not label:
         # No label = can't match across cameras, create new global ID
         new_global_id = global_track_counter
@@ -2562,42 +2618,132 @@ def get_global_track_id(camera_id, local_track_id, features=None, label=None):
         local_to_global_id_map[(camera_id, local_track_id)] = new_global_id
         return new_global_id
     
-    # STEP 3: Check for cross-camera matching opportunity (RULE 3)
-    other_camera = 1 if camera_id == 0 else 0  # Get opposite camera
+    # ============================================================
+    # STEP 3: Check recently lost objects (BLIND HANDOFF FIX)
+    # When object disappears from cam 0 and appears on cam 1,
+    # reuse the global ID instead of creating a duplicate.
+    # Only 2 conditions: right label + within grace period.
+    # Picks the most recently lost match (closest in time).
+    # ============================================================
+    current_time = time.time()
+    best_reuse_id = None
+    best_reuse_time = 0
     
-    # Look for objects with same label on other camera
+    for global_id, lost_time in list(recently_lost_objects.items()):
+        # Simple check: right label + lost within 1.5 seconds
+        if (global_id in global_track_labels and
+            global_track_labels[global_id] == label and
+            current_time - lost_time < 1.5):
+            
+            # Pick the most recently lost one (closest in time)
+            if lost_time > best_reuse_time:
+                best_reuse_id = global_id
+                best_reuse_time = lost_time
+    
+    if best_reuse_id is not None:
+        # REUSE the recently lost global_id
+        local_to_global_id_map[(camera_id, local_track_id)] = best_reuse_id
+        if label not in active_objects_per_camera[camera_id]:
+            active_objects_per_camera[camera_id][label] = {}
+        active_objects_per_camera[camera_id][label][local_track_id] = best_reuse_id
+        
+        # Remove from recently_lost since it's active again
+        recently_lost_objects.pop(best_reuse_id, None)
+        global_id_lock_until.pop(best_reuse_id, None)
+        
+        print(f"[REUSE] Camera {camera_id} reusing Global ID {best_reuse_id} for {label}")
+        return best_reuse_id
+    
+    # ============================================================
+    # STEP 4: Check for cross-camera matching (RULE 3)
+    # Sorted by lowest global_id for stable matching.
+    # ============================================================
+    other_camera = 1 if camera_id == 0 else 0
+    
     available_matches = []
     if label in active_objects_per_camera[other_camera]:
-        # Iterate through all objects with this label on other camera
         for other_local_id, other_global_id in active_objects_per_camera[other_camera][label].items():
-            # Check if this global_id is already matched to another object on our camera
+            # Check if this global_id is already used on our camera
             already_matched_on_this_camera = False
-            for our_local_id, our_global_id in active_objects_per_camera[camera_id][label].items():
-                if our_global_id == other_global_id:
-                    already_matched_on_this_camera = True
-                    break
+            if label in active_objects_per_camera[camera_id]:
+                for our_local_id, our_global_id in active_objects_per_camera[camera_id][label].items():
+                    if our_global_id == other_global_id:
+                        already_matched_on_this_camera = True
+                        break
             
-            # If not already matched, this is an available match
             if not already_matched_on_this_camera:
                 available_matches.append((other_local_id, other_global_id))
     
-    # STEP 4: Use available match if found
     if available_matches:
-        # Use first available match (could add distance-based matching here)
+        # Pick the match with the lowest global_id (oldest = most established)
+        available_matches.sort(key=lambda x: x[1])
         matched_local_id, matched_global_id = available_matches[0]
+        
         local_to_global_id_map[(camera_id, local_track_id)] = matched_global_id
+        if label not in active_objects_per_camera[camera_id]:
+            active_objects_per_camera[camera_id][label] = {}
         active_objects_per_camera[camera_id][label][local_track_id] = matched_global_id
         global_track_labels[matched_global_id] = label
         return matched_global_id
     
-    # STEP 5: No match found, create new global ID (RULE 2 or RULE 4)
+    # ============================================================
+    # STEP 5: Label count cap — last safety net
+    # Before creating a new global ID, check if one already exists
+    # for this label on the other camera that could be reused.
+    # Prevents creating impossible duplicates.
+    # ============================================================
+    existing_count = 0
+    for cam in [0, 1]:
+        if label in active_objects_per_camera[cam]:
+            existing_count += len(active_objects_per_camera[cam][label])
+    
+    # Also count recently lost objects with this label (still "alive")
+    for gid, lost_time in recently_lost_objects.items():
+        if (gid in global_track_labels and 
+            global_track_labels[gid] == label and
+            current_time - lost_time < 1.5):
+            existing_count += 1
+    
+    # If there's already at least 1 of this label active/recently lost,
+    # and we're on a different camera, it's likely the same object.
+    if existing_count > 0:
+        # Find a reusable global_id with this label on the other camera
+        best_existing_id = None
+        
+        if label in active_objects_per_camera[other_camera]:
+            for other_local_id, other_global_id in active_objects_per_camera[other_camera][label].items():
+                already_on_ours = False
+                if label in active_objects_per_camera[camera_id]:
+                    for our_local_id, our_global_id in active_objects_per_camera[camera_id][label].items():
+                        if our_global_id == other_global_id:
+                            already_on_ours = True
+                            break
+                if not already_on_ours:
+                    best_existing_id = other_global_id
+                    break
+        
+        if best_existing_id is not None:
+            local_to_global_id_map[(camera_id, local_track_id)] = best_existing_id
+            if label not in active_objects_per_camera[camera_id]:
+                active_objects_per_camera[camera_id][label] = {}
+            active_objects_per_camera[camera_id][label][local_track_id] = best_existing_id
+            global_track_labels[best_existing_id] = label
+            print(f"[CAP] Camera {camera_id} reusing Global ID {best_existing_id} for {label} (label count cap)")
+            return best_existing_id
+    
+    # ============================================================
+    # STEP 6: Truly new object, create new global ID (RULE 2 or RULE 4)
+    # ============================================================
     new_global_id = global_track_counter
     global_track_counter += 1
     local_to_global_id_map[(camera_id, local_track_id)] = new_global_id
+    if label not in active_objects_per_camera[camera_id]:
+        active_objects_per_camera[camera_id][label] = {}
     active_objects_per_camera[camera_id][label][local_track_id] = new_global_id
     global_track_labels[new_global_id] = label
     
     return new_global_id
+    
 
 def cleanup_inactive_tracks(camera_id, active_local_track_ids):
     """
@@ -2613,6 +2759,9 @@ def cleanup_inactive_tracks(camera_id, active_local_track_ids):
     - Removes from active_objects_per_camera
     - Frees up global IDs for reuse
     
+    IMPORTANT UPGRADE:
+    Instead of deleting immediately, we mark objects as "recently lost"
+    to prevent double counting when switching between cameras.
     Called every frame after processing detections.
     
     Args:
@@ -2624,28 +2773,71 @@ def cleanup_inactive_tracks(camera_id, active_local_track_ids):
         Frame: Only tracks [5, 12] detected
         After: Track 8 data cleaned up (no longer active)
     """
-    global local_to_global_id_map, active_objects_per_camera
-    
-    # Find inactive tracks for this camera
+
+    global local_to_global_id_map
+    global active_objects_per_camera
+    global recently_lost_objects
+    global global_id_lock_until
+    global global_track_labels
+
+    current_time = time.time()
+
+    # ============================================================
+    # STEP 1: Find inactive tracks
+    # ============================================================
     inactive_tracks = []
-    for (cam_id, local_id), global_id in local_to_global_id_map.items():
+
+    for (cam_id, local_id), global_id in list(local_to_global_id_map.items()):
         if cam_id == camera_id and local_id not in active_local_track_ids:
             inactive_tracks.append((cam_id, local_id, global_id))
-    
-    # Remove inactive tracks
+
+    # ============================================================
+    # STEP 2: Handle inactive tracks (SAFE CLEANUP)
+    # Instead of deleting global memory immediately, mark as
+    # recently lost so the handoff logic can reuse the ID.
+    # ============================================================
     for cam_id, local_id, global_id in inactive_tracks:
-        # Remove from local_to_global_id_map
+
+        # --------------------------------------------------------
+        # Mark as recently lost instead of deleting instantly
+        # Only set the time on first loss (don't reset if already lost)
+        # --------------------------------------------------------
+        if global_id not in recently_lost_objects:
+            recently_lost_objects[global_id] = current_time
+
+        # Lock global ID briefly to prevent reassignment
+        global_id_lock_until[global_id] = current_time + 1.5  # seconds
+
+        # --------------------------------------------------------
+        # Remove LOCAL mapping only (keep global memory alive)
+        # --------------------------------------------------------
         del local_to_global_id_map[(cam_id, local_id)]
-        
-        # Remove from active_objects_per_camera
+
         label = global_track_labels.get(global_id)
+
         if label and label in active_objects_per_camera[cam_id]:
             if local_id in active_objects_per_camera[cam_id][label]:
                 del active_objects_per_camera[cam_id][label][local_id]
-                
-                # Clean up empty label entries
+
                 if not active_objects_per_camera[cam_id][label]:
                     del active_objects_per_camera[cam_id][label]
+
+    # ============================================================
+    # STEP 3: FULL CLEANUP after grace period expires
+    # After 2 seconds, the object is truly gone — clean up
+    # the recently lost memory to prevent unbounded growth.
+    # ============================================================
+    GRACE_PERIOD = 2.0  # seconds
+
+    expired_ids = [
+        gid for gid, lost_time in recently_lost_objects.items()
+        if current_time - lost_time > GRACE_PERIOD
+    ]
+
+    for gid in expired_ids:
+        recently_lost_objects.pop(gid, None)
+        global_id_lock_until.pop(gid, None)
+        
 
 # =====================================================================
 # MOVEMENT DIRECTION ANALYSIS
