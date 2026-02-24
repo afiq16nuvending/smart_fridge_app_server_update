@@ -1,4 +1,4 @@
-{
+
   "iou_threshold": 0.45,
   "detection_threshold": 0.7,
   "label_offset": 1,
@@ -10,16 +10,21 @@
   ],
   "labels": [
     "",
-    "chickenKatsuCurry", 
+    "100plus",
+    "chickenKatsuCurry",
+    "cocacola",
+    "coconut", 
     "dakgangjeongRice",
-    "dragonFruit",
+    "dragonFruit", 
     "guava",
-    "kimchiFriedRice",
-    "kimchiTuna",
-    "mango",
-    "mangoMilk",
-    "pineappleHoney",
-    "pinkGuava"
+    "kimchiFriedRice", 
+    "kimchiTuna", 
+    "lemon",
+    "mango", 
+    "mangoMilk", 
+    "orange",
+    "pineappleHoney", 
+    "pinkGuava" 
 
 
   ]
