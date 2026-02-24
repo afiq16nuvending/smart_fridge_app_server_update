@@ -1,4 +1,4 @@
-
+{
   "iou_threshold": 0.45,
   "detection_threshold": 0.7,
   "label_offset": 1,
