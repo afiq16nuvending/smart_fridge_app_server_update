@@ -1801,17 +1801,28 @@ class HailoDetectionCallback(app_callback_class):
     # =================================================================
     # FALLBACK PIPELINE CONFIGURATION
     # =================================================================
-
+    
     def get_fallback_pipeline_string(self):
         """
         Return the fallback GStreamer pipeline string when API fetch fails.
+        
+        This is a pre-configured pipeline for dual-camera object detection:
+        - Camera 0: /dev/video0 (USB camera)
+        - Camera 2: /dev/video2 (USB camera)
+        - Resolution: 640x360 @ 25fps
+        - MJPEG input format
+        - Hailo AI inference with tracking
+        - Side-by-side display output
+        
+        Returns:
+            str: Complete GStreamer pipeline configuration
         """
         return (
             "hailoroundrobin mode=0 name=fun ! "
             "queue name=hailo_pre_infer_q_0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
-            "hailonet hef-path=resources/ai_model.hef batch-size=2 output-format-type=HAILO_FORMAT_TYPE_FLOAT32 ! "
+            "hailonet hef-path=resources/ai_model.hef batch-size=2 nms-score-threshold=0.3 nms-iou-threshold=0.45 output-format-type=HAILO_FORMAT_TYPE_FLOAT32 ! "
             "queue name=hailo_postprocess0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
-            "identity name=identity_callback_0 ! "
+            "hailofilter function-name=filter_letterbox so-path=/home/afiq/hailo-rpi5-examples/basic_pipelines/../resources/libyolo_hailortpp_postprocess.so config-path=resources/labels.json qos=false ! "
             "queue name=hailo_track0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
             "hailotracker name=hailo_tracker class-id=-1 kalman-dist-thr=0.8 iou-thr=0.9 init-iou-thr=0.7 keep-new-frames=1 keep-tracked-frames=1 keep-lost-frames=1 keep-past-metadata=true ! "
             "hailostreamrouter name=sid src_0::input-streams=\"<sink_0>\" src_1::input-streams=\"<sink_1>\" "
@@ -1836,7 +1847,7 @@ class HailoDetectionCallback(app_callback_class):
             # Camera 0 output pipeline
             "sid.src_0 ! "
             "queue name=identity_callback_q_0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
-            "identity name=identity_callback_1 ! "
+            "identity name=identity_callback_0 ! "
             "queue name=hailo_draw_0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
             "hailooverlay ! "
             "videoscale n-threads=8 ! "
@@ -1859,7 +1870,7 @@ class HailoDetectionCallback(app_callback_class):
             # Camera 2 output pipeline
             "sid.src_1 ! "
             "queue name=identity_callback_q_1 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
-            "identity name=identity_callback_2 ! "
+            "identity name=identity_callback_1 ! "
             "queue name=hailo_draw_1 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
             "hailooverlay ! "
             "videoscale n-threads=8 ! "
@@ -2182,60 +2193,6 @@ class HailoDetectionApp:
         # Start door monitoring
         self.door_monitor_thread.start()
 
-
-
-
-
-    def app_callback(self, pad, info, user_data):
-        """
-        Custom callback for YOLO26 NMS-free model.
-        Decodes the 1x19x8400 raw tensor into HailoDetection objects.
-        """
-        buffer = info.get_buffer()
-        if buffer is None:
-            return Gst.PadProbeReturn.OK
-
-        # Get the Hailo metadata from the buffer
-        roi = hailo.get_roi_from_buffer(buffer)
-        tensors = roi.get_tensors()
-        
-        # Labels must match your 15-class training order (Index 0 to 14)
-        labels = [
-            "100plus", "chickenKatsuCurry", "cocacola", "coconut", 
-            "dakgangjeongRice", "dragonFruit", "guava", "kimchiFriedRice", 
-            "kimchiTuna", "lemon", "mango", "mangoMilk", "orange", 
-            "pineappleHoney", "pinkGuava"
-        ]
-
-        for tensor in tensors:
-            # Reshape the raw data to (8400, 19)
-            # 19 = 4 box coords + 15 class scores
-            data = np.array(tensor).reshape(8400, 19)
-            
-            # Separate boxes and scores
-            boxes = data[:, :4]
-            scores = data[:, 4:]
-            
-            # Find highest score for each anchor
-            class_ids = np.argmax(scores, axis=1)
-            confidences = np.max(scores, axis=1)
-            
-            # Filter for confidence (e.g., > 0.5)
-            mask = confidences > 0.5 
-            
-            for i in np.where(mask)[0]:
-                label = labels[class_ids[i]]
-                confidence = float(confidences[i])
-                x, y, w, h = boxes[i]
-                
-                # Create Hailo objects so the Tracker and Overlay can see them
-                hailo_box = hailo.HailoBBox(x, y, w, h)
-                detection = hailo.HailoDetection(hailo_box, class_ids[i], label, confidence)
-                roi.add_object(detection)
-                
-        return Gst.PadProbeReturn.OK
-
-    
     def get_pipeline_string(self):
         """
         Get GStreamer pipeline configuration string.
@@ -2258,7 +2215,7 @@ class HailoDetectionApp:
         print(f'Pipeline configuration loaded')
         return pipeline_string
 
-def create_pipeline(self):
+    def create_pipeline(self):
         """
         Create and configure the GStreamer pipeline.
         
@@ -2294,9 +2251,8 @@ def create_pipeline(self):
         bus.add_signal_watch()
         bus.connect("message", self.bus_call, self.loop)
         
-        # Connect callbacks for the identity elements defined in the pipeline string
-        # We check 0, 1, and 2 to match the new NMS-free pipeline structure
-        for stream_id in [0, 1, 2]:
+        # Connect callbacks for both camera streams (0 and 1)
+        for stream_id in [0, 1]:
             # Find identity element for this stream
             identity = self.pipeline.get_by_name(f"identity_callback_{stream_id}")
             if identity:
@@ -2326,8 +2282,6 @@ def create_pipeline(self):
                     print(f"Warning: Could not get src pad from identity element "
                           f"for stream {stream_id}")
             else:
-                # This print will trigger for index 1 or 2 depending on your final string,
-                # but stream 0 is the critical one for your YOLO26 raw data.
                 print(f"Warning: Could not find identity_callback_{stream_id} "
                       f"element in pipeline")
     
