@@ -1801,21 +1801,10 @@ class HailoDetectionCallback(app_callback_class):
     # =================================================================
     # FALLBACK PIPELINE CONFIGURATION
     # =================================================================
-    
-       def get_fallback_pipeline_string(self):
+
+    def get_fallback_pipeline_string(self):
         """
         Return the fallback GStreamer pipeline string when API fetch fails.
-        
-        This is a pre-configured pipeline for dual-camera object detection:
-        - Camera 0: /dev/video0 (USB camera)
-        - Camera 2: /dev/video2 (USB camera)
-        - Resolution: 640x360 @ 25fps
-        - MJPEG input format
-        - Hailo AI inference with tracking
-        - Side-by-side display output
-        
-        Returns:
-            str: Complete GStreamer pipeline configuration
         """
         return (
             "hailoroundrobin mode=0 name=fun ! "
@@ -1878,6 +1867,7 @@ class HailoDetectionCallback(app_callback_class):
             "queue name=comp_q_1 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
             "comp.sink_1"
         )
+
     # =================================================================
     # API PLANOGRAM FETCHING AND REFRESH SYSTEM
     # =================================================================
