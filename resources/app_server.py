@@ -1801,8 +1801,7 @@ class HailoDetectionCallback(app_callback_class):
     # =================================================================
     # FALLBACK PIPELINE CONFIGURATION
     # =================================================================
-    
-    def get_fallback_pipeline_string(self):
+      def get_fallback_pipeline_string(self):
         """
         Return the fallback GStreamer pipeline string when API fetch fails.
         """
@@ -1866,7 +1865,8 @@ class HailoDetectionCallback(app_callback_class):
             "video/x-raw,width=640,height=360 ! "
             "queue name=comp_q_1 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
             "comp.sink_1"
-        )
+        )  
+
     # =================================================================
     # API PLANOGRAM FETCHING AND REFRESH SYSTEM
     # =================================================================
