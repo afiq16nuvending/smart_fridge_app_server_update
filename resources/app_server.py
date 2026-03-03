@@ -1802,7 +1802,7 @@ class HailoDetectionCallback(app_callback_class):
     # FALLBACK PIPELINE CONFIGURATION
     # =================================================================
     
-   def get_fallback_pipeline_string(self):
+    def get_fallback_pipeline_string(self):
     
     return (
         "hailoroundrobin mode=0 name=fun ! "
