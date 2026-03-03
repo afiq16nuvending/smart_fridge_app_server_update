@@ -1801,16 +1801,27 @@ class HailoDetectionCallback(app_callback_class):
     # =================================================================
     # FALLBACK PIPELINE CONFIGURATION
     # =================================================================
-      def get_fallback_pipeline_string(self):
+  def get_fallback_pipeline_string(self):
         """
         Return the fallback GStreamer pipeline string when API fetch fails.
+        
+        This is a pre-configured pipeline for dual-camera object detection:
+        - Camera 0: /dev/video0 (USB camera)
+        - Camera 2: /dev/video2 (USB camera)
+        - Resolution: 640x360 @ 25fps
+        - MJPEG input format
+        - Hailo AI inference with tracking
+        - Side-by-side display output
+        
+        Returns:
+            str: Complete GStreamer pipeline configuration
         """
         return (
             "hailoroundrobin mode=0 name=fun ! "
             "queue name=hailo_pre_infer_q_0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
-            "hailonet hef-path=resources/ai_model.hef batch-size=2 output-format-type=HAILO_FORMAT_TYPE_FLOAT32 ! "
+            "hailonet hef-path=resources/ai_model.hef batch-size=2 nms-score-threshold=0.3 nms-iou-threshold=0.45 output-format-type=HAILO_FORMAT_TYPE_FLOAT32 ! "
             "queue name=hailo_postprocess0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
-            "identity name=identity_callback_0 ! "
+            "hailofilter function-name=filter_letterbox so-path=/home/afiq/hailo-rpi5-examples/basic_pipelines/../resources/libyolo_hailortpp_postprocess.so config-path=resources/labels.json qos=false ! "
             "queue name=hailo_track0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
             "hailotracker name=hailo_tracker class-id=-1 kalman-dist-thr=0.8 iou-thr=0.9 init-iou-thr=0.7 keep-new-frames=1 keep-tracked-frames=1 keep-lost-frames=1 keep-past-metadata=true ! "
             "hailostreamrouter name=sid src_0::input-streams=\"<sink_0>\" src_1::input-streams=\"<sink_1>\" "
@@ -1835,7 +1846,7 @@ class HailoDetectionCallback(app_callback_class):
             # Camera 0 output pipeline
             "sid.src_0 ! "
             "queue name=identity_callback_q_0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
-            "identity name=identity_callback_1 ! "
+            "identity name=identity_callback_0 ! "
             "queue name=hailo_draw_0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
             "hailooverlay ! "
             "videoscale n-threads=8 ! "
@@ -1858,14 +1869,14 @@ class HailoDetectionCallback(app_callback_class):
             # Camera 2 output pipeline
             "sid.src_1 ! "
             "queue name=identity_callback_q_1 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
-            "identity name=identity_callback_2 ! "
+            "identity name=identity_callback_1 ! "
             "queue name=hailo_draw_1 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
             "hailooverlay ! "
             "videoscale n-threads=8 ! "
             "video/x-raw,width=640,height=360 ! "
             "queue name=comp_q_1 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
             "comp.sink_1"
-        )  
+        )
 
     # =================================================================
     # API PLANOGRAM FETCHING AND REFRESH SYSTEM
