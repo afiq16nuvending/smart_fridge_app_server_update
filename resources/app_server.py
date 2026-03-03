@@ -1801,82 +1801,82 @@ class HailoDetectionCallback(app_callback_class):
     # =================================================================
     # FALLBACK PIPELINE CONFIGURATION
     # =================================================================
-    def get_fallback_pipeline_string(self):
-        """
-        Return the fallback GStreamer pipeline string when API fetch fails.
-        
-        This is a pre-configured pipeline for dual-camera object detection:
-        - Camera 0: /dev/video0 (USB camera)
-        - Camera 2: /dev/video2 (USB camera)
-        - Resolution: 640x360 @ 25fps
-        - MJPEG input format
-        - Hailo AI inference with tracking
-        - Side-by-side display output
-        
-        Returns:
-            str: Complete GStreamer pipeline configuration
-        """
-        return (
-            "hailoroundrobin mode=0 name=fun ! "
-            "queue name=hailo_pre_infer_q_0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
-            "hailonet hef-path=resources/ai_model.hef batch-size=2 nms-score-threshold=0.3 nms-iou-threshold=0.45 output-format-type=HAILO_FORMAT_TYPE_FLOAT32 ! "
-            "queue name=hailo_postprocess0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
-            "hailofilter function-name=filter_letterbox so-path=/home/afiq/hailo-rpi5-examples/basic_pipelines/../resources/libyolo_hailortpp_postprocess.so config-path=resources/labels.json qos=false ! "
-            "queue name=hailo_track0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
-            "hailotracker name=hailo_tracker class-id=-1 kalman-dist-thr=0.8 iou-thr=0.9 init-iou-thr=0.7 keep-new-frames=1 keep-tracked-frames=1 keep-lost-frames=1 keep-past-metadata=true ! "
-            "hailostreamrouter name=sid src_0::input-streams=\"<sink_0>\" src_1::input-streams=\"<sink_1>\" "
-            "compositor name=comp start-time-selection=0 sink_0::xpos=0 sink_0::ypos=0 sink_1::xpos=350 sink_1::ypos=0 ! "
-            "queue name=hailo_video_q_0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
-            "videoconvert ! "
-            "queue name=hailo_display_q_0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
-            "fpsdisplaysink video-sink=ximagesink name=hailo_display sync=false text-overlay=true "
+        def get_fallback_pipeline_string(self):
+            """
+            Return the fallback GStreamer pipeline string when API fetch fails.
             
-            # Camera 0 source pipeline
-            "v4l2src device=/dev/video0 name=source_0 ! "
-            "image/jpeg, width=640, height=360, framerate=25/1 ! "
-            "jpegdec ! "
-            "queue name=source_scale_q_0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
-            "videoscale name=source_videoscale_0 n-threads=2 ! "
-            "queue name=source_convert_q_0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
-            "videoconvert n-threads=3 name=source_convert_0 qos=false ! "
-            "video/x-raw, format=RGB, pixel-aspect-ratio=1/1 ! "
-            "queue name=inference_wrapper_input_q_0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
-            "fun.sink_0 "
+            This is a pre-configured pipeline for dual-camera object detection:
+            - Camera 0: /dev/video0 (USB camera)
+            - Camera 2: /dev/video2 (USB camera)
+            - Resolution: 640x360 @ 25fps
+            - MJPEG input format
+            - Hailo AI inference with tracking
+            - Side-by-side display output
             
-            # Camera 0 output pipeline
-            "sid.src_0 ! "
-            "queue name=identity_callback_q_0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
-            "identity name=identity_callback_0 ! "
-            "queue name=hailo_draw_0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
-            "hailooverlay ! "
-            "videoscale n-threads=8 ! "
-            "video/x-raw,width=640,height=360 ! "
-            "queue name=comp_q_0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
-            "comp.sink_0 "
-            
-            # Camera 2 source pipeline
-            "v4l2src device=/dev/video2 name=source_2 ! "
-            "image/jpeg, width=640, height=360, framerate=25/1 ! "
-            "jpegdec ! "
-            "queue name=source_scale_q_2 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
-            "videoscale name=source_videoscale_2 n-threads=2 ! "
-            "queue name=source_convert_q_2 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
-            "videoconvert n-threads=3 name=source_convert_2 qos=false ! "
-            "video/x-raw, format=RGB, pixel-aspect-ratio=1/1 ! "
-            "queue name=inference_wrapper_input_q_2 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
-            "fun.sink_1 "
-            
-            # Camera 2 output pipeline
-            "sid.src_1 ! "
-            "queue name=identity_callback_q_1 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
-            "identity name=identity_callback_1 ! "
-            "queue name=hailo_draw_1 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
-            "hailooverlay ! "
-            "videoscale n-threads=8 ! "
-            "video/x-raw,width=640,height=360 ! "
-            "queue name=comp_q_1 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
-            "comp.sink_1"
-        )
+            Returns:
+                str: Complete GStreamer pipeline configuration
+            """
+            return (
+                "hailoroundrobin mode=0 name=fun ! "
+                "queue name=hailo_pre_infer_q_0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
+                "hailonet hef-path=resources/ai_model.hef batch-size=2 nms-score-threshold=0.3 nms-iou-threshold=0.45 output-format-type=HAILO_FORMAT_TYPE_FLOAT32 ! "
+                "queue name=hailo_postprocess0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
+                "hailofilter function-name=filter_letterbox so-path=/home/afiq/hailo-rpi5-examples/basic_pipelines/../resources/libyolo_hailortpp_postprocess.so config-path=resources/labels.json qos=false ! "
+                "queue name=hailo_track0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
+                "hailotracker name=hailo_tracker class-id=-1 kalman-dist-thr=0.8 iou-thr=0.9 init-iou-thr=0.7 keep-new-frames=1 keep-tracked-frames=1 keep-lost-frames=1 keep-past-metadata=true ! "
+                "hailostreamrouter name=sid src_0::input-streams=\"<sink_0>\" src_1::input-streams=\"<sink_1>\" "
+                "compositor name=comp start-time-selection=0 sink_0::xpos=0 sink_0::ypos=0 sink_1::xpos=350 sink_1::ypos=0 ! "
+                "queue name=hailo_video_q_0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
+                "videoconvert ! "
+                "queue name=hailo_display_q_0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
+                "fpsdisplaysink video-sink=ximagesink name=hailo_display sync=false text-overlay=true "
+                
+                # Camera 0 source pipeline
+                "v4l2src device=/dev/video0 name=source_0 ! "
+                "image/jpeg, width=640, height=360, framerate=25/1 ! "
+                "jpegdec ! "
+                "queue name=source_scale_q_0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
+                "videoscale name=source_videoscale_0 n-threads=2 ! "
+                "queue name=source_convert_q_0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
+                "videoconvert n-threads=3 name=source_convert_0 qos=false ! "
+                "video/x-raw, format=RGB, pixel-aspect-ratio=1/1 ! "
+                "queue name=inference_wrapper_input_q_0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
+                "fun.sink_0 "
+                
+                # Camera 0 output pipeline
+                "sid.src_0 ! "
+                "queue name=identity_callback_q_0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
+                "identity name=identity_callback_0 ! "
+                "queue name=hailo_draw_0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
+                "hailooverlay ! "
+                "videoscale n-threads=8 ! "
+                "video/x-raw,width=640,height=360 ! "
+                "queue name=comp_q_0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
+                "comp.sink_0 "
+                
+                # Camera 2 source pipeline
+                "v4l2src device=/dev/video2 name=source_2 ! "
+                "image/jpeg, width=640, height=360, framerate=25/1 ! "
+                "jpegdec ! "
+                "queue name=source_scale_q_2 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
+                "videoscale name=source_videoscale_2 n-threads=2 ! "
+                "queue name=source_convert_q_2 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
+                "videoconvert n-threads=3 name=source_convert_2 qos=false ! "
+                "video/x-raw, format=RGB, pixel-aspect-ratio=1/1 ! "
+                "queue name=inference_wrapper_input_q_2 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
+                "fun.sink_1 "
+                
+                # Camera 2 output pipeline
+                "sid.src_1 ! "
+                "queue name=identity_callback_q_1 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
+                "identity name=identity_callback_1 ! "
+                "queue name=hailo_draw_1 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
+                "hailooverlay ! "
+                "videoscale n-threads=8 ! "
+                "video/x-raw,width=640,height=360 ! "
+                "queue name=comp_q_1 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
+                "comp.sink_1"
+            )
 
     # =================================================================
     # API PLANOGRAM FETCHING AND REFRESH SYSTEM
