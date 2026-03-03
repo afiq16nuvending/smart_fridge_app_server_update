@@ -1801,7 +1801,7 @@ class HailoDetectionCallback(app_callback_class):
     # =================================================================
     # FALLBACK PIPELINE CONFIGURATION
     # =================================================================
-  def get_fallback_pipeline_string(self):
+    def get_fallback_pipeline_string(self):
         """
         Return the fallback GStreamer pipeline string when API fetch fails.
         
