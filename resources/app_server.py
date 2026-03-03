@@ -1803,7 +1803,8 @@ class HailoDetectionCallback(app_callback_class):
     # =================================================================
     
     def get_fallback_pipeline_string(self):
-    return (
+        
+        return (
         "hailoroundrobin mode=0 name=fun ! "
         "queue name=hailo_pre_infer_q_0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
         "hailonet hef-path=resources/ai_model.hef batch-size=2 output-format-type=HAILO_FORMAT_TYPE_FLOAT32 ! "
