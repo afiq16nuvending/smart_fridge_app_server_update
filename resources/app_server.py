@@ -1802,14 +1802,16 @@ class HailoDetectionCallback(app_callback_class):
     # FALLBACK PIPELINE CONFIGURATION
     # =================================================================
     
-    def get_fallback_pipeline_string(self):
-        
+def get_fallback_pipeline_string(self):
+        """
+        Return the fallback GStreamer pipeline string when API fetch fails.
+        """
         return (
             "hailoroundrobin mode=0 name=fun ! "
             "queue name=hailo_pre_infer_q_0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
             "hailonet hef-path=resources/ai_model.hef batch-size=2 output-format-type=HAILO_FORMAT_TYPE_FLOAT32 ! "
             "queue name=hailo_postprocess0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
-            "hailofilter function-name=yolov8s so-path=/usr/lib/aarch64-linux-gnu/hailo/tappas/post_processes/libyolo_hailortpp_post.so config-path=resources/yolov8_15class.json qos=false ! "
+            "identity name=identity_callback_0 ! "
             "queue name=hailo_track0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
             "hailotracker name=hailo_tracker class-id=-1 kalman-dist-thr=0.8 iou-thr=0.9 init-iou-thr=0.7 keep-new-frames=1 keep-tracked-frames=1 keep-lost-frames=1 keep-past-metadata=true ! "
             "hailostreamrouter name=sid src_0::input-streams=\"<sink_0>\" src_1::input-streams=\"<sink_1>\" "
@@ -1818,6 +1820,7 @@ class HailoDetectionCallback(app_callback_class):
             "videoconvert ! "
             "queue name=hailo_display_q_0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
             "fpsdisplaysink video-sink=ximagesink name=hailo_display sync=false text-overlay=true "
+            
             # Camera 0 source pipeline
             "v4l2src device=/dev/video0 name=source_0 ! "
             "image/jpeg, width=640, height=360, framerate=25/1 ! "
@@ -1829,16 +1832,18 @@ class HailoDetectionCallback(app_callback_class):
             "video/x-raw, format=RGB, pixel-aspect-ratio=1/1 ! "
             "queue name=inference_wrapper_input_q_0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
             "fun.sink_0 "
+            
             # Camera 0 output pipeline
             "sid.src_0 ! "
             "queue name=identity_callback_q_0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
-            "identity name=identity_callback_0 ! "
+            "identity name=identity_callback_1 ! "
             "queue name=hailo_draw_0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
             "hailooverlay ! "
             "videoscale n-threads=8 ! "
             "video/x-raw,width=640,height=360 ! "
             "queue name=comp_q_0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
             "comp.sink_0 "
+            
             # Camera 2 source pipeline
             "v4l2src device=/dev/video2 name=source_2 ! "
             "image/jpeg, width=640, height=360, framerate=25/1 ! "
@@ -1848,12 +1853,13 @@ class HailoDetectionCallback(app_callback_class):
             "queue name=source_convert_q_2 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
             "videoconvert n-threads=3 name=source_convert_2 qos=false ! "
             "video/x-raw, format=RGB, pixel-aspect-ratio=1/1 ! "
-            "queue name=inference_wrapper_input_q_2 leaky=downstream max-size-bytes=0 max-size-time=0 ! "
+            "queue name=inference_wrapper_input_q_2 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
             "fun.sink_1 "
+            
             # Camera 2 output pipeline
             "sid.src_1 ! "
             "queue name=identity_callback_q_1 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
-            "identity name=identity_callback_1 ! "
+            "identity name=identity_callback_2 ! "
             "queue name=hailo_draw_1 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
             "hailooverlay ! "
             "videoscale n-threads=8 ! "
