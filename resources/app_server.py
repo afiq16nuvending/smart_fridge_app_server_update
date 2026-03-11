@@ -329,86 +329,86 @@ def control_door(pin, action, duration=0.5):
 # COLOR COMPUTATION FOR VISUALIZATION
 # =====================================================================
 
-def compute_color_for_labels(label):
-    """
-    Compute a unique color for each product label for visualization.
+# def compute_color_for_labels(label):
+#     """
+#     Compute a unique color for each product label for visualization.
     
-    This function assigns consistent colors to product classes:
-    - Person (class 0): Orange-red
-    - Car (class 2): Pink
-    - Other classes: Generated from palette
+#     This function assigns consistent colors to product classes:
+#     - Person (class 0): Orange-red
+#     - Car (class 2): Pink
+#     - Other classes: Generated from palette
     
-    Args:
-        label (int): Class ID of the detected object
+#     Args:
+#         label (int): Class ID of the detected object
         
-    Returns:
-        tuple: BGR color tuple (B, G, R) for OpenCV drawing
+#     Returns:
+#         tuple: BGR color tuple (B, G, R) for OpenCV drawing
         
-    Note: OpenCV uses BGR format, not RGB!
-    """
-    # Color palette for generating unique colors
-    palette = (2 ** 11 - 1, 2 ** 15 - 1, 2 ** 20 - 1)
+#     Note: OpenCV uses BGR format, not RGB!
+#     """
+#     # Color palette for generating unique colors
+#     palette = (2 ** 11 - 1, 2 ** 15 - 1, 2 ** 20 - 1)
     
-    # Predefined colors for specific classes
-    if label == 0:  # Person class
-        color = (85, 45, 255)  # Orange-red in BGR
-    elif label == 2:  # Car class
-        color = (222, 82, 175)  # Pink in BGR
-    else:
-        # Generate unique color based on label value
-        color = [int((p * (label ** 2 - label + 1)) % 255) for p in palette]
+#     # Predefined colors for specific classes
+#     if label == 0:  # Person class
+#         color = (85, 45, 255)  # Orange-red in BGR
+#     elif label == 2:  # Car class
+#         color = (222, 82, 175)  # Pink in BGR
+#     else:
+#         # Generate unique color based on label value
+#         color = [int((p * (label ** 2 - label + 1)) % 255) for p in palette]
         
-    return tuple(color)
+#     return tuple(color)
 
 # =====================================================================
 # VISUAL TRAIL DRAWING
 # =====================================================================
 
-def draw_trail(frame, track_id, center, color, global_id=None):
-    """
-    Draw movement trail (breadcrumb path) for a tracked object.
+# def draw_trail(frame, track_id, center, color, global_id=None):
+#     """
+#     Draw movement trail (breadcrumb path) for a tracked object.
     
-    Trails help visualize object movement patterns:
-    - Shows last 30 positions
-    - Line thickness decreases with age (older = thinner)
-    - Supports both local and global ID tracking
+#     Trails help visualize object movement patterns:
+#     - Shows last 30 positions
+#     - Line thickness decreases with age (older = thinner)
+#     - Supports both local and global ID tracking
     
-    Args:
-        frame (numpy.ndarray): Video frame to draw on
-        track_id (int): Local track ID or global ID
-        center (tuple): Current center point (x, y) in pixels
-        color (tuple): BGR color for the trail
-        global_id (int, optional): Global ID across cameras
+#     Args:
+#         frame (numpy.ndarray): Video frame to draw on
+#         track_id (int): Local track ID or global ID
+#         center (tuple): Current center point (x, y) in pixels
+#         color (tuple): BGR color for the trail
+#         global_id (int, optional): Global ID across cameras
         
-    Visual Effect:
-        - Most recent positions: thick lines
-        - Older positions: progressively thinner lines
-        - Creates a "comet tail" effect showing direction
-    """
-    # Choose which trail storage to use
-    if global_id is not None:
-        # Use global trails for cross-camera tracking
-        global_trails[global_id].appendleft(center)
-        points = list(global_trails[global_id])
-    else:
-        # Use local trails for single-camera tracking
-        object_trails[track_id].appendleft(center)
-        points = list(object_trails[track_id])
+#     Visual Effect:
+#         - Most recent positions: thick lines
+#         - Older positions: progressively thinner lines
+#         - Creates a "comet tail" effect showing direction
+#     """
+#     # Choose which trail storage to use
+#     if global_id is not None:
+#         # Use global trails for cross-camera tracking
+#         global_trails[global_id].appendleft(center)
+#         points = list(global_trails[global_id])
+#     else:
+#         # Use local trails for single-camera tracking
+#         object_trails[track_id].appendleft(center)
+#         points = list(object_trails[track_id])
     
-    # Draw lines connecting consecutive points
-    for i in range(1, len(points)):
-        # Skip if any point is invalid
-        if points[i - 1] is None or points[i] is None:
-            continue
+#     # Draw lines connecting consecutive points
+#     for i in range(1, len(points)):
+#         # Skip if any point is invalid
+#         if points[i - 1] is None or points[i] is None:
+#             continue
             
-        # Calculate line thickness (thicker = more recent)
-        # Formula: sqrt(64 / (i + 1)) * 2
-        # i=0 (most recent): thickness ≈ 16
-        # i=29 (oldest): thickness ≈ 3
-        thickness = int(np.sqrt(64 / float(i + 1)) * 2)
+#         # Calculate line thickness (thicker = more recent)
+#         # Formula: sqrt(64 / (i + 1)) * 2
+#         # i=0 (most recent): thickness ≈ 16
+#         # i=29 (oldest): thickness ≈ 3
+#         thickness = int(np.sqrt(64 / float(i + 1)) * 2)
         
-        # Draw line segment
-        cv2.line(frame, points[i - 1], points[i], color, thickness)
+#         # Draw line segment
+#         cv2.line(frame, points[i - 1], points[i], color, thickness)
 
 # =====================================================================
 # ON-SCREEN COUNTER DISPLAY
