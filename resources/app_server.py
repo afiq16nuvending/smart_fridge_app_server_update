@@ -2968,28 +2968,28 @@ def detection_callback(pad, info, callback_data):
         validation_result = user_data.validate_detected_product(label)
         
         # Get color for this product class
-        color = compute_color_for_labels(class_id)
+        # color = compute_color_for_labels(class_id)
         
         # -----------------------------------------------------------
         # Draw Bounding Box and Label
         # -----------------------------------------------------------
         # Draw rectangle around detected object
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        # cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
         
-        # Format label text with track IDs and validation status
-        label_text = (f"{label} L:{track_id} G:{global_id} "
-                     f"{'Valid' if validation_result['valid'] else 'Invalid'}")
+        # # Format label text with track IDs and validation status
+        # label_text = (f"{label} L:{track_id} G:{global_id} "
+        #              f"{'Valid' if validation_result['valid'] else 'Invalid'}")
         
-        # Draw label above bounding box
-        # Green if valid, red if invalid
-        text_color = (0, 255, 0) if validation_result['valid'] else (0, 0, 255)
-        cv2.putText(frame, label_text, (x1, y1 - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, text_color, 2)
+        # # Draw label above bounding box
+        # # Green if valid, red if invalid
+        # text_color = (0, 255, 0) if validation_result['valid'] else (0, 0, 255)
+        # cv2.putText(frame, label_text, (x1, y1 - 10),
+        #             cv2.FONT_HERSHEY_SIMPLEX, 0.7, text_color, 2)
         
         # -----------------------------------------------------------
         # Draw Movement Trail
         # -----------------------------------------------------------
-        draw_trail(frame, track_id, center, color, global_id=global_id)
+        # draw_trail(frame, track_id, center, color, global_id=global_id)
         
         # -----------------------------------------------------------
         # Analyze Movement Direction
