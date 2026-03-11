@@ -648,7 +648,7 @@ class HailoDetectionCallback(app_callback_class):
             headers = {'x-api-key': api_key}
             
             api_endpoint = f'https://stg-sfapi.nuboxtech.com/index.php/'
-                          f'mobile_app/machine/Machine_listing/machine_planogram/{machine_id}')
+                           f'mobile_app/machine/Machine_listing/machine_planogram/{machine_id}')
                           
                           
             video_thread = threading.Thread(target=monitor_and_send_videos,
@@ -679,8 +679,8 @@ class HailoDetectionCallback(app_callback_class):
                         continue
                         
                     endpoint = (f'https://stg-sfapi.nuboxtech.com/index.php/'
-                                      f'mobile_app/machine/Machine_listing/'
-                                      f'machine_planogram/{refresh_machine_id}')
+                                f'mobile_app/machine/Machine_listing/'
+                                f'machine_planogram/{refresh_machine_id}')
                     
                     resp = requests.get(endpoint, auth=HTTPBasicAuth(username, password), headers=headers)
                     if resp.status_code == 200:
