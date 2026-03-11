@@ -408,10 +408,10 @@ def display_user_data_frame(user_data):
 
 
 def stream_video_to_api(video_path, dataset_name, transaction_id, machine_id, user_id, machine_identifier):
-    api_url = ""
-    username = ''
-    password = ''
-    api_key = ''
+    api_url = "https://stg-sfapi.nuboxtech.com/index.php/shopping_app/machine/TransactionDataset/insert_transactionDataset"
+    username = 'admin'
+    password = '1234'
+    api_key = '123456'
     current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     filename = os.path.basename(video_path)
     payload = {
@@ -642,11 +642,15 @@ class HailoDetectionCallback(app_callback_class):
 
     def fetch_and_store_initial_planogram(self, machine_id):
         try:
-            username = ''
-            password = ''
-            api_key = ''
+            username = 'admin'
+            password = '1234'
+            api_key = '123456'
             headers = {'x-api-key': api_key}
-            api_endpoint = (f'')
+            
+            api_endpoint = f'https://stg-sfapi.nuboxtech.com/index.php/'
+                          f'mobile_app/machine/Machine_listing/machine_planogram/{machine_id}')
+                          
+                          
             video_thread = threading.Thread(target=monitor_and_send_videos,
                 args=(self.video_directory, machine_id, self.machine_identifier, self.user_id), daemon=True)
             video_thread.start()
@@ -663,9 +667,9 @@ class HailoDetectionCallback(app_callback_class):
 
     def start_planogram_refresh_thread(self):
         def refresh():
-            username = ''
-            password = ''
-            api_key = ''
+            username = 'admin'
+            password = '1234'
+            api_key = '123456'
             headers = {'x-api-key': api_key}
             while True:
                 try:
@@ -673,7 +677,11 @@ class HailoDetectionCallback(app_callback_class):
                     if not mid:
                         time.sleep(1000)
                         continue
-                    endpoint = (f'')
+                        
+                    endpoint = (f'https://stg-sfapi.nuboxtech.com/index.php/'
+                                      f'mobile_app/machine/Machine_listing/'
+                                      f'machine_planogram/{refresh_machine_id}')
+                    
                     resp = requests.get(endpoint, auth=HTTPBasicAuth(username, password), headers=headers)
                     if resp.status_code == 200:
                         new_data = resp.json().get('machine_planogram', [])
@@ -1306,10 +1314,10 @@ def capture_images(device_id, num_images=3):
 
 
 def upload_images_to_api(camera1_images, machine_id, machine_identifier, user_id, product_name, image_count):
-    api_url = ""
-    username = ''
-    password = ''
-    api_key = ''
+    api_url = "https://stg-sfapi.nuboxtech.com/index.php/mobile_app/product/Product/upload_product_images"
+    username = 'admin'
+    password = '1234'
+    api_key = '123456'
     payload = {'machine_id': machine_id, 'machine_identifier': machine_identifier,
                'user_id': user_id, 'product_name': product_name, 'image_count': image_count}
     headers = {'x-api-key': api_key}
