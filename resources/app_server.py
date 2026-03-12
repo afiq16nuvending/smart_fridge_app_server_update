@@ -3333,7 +3333,7 @@ class PostProcessThread(threading.Thread):
                     # Run inference
                     try:
                         input_dict = {
-                            infer_pipeline.get_input_vstream_infos()[0].name: input_data
+                            infer_pipeline.input_vstream_infos[0].name: input_data
                         }
                         with infer_pipeline.infer(input_dict) as infer_results:
                             for out_name, out_data in infer_results.items():
