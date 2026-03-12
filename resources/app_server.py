@@ -120,6 +120,10 @@ from scipy.spatial import distance
 import weakref
 import setproctitle
 
+# OCR for text detection on product labels
+import pytesseract
+from PIL import Image
+
 # =====================================================================
 # GLOBAL VARIABLES AND CONFIGURATION
 # =====================================================================
@@ -184,8 +188,220 @@ print_lock = threading.Lock()     # Thread lock for console output
 done = False                    # Flag indicating transaction completion
 unlock_data = 0                # Flag for door unlock control
 
+
 # =====================================================================
-# TRACKING DATA STRUCTURES
+# OCR PROCESSOR
+# =====================================================================
+
+class OCRProcessor:
+    """
+    OCR (Optical Character Recognition) processor for reading text
+    on product labels detected within bounding boxes.
+
+    This supplements the Hailo AI object detection by extracting
+    human-readable text (e.g. brand names, barcodes, expiry dates)
+    directly from the cropped region of each detection.
+
+    Features:
+    - Preprocessing pipeline to improve OCR accuracy on fridge labels
+    - Confidence-based filtering (rejects low-quality reads)
+    - Thread-safe result caching per global track ID
+    - Lightweight: only runs OCR when a new track is first seen
+
+    Usage:
+        ocr_processor = OCRProcessor()
+        text = ocr_processor.read_label(frame, x1, y1, x2, y2, global_id)
+    """
+
+    def __init__(self, min_confidence=60, cache_size=200):
+        """
+        Initialize OCR processor.
+
+        Args:
+            min_confidence (int): Minimum Tesseract confidence score (0-100)
+                                  to accept a result. Default 60.
+            cache_size (int): Maximum number of track results to cache.
+                              Oldest entries are evicted when full.
+        """
+        self.min_confidence = min_confidence
+        self.cache_size = cache_size
+
+        # Cache: global_track_id -> OCR text string (or None if unreadable)
+        self._cache: Dict[int, str] = {}
+        self._cache_lock = threading.Lock()
+
+        # Tesseract config: single line of text, alphanumeric + common symbols
+        self._tess_config = '--oem 3 --psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 -./'
+
+    # -----------------------------------------------------------------
+    # PUBLIC API
+    # -----------------------------------------------------------------
+
+    def read_label(self, frame, x1, y1, x2, y2, global_id):
+        """
+        Extract and return OCR text from a bounding box region.
+
+        Caches results per global_id so OCR only runs once per
+        unique tracked object, keeping CPU load minimal.
+
+        Args:
+            frame (numpy.ndarray): BGR video frame from OpenCV.
+            x1, y1, x2, y2 (int): Bounding box pixel coordinates.
+            global_id (int): Global track ID for cache lookup.
+
+        Returns:
+            str: Cleaned OCR text, or empty string if unreadable.
+        """
+        # Return cached result if already processed this track
+        with self._cache_lock:
+            if global_id in self._cache:
+                return self._cache[global_id]
+
+        # Crop and preprocess the label region
+        crop = self._crop_region(frame, x1, y1, x2, y2)
+        if crop is None:
+            return ''
+
+        processed = self._preprocess(crop)
+        text = self._run_tesseract(processed)
+
+        # Store in cache (evict oldest if full)
+        with self._cache_lock:
+            if len(self._cache) >= self.cache_size:
+                oldest_key = next(iter(self._cache))
+                del self._cache[oldest_key]
+            self._cache[global_id] = text
+
+        return text
+
+    def clear_cache(self):
+        """
+        Clear the OCR result cache.
+
+        Call this at the end of each transaction to free memory,
+        consistent with the TransactionMemoryManager cleanup strategy.
+        """
+        with self._cache_lock:
+            self._cache.clear()
+
+    # -----------------------------------------------------------------
+    # INTERNAL HELPERS
+    # -----------------------------------------------------------------
+
+    def _crop_region(self, frame, x1, y1, x2, y2):
+        """
+        Safely crop a bounding box region from the frame.
+
+        Adds a small padding (5 px) around the box to capture
+        text that sits right at the edge of a detection boundary.
+
+        Args:
+            frame (numpy.ndarray): Source BGR frame.
+            x1, y1, x2, y2 (int): Bounding box coordinates.
+
+        Returns:
+            numpy.ndarray or None: Cropped region, or None if invalid.
+        """
+        h, w = frame.shape[:2]
+
+        # Apply padding, clamped to frame boundaries
+        pad = 5
+        cx1 = max(0, x1 - pad)
+        cy1 = max(0, y1 - pad)
+        cx2 = min(w, x2 + pad)
+        cy2 = min(h, y2 + pad)
+
+        # Reject degenerate crops
+        if cx2 <= cx1 or cy2 <= cy1:
+            return None
+
+        return frame[cy1:cy2, cx1:cx2]
+
+    def _preprocess(self, crop):
+        """
+        Preprocess the cropped region to improve Tesseract accuracy.
+
+        Pipeline:
+        1. Upscale 2x  – Tesseract works best on text >= 20px tall
+        2. Grayscale   – Remove color noise
+        3. Denoise     – Smooth sensor noise before thresholding
+        4. Threshold   – Adaptive binarisation handles varied lighting
+
+        Args:
+            crop (numpy.ndarray): BGR crop from the frame.
+
+        Returns:
+            numpy.ndarray: Binary (black/white) image ready for Tesseract.
+        """
+        # Step 1: Upscale for small labels
+        upscaled = cv2.resize(crop, None, fx=2, fy=2,
+                              interpolation=cv2.INTER_CUBIC)
+
+        # Step 2: Convert to grayscale
+        gray = cv2.cvtColor(upscaled, cv2.COLOR_BGR2GRAY)
+
+        # Step 3: Denoise
+        denoised = cv2.fastNlMeansDenoising(gray, h=10)
+
+        # Step 4: Adaptive threshold (handles uneven lighting in fridge)
+        binary = cv2.adaptiveThreshold(
+            denoised, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            blockSize=11,
+            C=2
+        )
+
+        return binary
+
+    def _run_tesseract(self, processed_img):
+        """
+        Run Tesseract OCR on the preprocessed image.
+
+        Uses pytesseract's image_to_data() to get per-word confidence
+        scores, filtering out any words below min_confidence.
+
+        Args:
+            processed_img (numpy.ndarray): Binary preprocessed image.
+
+        Returns:
+            str: Space-joined high-confidence words, stripped of
+                 whitespace. Empty string if nothing readable.
+        """
+        try:
+            pil_img = Image.fromarray(processed_img)
+
+            # Get detailed OCR data with confidence scores
+            ocr_data = pytesseract.image_to_data(
+                pil_img,
+                config=self._tess_config,
+                output_type=pytesseract.Output.DICT
+            )
+
+            # Collect words that meet confidence threshold
+            words = []
+            for i, conf in enumerate(ocr_data['conf']):
+                try:
+                    conf_val = int(conf)
+                except (ValueError, TypeError):
+                    continue
+
+                if conf_val >= self.min_confidence:
+                    word = ocr_data['text'][i].strip()
+                    if word:
+                        words.append(word)
+
+            return ' '.join(words).strip()
+
+        except Exception as e:
+            print(f"[OCR] Tesseract error: {e}")
+            return ''
+
+
+# Global OCR processor instance
+ocr_processor = OCRProcessor()
+
+
 # =====================================================================
 
 # Store movement history for each tracked object (last 5 positions)
@@ -998,7 +1214,7 @@ def stream_video_to_api(video_path, dataset_name, transaction_id, machine_id,
     Returns:
         bool: True if upload successful, False otherwise
         
-    API Endpoint:
+API Endpoint:
         POST /shopping_app/machine/TransactionDataset/insert_transactionDataset
         
     Authentication:
@@ -1069,6 +1285,8 @@ def stream_video_to_api(video_path, dataset_name, transaction_id, machine_id,
     except Exception as e:
         print(f"Error during video streaming: {e}")
         return False
+
+
 
 # =====================================================================
 # VIDEO MONITORING AND AUTO-UPLOAD SYSTEM
@@ -1862,7 +2080,7 @@ class HailoDetectionCallback(app_callback_class):
             "comp.sink_1"
         )
 
-    # =================================================================
+  # =================================================================
     # API PLANOGRAM FETCHING AND REFRESH SYSTEM
     # =================================================================
     
@@ -2029,7 +2247,7 @@ class HailoDetectionCallback(app_callback_class):
             list: Current planogram data from environment cache
         """
         return self.load_planogram_env()
-    
+
     # =================================================================
     # PRODUCT VALIDATION AGAINST PLANOGRAM
     # =================================================================
@@ -2985,6 +3203,24 @@ def detection_callback(pad, info, callback_data):
         text_color = (0, 255, 0) if validation_result['valid'] else (0, 0, 255)
         cv2.putText(frame, label_text, (x1, y1 - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, text_color, 2)
+
+        # -----------------------------------------------------------
+        # OCR: Read Text from Product Label Region
+        # -----------------------------------------------------------
+        # Run OCR on the bounding box crop to extract any printed
+        # text (brand name, variant, weight, etc.) from the label.
+        # Results are cached per global_id so OCR only runs once
+        # per unique tracked object.
+        ocr_text = ocr_processor.read_label(frame, x1, y1, x2, y2, global_id)
+
+        if ocr_text:
+            # Draw OCR text just below the bounding box
+            ocr_display = f"OCR: {ocr_text[:30]}"  # Truncate long text for display
+            cv2.putText(frame, ocr_display, (x1, y2 + 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 2)
+
+            with print_lock:
+                print(f"[OCR] Track G:{global_id} ({label}) → '{ocr_text}'")
         
         # -----------------------------------------------------------
         # Draw Movement Trail
@@ -3300,7 +3536,7 @@ async def run_tracking(websocket: WebSocket):
             print("\n" + "-"*30)
             print("CAMERA 1 CAPTURE PHASE")
             print("-"*30)
-            camera1_images = capture_images(0, image_count)
+            camera1_images = capture_images(2, image_count)
             
             # ---------------------------------------------------
             # Process Results
@@ -3813,6 +4049,7 @@ def delete_images(image_paths):
     print(f"Successfully deleted {deleted_count} images")
     return deleted_count
 
+
 # =====================================================================
 # TRANSACTION-BASED MEMORY MANAGEMENT SYSTEM
 # =====================================================================
@@ -4004,6 +4241,10 @@ class TransactionMemoryManager:
             
             # Strategy 4: Try to release memory back to OS
             self._release_memory_to_os()
+
+            # Strategy 5: Clear OCR cache for completed transaction
+            ocr_processor.clear_cache()
+            print(f"[Cleanup] OCR cache cleared")
             
             # ==========================================================
             # STEP 5: VERIFY CLEANUP
@@ -5418,8 +5659,8 @@ def main():
     parser.add_argument(
         '--port', 
         type=int, 
-        default=8000, 
-        help='Port to run the server on (default: 8000)'
+        default=, 
+        help='Port to run the server on (default: )'
     )
     
     args = parser.parse_args()
@@ -5550,8 +5791,8 @@ DEPLOYMENT:
 1. Install dependencies: pip install -r requirements.txt
 2. Configure camera devices (/dev/video0, /dev/video2)
 3. Set up API credentials in code
-4. Run: python app_server.py --host 0.0.0.0 --port 8000
-5. Mobile app connects to: ws://raspberry-pi-ip:8000/ws/track
+4. Run: python app_server.py --host 0.0.0.0 --rtspport 8000
+5. Mobile app connects to: 
 
 MAINTENANCE:
 - Monitor memory usage: curl http://raspberry-pi:8000/stats
