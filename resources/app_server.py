@@ -120,10 +120,6 @@ from scipy.spatial import distance
 import weakref
 import setproctitle
 
-# OCR for text detection on product labels
-import pytesseract
-from PIL import Image
-
 # =====================================================================
 # GLOBAL VARIABLES AND CONFIGURATION
 # =====================================================================
@@ -190,218 +186,7 @@ unlock_data = 0                # Flag for door unlock control
 
 
 # =====================================================================
-# OCR PROCESSOR
-# =====================================================================
-
-class OCRProcessor:
-    """
-    OCR (Optical Character Recognition) processor for reading text
-    on product labels detected within bounding boxes.
-
-    This supplements the Hailo AI object detection by extracting
-    human-readable text (e.g. brand names, barcodes, expiry dates)
-    directly from the cropped region of each detection.
-
-    Features:
-    - Preprocessing pipeline to improve OCR accuracy on fridge labels
-    - Confidence-based filtering (rejects low-quality reads)
-    - Thread-safe result caching per global track ID
-    - Lightweight: only runs OCR when a new track is first seen
-
-    Usage:
-        ocr_processor = OCRProcessor()
-        text = ocr_processor.read_label(frame, x1, y1, x2, y2, global_id)
-    """
-
-    def __init__(self, min_confidence=60, cache_size=200):
-        """
-        Initialize OCR processor.
-
-        Args:
-            min_confidence (int): Minimum Tesseract confidence score (0-100)
-                                  to accept a result. Default 60.
-            cache_size (int): Maximum number of track results to cache.
-                              Oldest entries are evicted when full.
-        """
-        self.min_confidence = min_confidence
-        self.cache_size = cache_size
-
-        # Cache: global_track_id -> OCR text string (or None if unreadable)
-        self._cache: Dict[int, str] = {}
-        self._cache_lock = threading.Lock()
-
-        # Tesseract config: single line of text, alphanumeric + common symbols
-        self._tess_config = '--oem 3 --psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 -./'
-
-    # -----------------------------------------------------------------
-    # PUBLIC API
-    # -----------------------------------------------------------------
-
-    def read_label(self, frame, x1, y1, x2, y2, global_id):
-        """
-        Extract and return OCR text from a bounding box region.
-
-        Caches results per global_id so OCR only runs once per
-        unique tracked object, keeping CPU load minimal.
-
-        Args:
-            frame (numpy.ndarray): BGR video frame from OpenCV.
-            x1, y1, x2, y2 (int): Bounding box pixel coordinates.
-            global_id (int): Global track ID for cache lookup.
-
-        Returns:
-            str: Cleaned OCR text, or empty string if unreadable.
-        """
-        # Return cached result if already processed this track
-        with self._cache_lock:
-            if global_id in self._cache:
-                return self._cache[global_id]
-
-        # Crop and preprocess the label region
-        crop = self._crop_region(frame, x1, y1, x2, y2)
-        if crop is None:
-            return ''
-
-        processed = self._preprocess(crop)
-        text = self._run_tesseract(processed)
-
-        # Store in cache (evict oldest if full)
-        with self._cache_lock:
-            if len(self._cache) >= self.cache_size:
-                oldest_key = next(iter(self._cache))
-                del self._cache[oldest_key]
-            self._cache[global_id] = text
-
-        return text
-
-    def clear_cache(self):
-        """
-        Clear the OCR result cache.
-
-        Call this at the end of each transaction to free memory,
-        consistent with the TransactionMemoryManager cleanup strategy.
-        """
-        with self._cache_lock:
-            self._cache.clear()
-
-    # -----------------------------------------------------------------
-    # INTERNAL HELPERS
-    # -----------------------------------------------------------------
-
-    def _crop_region(self, frame, x1, y1, x2, y2):
-        """
-        Safely crop a bounding box region from the frame.
-
-        Adds a small padding (5 px) around the box to capture
-        text that sits right at the edge of a detection boundary.
-
-        Args:
-            frame (numpy.ndarray): Source BGR frame.
-            x1, y1, x2, y2 (int): Bounding box coordinates.
-
-        Returns:
-            numpy.ndarray or None: Cropped region, or None if invalid.
-        """
-        h, w = frame.shape[:2]
-
-        # Apply padding, clamped to frame boundaries
-        pad = 5
-        cx1 = max(0, x1 - pad)
-        cy1 = max(0, y1 - pad)
-        cx2 = min(w, x2 + pad)
-        cy2 = min(h, y2 + pad)
-
-        # Reject degenerate crops
-        if cx2 <= cx1 or cy2 <= cy1:
-            return None
-
-        return frame[cy1:cy2, cx1:cx2]
-
-    def _preprocess(self, crop):
-        """
-        Preprocess the cropped region to improve Tesseract accuracy.
-
-        Pipeline:
-        1. Upscale 2x  – Tesseract works best on text >= 20px tall
-        2. Grayscale   – Remove color noise
-        3. Denoise     – Smooth sensor noise before thresholding
-        4. Threshold   – Adaptive binarisation handles varied lighting
-
-        Args:
-            crop (numpy.ndarray): BGR crop from the frame.
-
-        Returns:
-            numpy.ndarray: Binary (black/white) image ready for Tesseract.
-        """
-        # Step 1: Upscale for small labels
-        upscaled = cv2.resize(crop, None, fx=2, fy=2,
-                              interpolation=cv2.INTER_CUBIC)
-
-        # Step 2: Convert to grayscale
-        gray = cv2.cvtColor(upscaled, cv2.COLOR_BGR2GRAY)
-
-        # Step 3: Denoise
-        denoised = cv2.fastNlMeansDenoising(gray, h=10)
-
-        # Step 4: Adaptive threshold (handles uneven lighting in fridge)
-        binary = cv2.adaptiveThreshold(
-            denoised, 255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY,
-            blockSize=11,
-            C=2
-        )
-
-        return binary
-
-    def _run_tesseract(self, processed_img):
-        """
-        Run Tesseract OCR on the preprocessed image.
-
-        Uses pytesseract's image_to_data() to get per-word confidence
-        scores, filtering out any words below min_confidence.
-
-        Args:
-            processed_img (numpy.ndarray): Binary preprocessed image.
-
-        Returns:
-            str: Space-joined high-confidence words, stripped of
-                 whitespace. Empty string if nothing readable.
-        """
-        try:
-            pil_img = Image.fromarray(processed_img)
-
-            # Get detailed OCR data with confidence scores
-            ocr_data = pytesseract.image_to_data(
-                pil_img,
-                config=self._tess_config,
-                output_type=pytesseract.Output.DICT
-            )
-
-            # Collect words that meet confidence threshold
-            words = []
-            for i, conf in enumerate(ocr_data['conf']):
-                try:
-                    conf_val = int(conf)
-                except (ValueError, TypeError):
-                    continue
-
-                if conf_val >= self.min_confidence:
-                    word = ocr_data['text'][i].strip()
-                    if word:
-                        words.append(word)
-
-            return ' '.join(words).strip()
-
-        except Exception as e:
-            print(f"[OCR] Tesseract error: {e}")
-            return ''
-
-
-# Global OCR processor instance
-ocr_processor = OCRProcessor()
-
-
+# TRACKING DATA STRUCTURES
 # =====================================================================
 
 # Store movement history for each tracked object (last 5 positions)
@@ -1218,8 +1003,8 @@ API Endpoint:
         POST /shopping_app/machine/TransactionDataset/insert_transactionDataset
         
     Authentication:
-        - Basic Auth: username='admin', password='1234'
-        - API Key: '123456' in x-api-key header
+        - Basic Auth: username='', password=''
+        - API Key: ' in x-api-key header
         
     Upload Details:
         - Method: HTTP POST with multipart/form-data
@@ -1811,6 +1596,14 @@ class HailoDetectionCallback(app_callback_class):
         # Create video directory BEFORE loading planogram
         self.video_directory = os.path.join(os.getcwd(), "saved_videos")
         os.makedirs(self.video_directory, exist_ok=True)
+        
+        # Clean video for post-processing (Camera 0 only, no overlays)
+        self.clean_video_writer = None
+        self.clean_video_path = None
+        self.clean_video_fps_calculated = False
+        self.clean_video_frame_count = 0
+        self.clean_video_fps_start = None
+        self.clean_video_lock = threading.Lock()
         
         # Store machine_id in environment variable for persistence
         self.store_machine_id_env(machine_id)
@@ -3109,6 +2902,12 @@ def detection_callback(pad, info, callback_data):
     frame = get_numpy_from_buffer(buffer, format, width, height)
     
     # =================================================================
+    # STEP 2b: SAVE RAW FRAME FOR POST-PROCESSING (Camera 0 only)
+    # =================================================================
+    if stream_id == 0:
+        raw_frame_copy = frame.copy()
+    
+    # =================================================================
     # STEP 3: CAMERA COVER DETECTION (Security Feature)
     # =================================================================
     # Check if camera is covered/blocked
@@ -3203,24 +3002,6 @@ def detection_callback(pad, info, callback_data):
         text_color = (0, 255, 0) if validation_result['valid'] else (0, 0, 255)
         cv2.putText(frame, label_text, (x1, y1 - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, text_color, 2)
-
-        # -----------------------------------------------------------
-        # OCR: Read Text from Product Label Region
-        # -----------------------------------------------------------
-        # Run OCR on the bounding box crop to extract any printed
-        # text (brand name, variant, weight, etc.) from the label.
-        # Results are cached per global_id so OCR only runs once
-        # per unique tracked object.
-        ocr_text = ocr_processor.read_label(frame, x1, y1, x2, y2, global_id)
-
-        if ocr_text:
-            # Draw OCR text just below the bounding box
-            ocr_display = f"OCR: {ocr_text[:30]}"  # Truncate long text for display
-            cv2.putText(frame, ocr_display, (x1, y2 + 18),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 2)
-
-            with print_lock:
-                print(f"[OCR] Track G:{global_id} ({label}) → '{ocr_text}'")
         
         # -----------------------------------------------------------
         # Draw Movement Trail
@@ -3385,8 +3166,304 @@ def detection_callback(pad, info, callback_data):
         label
     )
     
+    # =================================================================
+    # STEP 13b: WRITE CLEAN FRAME (Camera 0 only, no overlays)
+    # =================================================================
+    if stream_id == 0:
+        with user_data.clean_video_lock:
+            # Convert raw_frame_copy to BGR for VideoWriter
+            raw_bgr = cv2.cvtColor(raw_frame_copy, cv2.COLOR_RGB2BGR)
+            
+            # Initialize FPS tracking
+            if user_data.clean_video_fps_start is None:
+                user_data.clean_video_fps_start = time.time()
+            user_data.clean_video_frame_count += 1
+            
+            # Create writer after 30 frames (same FPS detection as display loop)
+            if not user_data.clean_video_fps_calculated and user_data.clean_video_frame_count >= 30:
+                elapsed = time.time() - user_data.clean_video_fps_start
+                fps = user_data.clean_video_frame_count / elapsed
+                user_data.clean_video_fps_calculated = True
+                
+                # Build clean video path alongside main video directory
+                timestamp = time.strftime('%Y%m%d_%H%M%S')
+                tid = getattr(user_data, 'transaction_id', 'unknown')
+                clean_filename = f"clean_cam0_{timestamp}_{tid}.avi"
+                user_data.clean_video_path = os.path.join(
+                    user_data.video_directory, clean_filename
+                )
+                fourcc = cv2.VideoWriter_fourcc(*'XVID')
+                h, w = raw_bgr.shape[:2]
+                user_data.clean_video_writer = cv2.VideoWriter(
+                    user_data.clean_video_path, fourcc, fps, (w, h), isColor=True
+                )
+                print(f"[PostProcess] Clean video writer started: {user_data.clean_video_path}")
+            
+            # Write frame once writer is ready
+            if user_data.clean_video_writer is not None:
+                user_data.clean_video_writer.write(raw_bgr)
+    
     # Continue processing pipeline
     return Gst.PadProbeReturn.OK
+
+# =====================================================================
+# POST-PROCESSING THREAD (Secondary Hailo Verification)
+# =====================================================================
+
+class PostProcessThread(threading.Thread):
+    """
+    Background thread that re-runs Hailo on the clean Camera 0 video
+    after a transaction ends, to verify realtime detection counts.
+
+    Strategy:
+    - Samples frames evenly across the clean video
+    - Scores each frame by blur (Laplacian variance) + bbox stability
+    - Picks best frame per tracked product
+    - Re-classifies using a fresh Hailo GStreamer pipeline on the file
+    - Compares against realtime counts and logs any discrepancies
+    - Deletes the clean video when done
+
+    This does NOT modify charges - it only logs discrepancies for review.
+    """
+
+    # Minimum blur score to consider a frame usable
+    BLUR_THRESHOLD = 80.0
+    # Number of frames to sample from the video
+    SAMPLE_COUNT = 60
+
+    def __init__(self, clean_video_path, realtime_counts, transaction_id,
+                 hef_path, post_process_so, labels_json):
+        super().__init__(daemon=True)
+        self.clean_video_path = clean_video_path
+        self.realtime_counts = realtime_counts  # dict: {label: count}
+        self.transaction_id = transaction_id
+        self.hef_path = hef_path
+        self.post_process_so = post_process_so
+        self.labels_json = labels_json
+
+    def run(self):
+        print(f"[PostProcess] Starting for transaction {self.transaction_id}")
+        try:
+            post_counts = self._run_hailo_on_video()
+            self._compare_and_log(post_counts)
+        except Exception as e:
+            print(f"[PostProcess] Error: {e}")
+        finally:
+            self._delete_clean_video()
+
+    # ------------------------------------------------------------------
+    # HAILO RE-INFERENCE ON VIDEO FILE
+    # ------------------------------------------------------------------
+
+    def _run_hailo_on_video(self):
+        """
+        Open the clean video, sample frames, run Hailo inference on each,
+        and accumulate label detections.
+
+        Returns:
+            dict: {label: count} from post-processing
+        """
+        import gi
+        gi.require_version('Gst', '1.0')
+        from gi.repository import Gst
+        import hailo
+
+        cap = cv2.VideoCapture(self.clean_video_path)
+        if not cap.isOpened():
+            print(f"[PostProcess] Cannot open video: {self.clean_video_path}")
+            return {}
+
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total_frames <= 0:
+            cap.release()
+            return {}
+
+        # Build evenly-spaced sample indices
+        step = max(1, total_frames // self.SAMPLE_COUNT)
+        sample_indices = list(range(0, total_frames, step))[:self.SAMPLE_COUNT]
+
+        print(f"[PostProcess] Video has {total_frames} frames, sampling {len(sample_indices)}")
+
+        # Load label map
+        label_map = self._load_labels()
+
+        # Initialize Hailo inference (InferVStreams API — no GStreamer pipeline needed)
+        from hailo_platform import (HEF, VDevice, HailoStreamInterface,
+                                    InferVStreams, ConfigureParams,
+                                    InputVStreamParams, OutputVStreamParams,
+                                    FormatType)
+
+        hef = HEF(self.hef_path)
+        target = VDevice()
+        configure_params = ConfigureParams.create_from_hef(
+            hef, interface=HailoStreamInterface.PCIe
+        )
+        network_groups = target.configure(hef, configure_params)
+        network_group = network_groups[0]
+        network_group_params = network_group.create_params()
+
+        input_vstream_params = InputVStreamParams.make(
+            network_group, quantized=False, format_type=FormatType.FLOAT32
+        )
+        output_vstream_params = OutputVStreamParams.make(
+            network_group, quantized=False, format_type=FormatType.FLOAT32
+        )
+
+        # Accumulate best detections per label across all sampled frames
+        # {label: best_confidence}
+        best_detections = {}
+
+        with InferVStreams(network_group, input_vstream_params,
+                          output_vstream_params) as infer_pipeline:
+            with network_group.activate(network_group_params):
+                for idx in sample_indices:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                    ret, frame = cap.read()
+                    if not ret or frame is None:
+                        continue
+
+                    # Skip blurry frames
+                    blur = self._blur_score(frame)
+                    if blur < self.BLUR_THRESHOLD:
+                        continue
+
+                    # Preprocess frame for Hailo (resize to 640x640, normalize)
+                    input_data = self._preprocess_frame(frame)
+
+                    # Run inference
+                    try:
+                        input_dict = {
+                            infer_pipeline.get_input_vstream_infos()[0].name: input_data
+                        }
+                        with infer_pipeline.infer(input_dict) as infer_results:
+                            for out_name, out_data in infer_results.items():
+                                detections = self._parse_output(
+                                    out_data, label_map, frame.shape
+                                )
+                                for label, confidence in detections:
+                                    if label not in best_detections or \
+                                       confidence > best_detections[label]:
+                                        best_detections[label] = confidence
+                    except Exception as e:
+                        print(f"[PostProcess] Inference error on frame {idx}: {e}")
+                        continue
+
+        cap.release()
+
+        # Convert best_detections to counts (1 per label detected above threshold)
+        CONFIDENCE_THRESHOLD = 0.5
+        post_counts = {
+            label: 1
+            for label, conf in best_detections.items()
+            if conf >= CONFIDENCE_THRESHOLD
+        }
+        print(f"[PostProcess] Post-process detections: {post_counts}")
+        return post_counts
+
+    # ------------------------------------------------------------------
+    # HELPERS
+    # ------------------------------------------------------------------
+
+    def _blur_score(self, frame):
+        """Laplacian variance — higher = sharper."""
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        return cv2.Laplacian(gray, cv2.CV_64F).var()
+
+    def _preprocess_frame(self, frame):
+        """Resize and normalize frame for Hailo input."""
+        resized = cv2.resize(frame, (640, 640))
+        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+        normalized = rgb.astype(np.float32) / 255.0
+        return np.expand_dims(normalized, axis=0)  # (1, 640, 640, 3)
+
+    def _load_labels(self):
+        """Load label map from JSON file."""
+        try:
+            with open(self.labels_json, 'r') as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    def _parse_output(self, output_data, label_map, frame_shape):
+        """
+        Parse raw Hailo output into (label, confidence) pairs.
+        Handles flat array output format typical of YOLO models.
+        """
+        detections = []
+        try:
+            # output_data shape: (1, num_detections, 5 + num_classes) or similar
+            data = output_data[0] if output_data.ndim == 4 else output_data
+            data = data.reshape(-1, data.shape[-1])
+            for row in data:
+                if len(row) < 6:
+                    continue
+                confidence = float(row[4])
+                if confidence < 0.3:
+                    continue
+                class_scores = row[5:]
+                class_id = int(np.argmax(class_scores))
+                class_conf = float(class_scores[class_id]) * confidence
+                label = label_map.get(str(class_id), label_map.get(class_id, f"class_{class_id}"))
+                detections.append((label, class_conf))
+        except Exception as e:
+            print(f"[PostProcess] Parse error: {e}")
+        return detections
+
+    # ------------------------------------------------------------------
+    # COMPARISON AND LOGGING
+    # ------------------------------------------------------------------
+
+    def _compare_and_log(self, post_counts):
+        """
+        Compare post-process detections against realtime counts.
+        Logs any discrepancies for review.
+        """
+        print(f"\n[PostProcess] === Verification Report: {self.transaction_id} ===")
+        print(f"[PostProcess] Realtime counts : {self.realtime_counts}")
+        print(f"[PostProcess] Post-process    : {post_counts}")
+
+        all_labels = set(list(self.realtime_counts.keys()) + list(post_counts.keys()))
+        discrepancies = []
+
+        for label in all_labels:
+            rt_count = self.realtime_counts.get(label, 0)
+            pp_present = 1 if label in post_counts else 0
+
+            # Flag if post-process found something realtime missed, or vice versa
+            if rt_count == 0 and pp_present == 1:
+                discrepancies.append({
+                    'label': label,
+                    'issue': 'MISSED_IN_REALTIME',
+                    'realtime': rt_count,
+                    'post_process': pp_present
+                })
+            elif rt_count > 0 and pp_present == 0:
+                discrepancies.append({
+                    'label': label,
+                    'issue': 'NOT_CONFIRMED_BY_POST',
+                    'realtime': rt_count,
+                    'post_process': pp_present
+                })
+
+        if discrepancies:
+            print(f"[PostProcess] ⚠️  {len(discrepancies)} discrepancy(ies) found:")
+            for d in discrepancies:
+                print(f"  - {d['label']}: {d['issue']} "
+                      f"(realtime={d['realtime']}, post={d['post_process']})")
+        else:
+            print(f"[PostProcess] ✅ Realtime counts confirmed by post-processing")
+
+        print(f"[PostProcess] {'='*50}\n")
+
+    def _delete_clean_video(self):
+        """Delete the clean video file after post-processing."""
+        try:
+            if self.clean_video_path and os.path.exists(self.clean_video_path):
+                os.remove(self.clean_video_path)
+                print(f"[PostProcess] Clean video deleted: {self.clean_video_path}")
+        except Exception as e:
+            print(f"[PostProcess] Error deleting clean video: {e}")
+
 
 # =====================================================================
 # TRANSACTION ORCHESTRATION FUNCTION
@@ -3678,6 +3755,37 @@ async def run_tracking(websocket: WebSocket):
             
             # Run pipeline (blocks until shutdown)
             app.run()
+            
+            # ---------------------------------------------------------
+            # CLOSE CLEAN VIDEO AND LAUNCH POST-PROCESSING
+            # ---------------------------------------------------------
+            try:
+                with callback.clean_video_lock:
+                    if callback.clean_video_writer is not None:
+                        callback.clean_video_writer.release()
+                        callback.clean_video_writer = None
+                        print(f"[PostProcess] Clean video saved: {callback.clean_video_path}")
+                
+                if callback.clean_video_path and os.path.exists(callback.clean_video_path):
+                    # Build realtime counts from validated_products (entry direction)
+                    realtime_counts = {
+                        label: details["count"]
+                        for label, details in
+                        callback.tracking_data.validated_products.get("entry", {}).items()
+                    }
+                    
+                    post_thread = PostProcessThread(
+                        clean_video_path=callback.clean_video_path,
+                        realtime_counts=realtime_counts,
+                        transaction_id=transaction_id,
+                        hef_path=app.hef_path,
+                        post_process_so=app.post_process_so,
+                        labels_json=app.labels_json
+                    )
+                    post_thread.start()
+                    print(f"[PostProcess] Background verification started for {transaction_id}")
+            except Exception as e:
+                print(f"[PostProcess] Failed to start post-processing: {e}")
             
             # END TRANSACTION MEMORY TRACKING
             if transaction_id:
@@ -4241,10 +4349,6 @@ class TransactionMemoryManager:
             
             # Strategy 4: Try to release memory back to OS
             self._release_memory_to_os()
-
-            # Strategy 5: Clear OCR cache for completed transaction
-            ocr_processor.clear_cache()
-            print(f"[Cleanup] OCR cache cleared")
             
             # ==========================================================
             # STEP 5: VERIFY CLEANUP
