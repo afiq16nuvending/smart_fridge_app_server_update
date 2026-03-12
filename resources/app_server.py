@@ -3332,16 +3332,8 @@ class PostProcessThread(threading.Thread):
 
                     # Run inference
                     try:
-                        # Discover correct attribute name for this Hailo version
-                        if hasattr(infer_pipeline, 'input_vstream_infos'):
-                            input_name = infer_pipeline.input_vstream_infos[0].name
-                        elif hasattr(infer_pipeline, 'get_input_vstream_infos'):
-                            input_name = infer_pipeline.get_input_vstream_infos()[0].name
-                        elif hasattr(infer_pipeline, 'input_vstreams_params'):
-                            input_name = list(infer_pipeline.input_vstreams_params.keys())[0]
-                        else:
-                            print(f"[PostProcess] InferVStreams attrs: {[a for a in dir(infer_pipeline) if not a.startswith('__')]}")
-                            raise AttributeError("Cannot find input vstream name attribute")
+                        # Get input name from internal dict (confirmed via dir() inspection)
+                        input_name = list(infer_pipeline._input_vstreams_params.keys())[0]
                         input_dict = {input_name: input_data}
                         with infer_pipeline.infer(input_dict) as infer_results:
                             for out_name, out_data in infer_results.items():
