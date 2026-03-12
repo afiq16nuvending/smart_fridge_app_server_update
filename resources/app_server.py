@@ -3332,9 +3332,17 @@ class PostProcessThread(threading.Thread):
 
                     # Run inference
                     try:
-                        input_dict = {
-                            infer_pipeline.input_vstream_infos[0].name: input_data
-                        }
+                        # Discover correct attribute name for this Hailo version
+                        if hasattr(infer_pipeline, 'input_vstream_infos'):
+                            input_name = infer_pipeline.input_vstream_infos[0].name
+                        elif hasattr(infer_pipeline, 'get_input_vstream_infos'):
+                            input_name = infer_pipeline.get_input_vstream_infos()[0].name
+                        elif hasattr(infer_pipeline, 'input_vstreams_params'):
+                            input_name = list(infer_pipeline.input_vstreams_params.keys())[0]
+                        else:
+                            print(f"[PostProcess] InferVStreams attrs: {[a for a in dir(infer_pipeline) if not a.startswith('__')]}")
+                            raise AttributeError("Cannot find input vstream name attribute")
+                        input_dict = {input_name: input_data}
                         with infer_pipeline.infer(input_dict) as infer_results:
                             for out_name, out_data in infer_results.items():
                                 detections = self._parse_output(
@@ -3456,13 +3464,8 @@ class PostProcessThread(threading.Thread):
         print(f"[PostProcess] {'='*50}\n")
 
     def _delete_clean_video(self):
-        """Delete the clean video file after post-processing."""
-        try:
-            if self.clean_video_path and os.path.exists(self.clean_video_path):
-                os.remove(self.clean_video_path)
-                print(f"[PostProcess] Clean video deleted: {self.clean_video_path}")
-        except Exception as e:
-            print(f"[PostProcess] Error deleting clean video: {e}")
+        """Keep clean video for manual inspection (deletion disabled)."""
+        print(f"[PostProcess] Clean video kept for inspection: {self.clean_video_path}")
 
 
 # =====================================================================
