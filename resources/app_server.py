@@ -3316,38 +3316,39 @@ class PostProcessThread(threading.Thread):
         # {label: best_confidence}
         best_detections = {}
 
-        # Buffer to hold pairs of frames (batch_size=2 matches pipeline config)
-        frame_buffer = []
+        # Pre-allocate a persistent batch buffer — Hailo needs a stable memory owner
+        batch_buffer = np.zeros((2, 640, 640, 3), dtype=np.uint8)
 
         with InferVStreams(network_group, input_vstream_params,
                           output_vstream_params) as infer_pipeline:
             input_name = list(infer_pipeline._input_vstreams_params.keys())[0]
+            print(f"[PostProcess] Input name: {input_name}, buffer shape: {batch_buffer.shape}")
             with network_group.activate(network_group_params):
+                pending_frame = None  # holds first frame while waiting for second
+
                 for idx in sample_indices:
                     cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
                     ret, frame = cap.read()
                     if not ret or frame is None:
                         continue
 
-                    # Skip blurry frames
                     blur = self._blur_score(frame)
                     if blur < self.BLUR_THRESHOLD:
                         continue
 
-                    frame_buffer.append(self._preprocess_frame(frame))
+                    preprocessed = self._preprocess_frame(frame)  # (640, 640, 3)
 
-                    # Process in batches of 2 (matches pipeline batch_size)
-                    if len(frame_buffer) < 2:
+                    if pending_frame is None:
+                        pending_frame = preprocessed
                         continue
 
-                    try:
-                        # Stack into (2, 640, 640, 3), ensure C-contiguous
-                        batch = np.ascontiguousarray(
-                            np.concatenate(frame_buffer, axis=0)
-                        )
-                        frame_buffer = []
+                    # Fill pre-allocated buffer in-place
+                    batch_buffer[0] = pending_frame
+                    batch_buffer[1] = preprocessed
+                    pending_frame = None
 
-                        input_dict = {input_name: batch}
+                    try:
+                        input_dict = {input_name: batch_buffer}
                         infer_results = infer_pipeline.infer(input_dict)
                         for out_name, out_data in infer_results.items():
                             detections = self._parse_output(
@@ -3359,7 +3360,7 @@ class PostProcessThread(threading.Thread):
                                     best_detections[label] = confidence
                     except Exception as e:
                         print(f"[PostProcess] Inference error on frame {idx}: {e}")
-                        frame_buffer = []
+                        pending_frame = None
                         continue
 
         cap.release()
@@ -3384,11 +3385,10 @@ class PostProcessThread(threading.Thread):
         return cv2.Laplacian(gray, cv2.CV_64F).var()
 
     def _preprocess_frame(self, frame):
-        """Resize frame for Hailo input (uint8, RGB, 640x640, batch=1)."""
+        """Resize frame for Hailo input (uint8, RGB, 640x640)."""
         resized = cv2.resize(frame, (640, 640))
         rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-        arr = np.ascontiguousarray(rgb.astype(np.uint8))
-        return np.expand_dims(arr, axis=0)  # (1, 640, 640, 3)
+        return np.ascontiguousarray(rgb.astype(np.uint8))  # (640, 640, 3)
 
     def _load_labels(self):
         """Load label map from JSON file."""
