@@ -3301,6 +3301,9 @@ class PostProcessThread(threading.Thread):
         configure_params = ConfigureParams.create_from_hef(
             hef, interface=HailoStreamInterface.PCIe
         )
+        # Set batch_size=1 for post-process (no GStreamer pipeline constraints)
+        for network_group_name in configure_params:
+            configure_params[network_group_name].batch_size = 1
         network_groups = target.configure(hef, configure_params)
         network_group = network_groups[0]
         network_group_params = network_group.create_params()
@@ -3316,20 +3319,12 @@ class PostProcessThread(threading.Thread):
         # {label: best_confidence}
         best_detections = {}
 
-        # Pre-allocate a persistent batch buffer — Hailo needs a stable memory owner
-        batch_buffer = np.zeros((2, 640, 640, 3), dtype=np.uint8)
-
         with InferVStreams(network_group, input_vstream_params,
                           output_vstream_params) as infer_pipeline:
             input_name = list(infer_pipeline._input_vstreams_params.keys())[0]
-            print(f"[PostProcess] Input name: {input_name}, buffer shape: {batch_buffer.shape}")
-            print(f"[PostProcess] Output vstream params: {list(infer_pipeline._output_vstreams_params.keys())}")
-            # Log output shapes for diagnostics
-            for k, v in infer_pipeline._output_vstreams_params.items():
-                print(f"[PostProcess] Output '{k}': shape={getattr(v, 'shape', '?')} dtype={getattr(v, 'data_bytes', '?')} bytes")
-            with network_group.activate(network_group_params):
-                pending_frame = None  # holds first frame while waiting for second
+            print(f"[PostProcess] Input name: {input_name}")
 
+            with network_group.activate(network_group_params):
                 for idx in sample_indices:
                     cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
                     ret, frame = cap.read()
@@ -3340,35 +3335,13 @@ class PostProcessThread(threading.Thread):
                     if blur < self.BLUR_THRESHOLD:
                         continue
 
-                    preprocessed = self._preprocess_frame(frame)  # (640, 640, 3)
-
-                    if pending_frame is None:
-                        pending_frame = preprocessed
-                        continue
-
-                    # Fill pre-allocated buffer in-place
-                    batch_buffer[0] = pending_frame
-                    batch_buffer[1] = preprocessed
-                    pending_frame = None
+                    # Single frame, batch=1: shape (1, 640, 640, 3)
+                    preprocessed = self._preprocess_frame(frame)
 
                     try:
-                        # Pass raw bytes — Hailo C layer reads via PyBUF_SIMPLE
-                        raw_bytes = batch_buffer.tobytes()
-                        input_dict = {input_name: raw_bytes}
+                        input_dict = {input_name: preprocessed}
                         infer_results = infer_pipeline.infer(input_dict)
                         for out_name, out_data in infer_results.items():
-                            # infer() with bytes input returns bytes output —
-                            # convert back to numpy using known output vstream shape
-                            if isinstance(out_data, (bytes, bytearray)):
-                                out_params = infer_pipeline._output_vstreams_params
-                                out_info = out_params.get(out_name)
-                                if out_info is not None:
-                                    shape = out_info.shape  # e.g. (batch, H, W, C)
-                                    out_data = np.frombuffer(out_data, dtype=np.float32).reshape(shape)
-                                else:
-                                    # fallback: guess shape from byte count
-                                    n_floats = len(out_data) // 4
-                                    out_data = np.frombuffer(out_data, dtype=np.float32).reshape(2, -1)
                             detections = self._parse_output(
                                 out_data, label_map, frame.shape
                             )
@@ -3380,7 +3353,6 @@ class PostProcessThread(threading.Thread):
                         import traceback
                         print(f"[PostProcess] Inference error on frame {idx}: {e}")
                         print(f"[PostProcess] Traceback: {traceback.format_exc()}")
-                        pending_frame = None
                         continue
 
         cap.release()
@@ -3405,10 +3377,11 @@ class PostProcessThread(threading.Thread):
         return cv2.Laplacian(gray, cv2.CV_64F).var()
 
     def _preprocess_frame(self, frame):
-        """Resize frame for Hailo input (uint8, RGB, 640x640)."""
+        """Resize frame for Hailo input — returns (1, 640, 640, 3) uint8 numpy array."""
         resized = cv2.resize(frame, (640, 640))
         rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-        return np.ascontiguousarray(rgb.astype(np.uint8))  # (640, 640, 3)
+        arr = np.ascontiguousarray(rgb.astype(np.uint8))
+        return np.expand_dims(arr, axis=0)  # (1, 640, 640, 3)
 
     def _load_labels(self):
         """Load label map from JSON file."""
