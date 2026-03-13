@@ -3283,6 +3283,34 @@ def main():
 
     best = {}   # label -> best confidence
 
+    # Warm-up probe: try a dummy infer to confirm the device is truly ready.
+    # VDevice() opens fine even when GStreamer PCIe DMA buffers are still active,
+    # so we probe with actual inference before processing real frames.
+    for warmup_attempt in range(20):
+        try:
+            with InferVStreams(ng, in_params, out_params) as probe_pipe:
+                probe_name = list(probe_pipe._input_vstreams_params.keys())[0]
+                with ng.activate(ng_params):
+                    dummy = np.zeros((2, 640, 640, 3), dtype=np.uint8)
+                    probe_pipe.infer({probe_name: dummy})
+            print(f"[PPSubproc] Warm-up succeeded on attempt {warmup_attempt+1}", file=sys.stderr)
+            break
+        except Exception as we:
+            print(f"[PPSubproc] Warm-up attempt {warmup_attempt+1} failed: {we}", file=sys.stderr)
+            time.sleep(3)
+            # Re-configure after failed warm-up to get fresh vstream state
+            try:
+                ng_list2 = target.configure(hef, cfg)
+                ng       = ng_list2[0]
+                ng_params = ng.create_params()
+                in_params  = InputVStreamParams.make(ng,  quantized=True,  format_type=FormatType.UINT8)
+                out_params = OutputVStreamParams.make(ng, quantized=False, format_type=FormatType.FLOAT32)
+            except Exception:
+                pass
+    else:
+        print(json.dumps({"error": "warm-up failed after 20 attempts", "counts": {}}))
+        return
+
     with InferVStreams(ng, in_params, out_params) as pipe:
         in_name = list(pipe._input_vstreams_params.keys())[0]
         print(f"[PPSubproc] input vstream: {in_name}", file=sys.stderr)
