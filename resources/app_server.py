@@ -3281,8 +3281,6 @@ def main():
     gi.require_version("GLib", "2.0")
     gi.require_version("GstApp", "1.0")
     from gi.repository import Gst, GLib, GstApp
-    # Enable hailonet debug output to stderr so we can see device errors
-    os.environ.setdefault("GST_DEBUG", "hailonet:5,hailort:5")
     Gst.init(None)
 
     # Pre-process: resize all frames to 640x640 RGB
@@ -3317,8 +3315,8 @@ def main():
     pipeline_str = (
         "appsrc name=src format=time is-live=false block=true "
         "caps=video/x-raw,format=RGB,width=640,height=640,framerate=5/1 ! "
-        "queue ! "
-        f"hailonet hef-path={hef_path} batch-size=2 "
+        "queue max-size-buffers=4 leaky=downstream ! "
+        f"hailonet hef-path={hef_path} batch-size=1 "
         "nms-score-threshold=0.3 nms-iou-threshold=0.45 "
         "output-format-type=HAILO_FORMAT_TYPE_FLOAT32 ! "
         "queue ! "
@@ -3338,10 +3336,13 @@ def main():
     bus  = pipeline.get_bus()
     bus.add_signal_watch()
     bus.connect("message::eos",   lambda b, m: loop.quit())
-    bus.connect("message::error", lambda b, m: (
-        print(f"[PPSubproc] GStreamer error: {m.parse_error()[0]}", file=sys.stderr),
+    def on_error(bus, msg):
+        err, dbg = msg.parse_error()
+        print(f"[PPSubproc] GStreamer error: {err}", file=sys.stderr)
+        if dbg:
+            print(f"[PPSubproc] GStreamer debug: {dbg}", file=sys.stderr)
         loop.quit()
-    ))
+    bus.connect("message::error", lambda b, m: on_error(b, m))
 
     pipeline.set_state(Gst.State.PLAYING)
 
