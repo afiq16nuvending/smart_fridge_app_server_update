@@ -3323,6 +3323,10 @@ class PostProcessThread(threading.Thread):
                           output_vstream_params) as infer_pipeline:
             input_name = list(infer_pipeline._input_vstreams_params.keys())[0]
             print(f"[PostProcess] Input name: {input_name}, buffer shape: {batch_buffer.shape}")
+            print(f"[PostProcess] Output vstream params: {list(infer_pipeline._output_vstreams_params.keys())}")
+            # Log output shapes for diagnostics
+            for k, v in infer_pipeline._output_vstreams_params.items():
+                print(f"[PostProcess] Output '{k}': shape={getattr(v, 'shape', '?')} dtype={getattr(v, 'data_bytes', '?')} bytes")
             with network_group.activate(network_group_params):
                 pending_frame = None  # holds first frame while waiting for second
 
@@ -3350,10 +3354,21 @@ class PostProcessThread(threading.Thread):
                     try:
                         # Pass raw bytes — Hailo C layer reads via PyBUF_SIMPLE
                         raw_bytes = batch_buffer.tobytes()
-                        print(f"[PostProcess] Sending {len(raw_bytes)} bytes to Hailo")
                         input_dict = {input_name: raw_bytes}
                         infer_results = infer_pipeline.infer(input_dict)
                         for out_name, out_data in infer_results.items():
+                            # infer() with bytes input returns bytes output —
+                            # convert back to numpy using known output vstream shape
+                            if isinstance(out_data, (bytes, bytearray)):
+                                out_params = infer_pipeline._output_vstreams_params
+                                out_info = out_params.get(out_name)
+                                if out_info is not None:
+                                    shape = out_info.shape  # e.g. (batch, H, W, C)
+                                    out_data = np.frombuffer(out_data, dtype=np.float32).reshape(shape)
+                                else:
+                                    # fallback: guess shape from byte count
+                                    n_floats = len(out_data) // 4
+                                    out_data = np.frombuffer(out_data, dtype=np.float32).reshape(2, -1)
                             detections = self._parse_output(
                                 out_data, label_map, frame.shape
                             )
@@ -3362,7 +3377,9 @@ class PostProcessThread(threading.Thread):
                                    confidence > best_detections[label]:
                                     best_detections[label] = confidence
                     except Exception as e:
+                        import traceback
                         print(f"[PostProcess] Inference error on frame {idx}: {e}")
+                        print(f"[PostProcess] Traceback: {traceback.format_exc()}")
                         pending_frame = None
                         continue
 
