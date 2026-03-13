@@ -1180,7 +1180,10 @@ def monitor_and_send_videos(video_directory, machine_id, machine_identifier, use
         try:
             # Find all .avi files in directory
             video_pattern = os.path.join(video_directory, "*.avi")
-            video_files = glob.glob(video_pattern)
+            video_files = [
+                f for f in glob.glob(video_pattern)
+                if not os.path.basename(f).startswith("clean_cam0_")
+            ]
             
             # Process each video file
             for video_path in video_files:
@@ -3303,7 +3306,7 @@ class PostProcessThread(threading.Thread):
         network_group_params = network_group.create_params()
 
         input_vstream_params = InputVStreamParams.make(
-            network_group, quantized=False, format_type=FormatType.FLOAT32
+            network_group, quantized=True, format_type=FormatType.UINT8
         )
         output_vstream_params = OutputVStreamParams.make(
             network_group, quantized=False, format_type=FormatType.FLOAT32
@@ -3313,8 +3316,12 @@ class PostProcessThread(threading.Thread):
         # {label: best_confidence}
         best_detections = {}
 
+        # Buffer to hold pairs of frames (batch_size=2 matches pipeline config)
+        frame_buffer = []
+
         with InferVStreams(network_group, input_vstream_params,
                           output_vstream_params) as infer_pipeline:
+            input_name = list(infer_pipeline._input_vstreams_params.keys())[0]
             with network_group.activate(network_group_params):
                 for idx in sample_indices:
                     cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
@@ -3327,25 +3334,32 @@ class PostProcessThread(threading.Thread):
                     if blur < self.BLUR_THRESHOLD:
                         continue
 
-                    # Preprocess frame for Hailo (resize to 640x640, normalize)
-                    input_data = self._preprocess_frame(frame)
+                    frame_buffer.append(self._preprocess_frame(frame))
 
-                    # Run inference
+                    # Process in batches of 2 (matches pipeline batch_size)
+                    if len(frame_buffer) < 2:
+                        continue
+
                     try:
-                        # Get input name from internal dict (confirmed via dir() inspection)
-                        input_name = list(infer_pipeline._input_vstreams_params.keys())[0]
-                        input_dict = {input_name: input_data}
-                        with infer_pipeline.infer(input_dict) as infer_results:
-                            for out_name, out_data in infer_results.items():
-                                detections = self._parse_output(
-                                    out_data, label_map, frame.shape
-                                )
-                                for label, confidence in detections:
-                                    if label not in best_detections or \
-                                       confidence > best_detections[label]:
-                                        best_detections[label] = confidence
+                        # Stack into (2, 640, 640, 3), ensure C-contiguous
+                        batch = np.ascontiguousarray(
+                            np.concatenate(frame_buffer, axis=0)
+                        )
+                        frame_buffer = []
+
+                        input_dict = {input_name: batch}
+                        infer_results = infer_pipeline.infer(input_dict)
+                        for out_name, out_data in infer_results.items():
+                            detections = self._parse_output(
+                                out_data, label_map, frame.shape
+                            )
+                            for label, confidence in detections:
+                                if label not in best_detections or \
+                                   confidence > best_detections[label]:
+                                    best_detections[label] = confidence
                     except Exception as e:
                         print(f"[PostProcess] Inference error on frame {idx}: {e}")
+                        frame_buffer = []
                         continue
 
         cap.release()
@@ -3370,11 +3384,11 @@ class PostProcessThread(threading.Thread):
         return cv2.Laplacian(gray, cv2.CV_64F).var()
 
     def _preprocess_frame(self, frame):
-        """Resize and normalize frame for Hailo input."""
+        """Resize frame for Hailo input (uint8, RGB, 640x640, batch=1)."""
         resized = cv2.resize(frame, (640, 640))
         rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-        normalized = rgb.astype(np.float32) / 255.0
-        return np.expand_dims(normalized, axis=0)  # (1, 640, 640, 3)
+        arr = np.ascontiguousarray(rgb.astype(np.uint8))
+        return np.expand_dims(arr, axis=0)  # (1, 640, 640, 3)
 
     def _load_labels(self):
         """Load label map from JSON file."""
