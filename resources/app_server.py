@@ -1018,7 +1018,7 @@ API Endpoint:
     # Authentication credentials
     username = 'admin'
     password = '1234'
-    api_key = '123456'
+    api_key = '123456f'
     
     # Get current timestamp for database record
     current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -3414,49 +3414,144 @@ class PostProcessRunner:
             self._delete_clean_video()
 
     def _run_subprocess(self):
-        import subprocess, json as _json
-        params = {
-            "video_path":       self.clean_video_path,
-            "hef_path":         self.hef_path,
-            "post_process_so":  self.post_process_so,
-            "labels_json":      self.labels_json,
-            "sample_count":     self.SAMPLE_COUNT,
-            "blur_threshold":   self.BLUR_THRESHOLD,
-            "conf_threshold":   self.CONF_THRESHOLD,
-        }
-        script_path = "/tmp/hailo_postprocess_worker.py"
-        # Always rewrite to ensure latest version is used
-        with open(script_path, "w") as f:
-            f.write(POST_PROCESS_SCRIPT)
+        """Run post-process inference in-process using a GStreamer appsrc pipeline.
+        Subprocess approach is impossible: hailonet holds a process-wide PCIe mutex."""
+        import cv2 as _cv2
+        import numpy as _np
+        import threading as _threading
 
-        proc = subprocess.run(
-            [sys.executable, script_path],
-            input=json.dumps(params),
-            capture_output=True,
-            text=True,
-            timeout=120
-        )
-        if proc.stderr:
-            for line in proc.stderr.strip().splitlines():
-                print(f"[PostProcess] {line}")
+        # --- Sample sharpest frames ---
+        cap = _cv2.VideoCapture(self.clean_video_path)
+        if not cap.isOpened():
+            print(f"[PostProcess] Cannot open video: {self.clean_video_path}")
+            return {}
+        total = int(cap.get(_cv2.CAP_PROP_FRAME_COUNT))
+        if total <= 0:
+            cap.release()
+            print("[PostProcess] Empty video")
+            return {}
 
-        # Parse last JSON line from stdout
-        counts = {}
-        for line in reversed(proc.stdout.strip().splitlines()):
-            line = line.strip()
-            if line.startswith("{"):
-                try:
-                    result = json.loads(line)
-                    counts = result.get("counts", {})
-                    if "error" in result:
-                        print(f"[PostProcess] Subprocess error: {result['error']}")
-                except Exception:
-                    pass
+        step = max(1, total // (self.SAMPLE_COUNT * 3))
+        candidates = []
+        idx = 0
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
                 break
+            if idx % step == 0:
+                gray  = _cv2.cvtColor(frame, _cv2.COLOR_BGR2GRAY)
+                score = _cv2.Laplacian(gray, _cv2.CV_64F).var()
+                if score >= self.BLUR_THRESHOLD:
+                    candidates.append((score, frame))
+            idx += 1
+        cap.release()
 
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        frames = [c[1] for c in candidates[:self.SAMPLE_COUNT]]
+        print(f"[PostProcess] [PPInProc] {total} frames, selected {len(frames)} sharp")
+        if not frames:
+            return {}
+
+        # Resize to 640x640 RGB for hailonet
+        processed = []
+        for frm in frames:
+            rgb = _cv2.cvtColor(frm, _cv2.COLOR_BGR2RGB)
+            if rgb.shape[:2] != (640, 640):
+                rgb = _cv2.resize(rgb, (640, 640))
+            processed.append(rgb)
+
+        # --- Build in-process GStreamer pipeline ---
+        import gi
+        gi.require_version("Gst", "1.0")
+        gi.require_version("GLib", "2.0")
+        gi.require_version("GstApp", "1.0")
+        from gi.repository import Gst, GLib
+        Gst.init(None)
+
+        detections = []
+        lock = _threading.Lock()
+
+        conf_thresh = self.CONF_THRESHOLD
+        def on_new_sample(appsink):
+            sample = appsink.emit("pull-sample")
+            if sample is None:
+                return Gst.FlowReturn.OK
+            buf = sample.get_buffer()
+            try:
+                import hailo
+                roi = hailo.get_roi_from_buffer(buf)
+                for det in roi.get_objects_typed(hailo.HAILO_DETECTION):
+                    label = det.get_label()
+                    conf  = det.get_confidence()
+                    if conf >= conf_thresh and label:
+                        with lock:
+                            detections.append(label)
+            except Exception:
+                pass
+            return Gst.FlowReturn.OK
+
+        pipeline_str = (
+            "appsrc name=src format=time is-live=false block=true "
+            "caps=video/x-raw,format=RGB,width=640,height=640,framerate=5/1 ! "
+            "queue max-size-buffers=4 leaky=downstream ! "
+            f"hailonet hef-path={self.hef_path} batch-size=1 "
+            "nms-score-threshold=0.3 nms-iou-threshold=0.45 "
+            "output-format-type=HAILO_FORMAT_TYPE_FLOAT32 ! "
+            "queue ! "
+            f"hailofilter function-name=filter_letterbox so-path={self.post_process_so} "
+            f"config-path={self.labels_json} qos=false ! "
+            "queue ! "
+            "appsink name=sink emit-signals=true sync=false max-buffers=10 drop=false"
+        )
+
+        print("[PostProcess] [PPInProc] Launching in-process GStreamer pipeline")
+        pipeline = Gst.parse_launch(pipeline_str)
+        src  = pipeline.get_by_name("src")
+        sink = pipeline.get_by_name("sink")
+        sink.connect("new-sample", on_new_sample)
+
+        loop = GLib.MainLoop()
+        bus  = pipeline.get_bus()
+        bus.add_signal_watch()
+
+        def on_error(bus, msg):
+            err, dbg = msg.parse_error()
+            print(f"[PostProcess] [PPInProc] GStreamer error: {err}")
+            if dbg:
+                print(f"[PostProcess] [PPInProc] Debug: {dbg}")
+            loop.quit()
+
+        bus.connect("message::eos",   lambda b, m: loop.quit())
+        bus.connect("message::error", on_error)
+
+        pipeline.set_state(Gst.State.PLAYING)
+
+        def push_frames():
+            pts = 0
+            duration = Gst.SECOND // 5
+            for frm in processed:
+                data = frm.tobytes()
+                buf  = Gst.Buffer.new_wrapped(data)
+                buf.pts      = pts
+                buf.duration = duration
+                pts += duration
+                ret = src.emit("push-buffer", buf)
+                if ret != Gst.FlowReturn.OK:
+                    print(f"[PostProcess] [PPInProc] push-buffer: {ret}")
+                    break
+            src.emit("end-of-stream")
+
+        push_thread = _threading.Thread(target=push_frames, daemon=True)
+        push_thread.start()
+        loop.run()
+        push_thread.join(timeout=10)
+        pipeline.set_state(Gst.State.NULL)
+
+        from collections import Counter
+        counts = dict(Counter(detections))
+        print(f"[PostProcess] [PPInProc] Raw detections: {counts}")
         print(f"[PostProcess] Post-process detections: {counts}")
         return counts
-
     def _compare_and_log(self, post_counts):
         print(f"\n[PostProcess] === Verification Report: {self.transaction_id} ===")
         print(f"[PostProcess] Realtime counts : {self.realtime_counts}")
@@ -3806,17 +3901,19 @@ async def run_tracking(websocket: WebSocket):
                     _transaction_id = transaction_id
                     _realtime_counts = dict(realtime_counts)
 
-                    def _delayed_post_process():
+                    # Run post-process IN-PROCESS after GStreamer pipeline is NULL.
+                    # Subprocess approach fails because hailonet holds a process-wide
+                    # PCIe device mutex that cannot be shared across processes.
+                    # We run it in a background thread so the WebSocket cleanup
+                    # (door_close audio etc.) is not blocked.
+                    def _inprocess_post_process():
                         import gc
-                        # Explicitly release the pipeline app object so GStreamer/hailonet
-                        # fully frees the Hailo PCIe device before we re-open it.
                         global current_pipeline_app
+                        # Release the app reference so GStreamer objects can finalize
                         with pipeline_lock:
                             current_pipeline_app = None
                         gc.collect()
-                        # Give the GLib event loop time to process the NULL state transition
-                        # and release all internal hailonet/PCIe DMA buffers
-                        time.sleep(5)
+                        time.sleep(2)  # Let GLib finalize hailonet internals
                         gc.collect()
                         runner = PostProcessRunner(
                             clean_video_path=_clean_video_path,
@@ -3829,7 +3926,7 @@ async def run_tracking(websocket: WebSocket):
                         runner.run()
 
                     post_thread = threading.Thread(
-                        target=_delayed_post_process, daemon=True
+                        target=_inprocess_post_process, daemon=True
                     )
                     post_thread.start()
                     print(f"[PostProcess] Background verification started for {transaction_id}")
