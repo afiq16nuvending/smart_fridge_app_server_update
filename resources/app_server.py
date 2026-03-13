@@ -3275,38 +3275,31 @@ def main():
         print(json.dumps({"error": "no sharp frames", "counts": {}}))
         return
 
-    # Write selected frames to a temp video for GStreamer filesrc
-    import tempfile
-    tmp_path = tempfile.mktemp(suffix=".avi")
-    h, w = frames[0].shape[:2]
-    fourcc = cv2.VideoWriter_fourcc(*"MJPG")
-    out = cv2.VideoWriter(tmp_path, fourcc, 5.0, (w, h))
-    for f in frames:
-        out.write(f)
-    out.release()
-    print(f"[PPSubproc] Wrote {len(frames)} frames to temp: {tmp_path}", file=sys.stderr)
-
-    # Run GStreamer pipeline on temp video using same hailonet element as main pipeline
+    # Feed frames directly via appsrc — no temp file, no container format issues
     import gi
     gi.require_version("Gst", "1.0")
     gi.require_version("GLib", "2.0")
-    from gi.repository import Gst, GLib
+    from gi.repository import Gst, GLib, GstApp
     Gst.init(None)
+
+    # Pre-process: resize all frames to 640x640 RGB
+    processed = []
+    for frm in frames:
+        rgb = cv2.cvtColor(frm, cv2.COLOR_BGR2RGB)
+        if rgb.shape[:2] != (640, 640):
+            rgb = cv2.resize(rgb, (640, 640))
+        processed.append(rgb)
 
     detections = []
     lock = threading.Lock()
-    done_event = threading.Event()
 
-    def on_new_sample(sink):
-        sample = sink.emit("pull-sample")
+    def on_new_sample(appsink):
+        sample = appsink.emit("pull-sample")
         if sample is None:
             return Gst.FlowReturn.OK
         buf = sample.get_buffer()
-        # Extract hailo metadata via hailo python bindings
         try:
             import hailo
-            meta = buf.get_meta("GstHailoTensorMeta")
-            # Try hailo ROI detection metadata approach
             roi = hailo.get_roi_from_buffer(buf)
             for det in roi.get_objects_typed(hailo.HAILO_DETECTION):
                 label = det.get_label()
@@ -3314,26 +3307,14 @@ def main():
                 if conf >= conf_thresh and label:
                     with lock:
                         detections.append(label)
-        except Exception as e:
+        except Exception:
             pass
         return Gst.FlowReturn.OK
 
-    def on_eos(bus, msg, loop):
-        loop.quit()
-
-    def on_error(bus, msg, loop):
-        err, dbg = msg.parse_error()
-        print(f"[PPSubproc] GStreamer error: {err}", file=sys.stderr)
-        loop.quit()
-
     pipeline_str = (
-        f"filesrc location={tmp_path} ! "
-        "avidemux ! "
+        "appsrc name=src format=time is-live=false block=true "
+        "caps=video/x-raw,format=RGB,width=640,height=640,framerate=5/1 ! "
         "queue ! "
-        "videoconvert ! "
-        "video/x-raw, format=RGB ! "
-        "videoscale ! "
-        "video/x-raw, width=640, height=640 ! "
         f"hailonet hef-path={hef_path} batch-size=2 "
         "nms-score-threshold=0.3 nms-iou-threshold=0.45 "
         "output-format-type=HAILO_FORMAT_TYPE_FLOAT32 ! "
@@ -3341,29 +3322,48 @@ def main():
         f"hailofilter function-name=filter_letterbox so-path={post_so} "
         f"config-path={labels_json} qos=false ! "
         "queue ! "
-        "appsink name=sink emit-signals=true sync=false"
+        "appsink name=sink emit-signals=true sync=false max-buffers=10 drop=false"
     )
 
-    print(f"[PPSubproc] Launching GStreamer pipeline", file=sys.stderr)
+    print(f"[PPSubproc] Launching GStreamer appsrc pipeline ({len(processed)} frames)", file=sys.stderr)
     pipeline = Gst.parse_launch(pipeline_str)
+    src  = pipeline.get_by_name("src")
     sink = pipeline.get_by_name("sink")
     sink.connect("new-sample", on_new_sample)
 
     loop = GLib.MainLoop()
-    bus = pipeline.get_bus()
+    bus  = pipeline.get_bus()
     bus.add_signal_watch()
-    bus.connect("message::eos",   lambda b, m: on_eos(b, m, loop))
-    bus.connect("message::error", lambda b, m: on_error(b, m, loop))
+    bus.connect("message::eos",   lambda b, m: loop.quit())
+    bus.connect("message::error", lambda b, m: (
+        print(f"[PPSubproc] GStreamer error: {m.parse_error()[0]}", file=sys.stderr),
+        loop.quit()
+    ))
 
     pipeline.set_state(Gst.State.PLAYING)
-    loop.run()
-    pipeline.set_state(Gst.State.NULL)
 
-    # Clean up temp file
-    try:
-        os.remove(tmp_path)
-    except Exception:
-        pass
+    # Push frames from a separate thread so the main thread can run the loop
+    def push_frames():
+        pts = 0
+        duration = Gst.SECOND // 5  # 5 fps → 200ms per frame
+        for frm in processed:
+            data = frm.tobytes()
+            buf  = Gst.Buffer.new_wrapped(data)
+            buf.pts      = pts
+            buf.duration = duration
+            pts += duration
+            ret = src.emit("push-buffer", buf)
+            if ret != Gst.FlowReturn.OK:
+                print(f"[PPSubproc] push-buffer returned {ret}", file=sys.stderr)
+                break
+        src.emit("end-of-stream")
+
+    push_thread = threading.Thread(target=push_frames, daemon=True)
+    push_thread.start()
+
+    loop.run()
+    push_thread.join(timeout=10)
+    pipeline.set_state(Gst.State.NULL)
 
     # Count detections
     from collections import Counter
