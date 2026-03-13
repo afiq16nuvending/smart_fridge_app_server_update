@@ -3782,14 +3782,35 @@ async def run_tracking(websocket: WebSocket):
                         for label, details in
                         callback.tracking_data.validated_products.get("entry", {}).items()
                     }
-                    
-                    post_thread = PostProcessThread(
-                        clean_video_path=callback.clean_video_path,
-                        realtime_counts=realtime_counts,
-                        transaction_id=transaction_id,
-                        hef_path=app.hef_path,
-                        post_process_so=app.post_process_so,
-                        labels_json=app.labels_json
+
+                    # Capture needed values before app reference may change
+                    _clean_video_path = callback.clean_video_path
+                    _hef_path = app.hef_path
+                    _post_process_so = app.post_process_so
+                    _labels_json = app.labels_json
+                    _transaction_id = transaction_id
+                    _realtime_counts = dict(realtime_counts)
+
+                    def _delayed_post_process():
+                        # Wait for GStreamer hailonet to fully release the Hailo
+                        # device before PostProcessThread opens its own VDevice
+                        import gc
+                        time.sleep(3)
+                        gc.collect()
+                        time.sleep(1)
+                        print(f"[PostProcess] Starting for {_transaction_id}")
+                        pt = PostProcessThread(
+                            clean_video_path=_clean_video_path,
+                            realtime_counts=_realtime_counts,
+                            transaction_id=_transaction_id,
+                            hef_path=_hef_path,
+                            post_process_so=_post_process_so,
+                            labels_json=_labels_json
+                        )
+                        pt.run()  # run directly in this daemon thread
+
+                    post_thread = threading.Thread(
+                        target=_delayed_post_process, daemon=True
                     )
                     post_thread.start()
                     print(f"[PostProcess] Background verification started for {transaction_id}")
