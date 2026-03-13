@@ -3279,7 +3279,10 @@ def main():
     import gi
     gi.require_version("Gst", "1.0")
     gi.require_version("GLib", "2.0")
+    gi.require_version("GstApp", "1.0")
     from gi.repository import Gst, GLib, GstApp
+    # Enable hailonet debug output to stderr so we can see device errors
+    os.environ.setdefault("GST_DEBUG", "hailonet:5,hailort:5")
     Gst.init(None)
 
     # Pre-process: resize all frames to 640x640 RGB
@@ -3803,10 +3806,16 @@ async def run_tracking(websocket: WebSocket):
                     _realtime_counts = dict(realtime_counts)
 
                     def _delayed_post_process():
-                        # Delay to let GStreamer fully release the Hailo device
-                        # before the subprocess opens its own fresh VDevice
                         import gc
-                        time.sleep(2)
+                        # Explicitly release the pipeline app object so GStreamer/hailonet
+                        # fully frees the Hailo PCIe device before we re-open it.
+                        global current_pipeline_app
+                        with pipeline_lock:
+                            current_pipeline_app = None
+                        gc.collect()
+                        # Give the GLib event loop time to process the NULL state transition
+                        # and release all internal hailonet/PCIe DMA buffers
+                        time.sleep(5)
                         gc.collect()
                         runner = PostProcessRunner(
                             clean_video_path=_clean_video_path,
