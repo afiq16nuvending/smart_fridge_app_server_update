@@ -184,7 +184,6 @@ print_lock = threading.Lock()     # Thread lock for console output
 done = False                    # Flag indicating transaction completion
 unlock_data = 0                # Flag for door unlock control
 
-
 # =====================================================================
 # TRACKING DATA STRUCTURES
 # =====================================================================
@@ -999,12 +998,12 @@ def stream_video_to_api(video_path, dataset_name, transaction_id, machine_id,
     Returns:
         bool: True if upload successful, False otherwise
         
-API Endpoint:
+    API Endpoint:
         POST /shopping_app/machine/TransactionDataset/insert_transactionDataset
         
     Authentication:
-        - Basic Auth: username='', password=''
-        - API Key: ' in x-api-key header
+        - Basic Auth: username='admin', password='1234'
+        - API Key: '123456' in x-api-key header
         
     Upload Details:
         - Method: HTTP POST with multipart/form-data
@@ -1070,8 +1069,6 @@ API Endpoint:
     except Exception as e:
         print(f"Error during video streaming: {e}")
         return False
-
-
 
 # =====================================================================
 # VIDEO MONITORING AND AUTO-UPLOAD SYSTEM
@@ -1597,14 +1594,6 @@ class HailoDetectionCallback(app_callback_class):
         self.video_directory = os.path.join(os.getcwd(), "saved_videos")
         os.makedirs(self.video_directory, exist_ok=True)
         
-        # Clean video for post-processing (Camera 0 only, no overlays)
-        self.clean_video_writer = None
-        self.clean_video_path = None
-        self.clean_video_fps_calculated = False
-        self.clean_video_frame_count = 0
-        self.clean_video_fps_start = None
-        self.clean_video_lock = threading.Lock()
-        
         # Store machine_id in environment variable for persistence
         self.store_machine_id_env(machine_id)
         
@@ -1873,7 +1862,7 @@ class HailoDetectionCallback(app_callback_class):
             "comp.sink_1"
         )
 
-  # =================================================================
+    # =================================================================
     # API PLANOGRAM FETCHING AND REFRESH SYSTEM
     # =================================================================
     
@@ -2040,7 +2029,7 @@ class HailoDetectionCallback(app_callback_class):
             list: Current planogram data from environment cache
         """
         return self.load_planogram_env()
-
+    
     # =================================================================
     # PRODUCT VALIDATION AGAINST PLANOGRAM
     # =================================================================
@@ -2902,12 +2891,6 @@ def detection_callback(pad, info, callback_data):
     frame = get_numpy_from_buffer(buffer, format, width, height)
     
     # =================================================================
-    # STEP 2b: SAVE RAW FRAME FOR POST-PROCESSING (Camera 0 only)
-    # =================================================================
-    if stream_id == 0:
-        raw_frame_copy = frame.copy()
-    
-    # =================================================================
     # STEP 3: CAMERA COVER DETECTION (Security Feature)
     # =================================================================
     # Check if camera is covered/blocked
@@ -3166,299 +3149,8 @@ def detection_callback(pad, info, callback_data):
         label
     )
     
-    # =================================================================
-    # STEP 13b: WRITE CLEAN FRAME (Camera 0 only, no overlays)
-    # =================================================================
-    if stream_id == 0:
-        with user_data.clean_video_lock:
-            # Convert raw_frame_copy to BGR for VideoWriter
-            raw_bgr = cv2.cvtColor(raw_frame_copy, cv2.COLOR_RGB2BGR)
-            
-            # Initialize FPS tracking
-            if user_data.clean_video_fps_start is None:
-                user_data.clean_video_fps_start = time.time()
-            user_data.clean_video_frame_count += 1
-            
-            # Create writer after 30 frames (same FPS detection as display loop)
-            if not user_data.clean_video_fps_calculated and user_data.clean_video_frame_count >= 30:
-                elapsed = time.time() - user_data.clean_video_fps_start
-                fps = user_data.clean_video_frame_count / elapsed
-                user_data.clean_video_fps_calculated = True
-                
-                # Build clean video path alongside main video directory
-                timestamp = time.strftime('%Y%m%d_%H%M%S')
-                tid = getattr(user_data, 'transaction_id', 'unknown')
-                clean_filename = f"clean_cam0_{timestamp}_{tid}.avi"
-                user_data.clean_video_path = os.path.join(
-                    user_data.video_directory, clean_filename
-                )
-                fourcc = cv2.VideoWriter_fourcc(*'XVID')
-                h, w = raw_bgr.shape[:2]
-                user_data.clean_video_writer = cv2.VideoWriter(
-                    user_data.clean_video_path, fourcc, fps, (w, h), isColor=True
-                )
-                print(f"[PostProcess] Clean video writer started: {user_data.clean_video_path}")
-            
-            # Write frame once writer is ready
-            if user_data.clean_video_writer is not None:
-                user_data.clean_video_writer.write(raw_bgr)
-    
     # Continue processing pipeline
     return Gst.PadProbeReturn.OK
-
-# =====================================================================
-# POST-PROCESSING THREAD (Secondary Hailo Verification)
-# =====================================================================
-
-class PostProcessThread(threading.Thread):
-    """
-    Background thread that re-runs Hailo on the clean Camera 0 video
-    after a transaction ends, to verify realtime detection counts.
-
-    Strategy:
-    - Samples frames evenly across the clean video
-    - Scores each frame by blur (Laplacian variance) + bbox stability
-    - Picks best frame per tracked product
-    - Re-classifies using a fresh Hailo GStreamer pipeline on the file
-    - Compares against realtime counts and logs any discrepancies
-    - Deletes the clean video when done
-
-    This does NOT modify charges - it only logs discrepancies for review.
-    """
-
-    # Minimum blur score to consider a frame usable
-    BLUR_THRESHOLD = 80.0
-    # Number of frames to sample from the video
-    SAMPLE_COUNT = 60
-
-    def __init__(self, clean_video_path, realtime_counts, transaction_id,
-                 hef_path, post_process_so, labels_json):
-        super().__init__(daemon=True)
-        self.clean_video_path = clean_video_path
-        self.realtime_counts = realtime_counts  # dict: {label: count}
-        self.transaction_id = transaction_id
-        self.hef_path = hef_path
-        self.post_process_so = post_process_so
-        self.labels_json = labels_json
-
-    def run(self):
-        print(f"[PostProcess] Starting for transaction {self.transaction_id}")
-        try:
-            post_counts = self._run_hailo_on_video()
-            self._compare_and_log(post_counts)
-        except Exception as e:
-            print(f"[PostProcess] Error: {e}")
-        finally:
-            self._delete_clean_video()
-
-    # ------------------------------------------------------------------
-    # HAILO RE-INFERENCE ON VIDEO FILE
-    # ------------------------------------------------------------------
-
-    def _run_hailo_on_video(self):
-        """
-        Open the clean video, sample frames, run Hailo inference on each,
-        and accumulate label detections.
-
-        Returns:
-            dict: {label: count} from post-processing
-        """
-        import gi
-        gi.require_version('Gst', '1.0')
-        from gi.repository import Gst
-        import hailo
-
-        cap = cv2.VideoCapture(self.clean_video_path)
-        if not cap.isOpened():
-            print(f"[PostProcess] Cannot open video: {self.clean_video_path}")
-            return {}
-
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        if total_frames <= 0:
-            cap.release()
-            return {}
-
-        # Build evenly-spaced sample indices
-        step = max(1, total_frames // self.SAMPLE_COUNT)
-        sample_indices = list(range(0, total_frames, step))[:self.SAMPLE_COUNT]
-
-        print(f"[PostProcess] Video has {total_frames} frames, sampling {len(sample_indices)}")
-
-        # Load label map
-        label_map = self._load_labels()
-
-        # Initialize Hailo inference (InferVStreams API — no GStreamer pipeline needed)
-        from hailo_platform import (HEF, VDevice, HailoStreamInterface,
-                                    InferVStreams, ConfigureParams,
-                                    InputVStreamParams, OutputVStreamParams,
-                                    FormatType)
-
-        hef = HEF(self.hef_path)
-        target = VDevice()
-        configure_params = ConfigureParams.create_from_hef(
-            hef, interface=HailoStreamInterface.PCIe
-        )
-        network_groups = target.configure(hef, configure_params)
-        network_group = network_groups[0]
-        network_group_params = network_group.create_params()
-
-        input_vstream_params = InputVStreamParams.make(
-            network_group, quantized=False, format_type=FormatType.FLOAT32
-        )
-        output_vstream_params = OutputVStreamParams.make(
-            network_group, quantized=False, format_type=FormatType.FLOAT32
-        )
-
-        # Accumulate best detections per label across all sampled frames
-        # {label: best_confidence}
-        best_detections = {}
-
-        with InferVStreams(network_group, input_vstream_params,
-                          output_vstream_params) as infer_pipeline:
-            with network_group.activate(network_group_params):
-                for idx in sample_indices:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-                    ret, frame = cap.read()
-                    if not ret or frame is None:
-                        continue
-
-                    # Skip blurry frames
-                    blur = self._blur_score(frame)
-                    if blur < self.BLUR_THRESHOLD:
-                        continue
-
-                    # Preprocess frame for Hailo (resize to 640x640, normalize)
-                    input_data = self._preprocess_frame(frame)
-
-                    # Run inference
-                    try:
-                        # Get input name from internal dict (confirmed via dir() inspection)
-                        input_name = list(infer_pipeline._input_vstreams_params.keys())[0]
-                        input_dict = {input_name: input_data}
-                        with infer_pipeline.infer(input_dict) as infer_results:
-                            for out_name, out_data in infer_results.items():
-                                detections = self._parse_output(
-                                    out_data, label_map, frame.shape
-                                )
-                                for label, confidence in detections:
-                                    if label not in best_detections or \
-                                       confidence > best_detections[label]:
-                                        best_detections[label] = confidence
-                    except Exception as e:
-                        print(f"[PostProcess] Inference error on frame {idx}: {e}")
-                        continue
-
-        cap.release()
-
-        # Convert best_detections to counts (1 per label detected above threshold)
-        CONFIDENCE_THRESHOLD = 0.5
-        post_counts = {
-            label: 1
-            for label, conf in best_detections.items()
-            if conf >= CONFIDENCE_THRESHOLD
-        }
-        print(f"[PostProcess] Post-process detections: {post_counts}")
-        return post_counts
-
-    # ------------------------------------------------------------------
-    # HELPERS
-    # ------------------------------------------------------------------
-
-    def _blur_score(self, frame):
-        """Laplacian variance — higher = sharper."""
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        return cv2.Laplacian(gray, cv2.CV_64F).var()
-
-    def _preprocess_frame(self, frame):
-        """Resize and normalize frame for Hailo input."""
-        resized = cv2.resize(frame, (640, 640))
-        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-        normalized = rgb.astype(np.float32) / 255.0
-        return np.expand_dims(normalized, axis=0)  # (1, 640, 640, 3)
-
-    def _load_labels(self):
-        """Load label map from JSON file."""
-        try:
-            with open(self.labels_json, 'r') as f:
-                return json.load(f)
-        except Exception:
-            return {}
-
-    def _parse_output(self, output_data, label_map, frame_shape):
-        """
-        Parse raw Hailo output into (label, confidence) pairs.
-        Handles flat array output format typical of YOLO models.
-        """
-        detections = []
-        try:
-            # output_data shape: (1, num_detections, 5 + num_classes) or similar
-            data = output_data[0] if output_data.ndim == 4 else output_data
-            data = data.reshape(-1, data.shape[-1])
-            for row in data:
-                if len(row) < 6:
-                    continue
-                confidence = float(row[4])
-                if confidence < 0.3:
-                    continue
-                class_scores = row[5:]
-                class_id = int(np.argmax(class_scores))
-                class_conf = float(class_scores[class_id]) * confidence
-                label = label_map.get(str(class_id), label_map.get(class_id, f"class_{class_id}"))
-                detections.append((label, class_conf))
-        except Exception as e:
-            print(f"[PostProcess] Parse error: {e}")
-        return detections
-
-    # ------------------------------------------------------------------
-    # COMPARISON AND LOGGING
-    # ------------------------------------------------------------------
-
-    def _compare_and_log(self, post_counts):
-        """
-        Compare post-process detections against realtime counts.
-        Logs any discrepancies for review.
-        """
-        print(f"\n[PostProcess] === Verification Report: {self.transaction_id} ===")
-        print(f"[PostProcess] Realtime counts : {self.realtime_counts}")
-        print(f"[PostProcess] Post-process    : {post_counts}")
-
-        all_labels = set(list(self.realtime_counts.keys()) + list(post_counts.keys()))
-        discrepancies = []
-
-        for label in all_labels:
-            rt_count = self.realtime_counts.get(label, 0)
-            pp_present = 1 if label in post_counts else 0
-
-            # Flag if post-process found something realtime missed, or vice versa
-            if rt_count == 0 and pp_present == 1:
-                discrepancies.append({
-                    'label': label,
-                    'issue': 'MISSED_IN_REALTIME',
-                    'realtime': rt_count,
-                    'post_process': pp_present
-                })
-            elif rt_count > 0 and pp_present == 0:
-                discrepancies.append({
-                    'label': label,
-                    'issue': 'NOT_CONFIRMED_BY_POST',
-                    'realtime': rt_count,
-                    'post_process': pp_present
-                })
-
-        if discrepancies:
-            print(f"[PostProcess] ⚠️  {len(discrepancies)} discrepancy(ies) found:")
-            for d in discrepancies:
-                print(f"  - {d['label']}: {d['issue']} "
-                      f"(realtime={d['realtime']}, post={d['post_process']})")
-        else:
-            print(f"[PostProcess] ✅ Realtime counts confirmed by post-processing")
-
-        print(f"[PostProcess] {'='*50}\n")
-
-    def _delete_clean_video(self):
-        """Keep clean video for manual inspection (deletion disabled)."""
-        print(f"[PostProcess] Clean video kept for inspection: {self.clean_video_path}")
-
 
 # =====================================================================
 # TRANSACTION ORCHESTRATION FUNCTION
@@ -3608,7 +3300,7 @@ async def run_tracking(websocket: WebSocket):
             print("\n" + "-"*30)
             print("CAMERA 1 CAPTURE PHASE")
             print("-"*30)
-            camera1_images = capture_images(2, image_count)
+            camera1_images = capture_images(0, image_count)
             
             # ---------------------------------------------------
             # Process Results
@@ -3750,37 +3442,6 @@ async def run_tracking(websocket: WebSocket):
             
             # Run pipeline (blocks until shutdown)
             app.run()
-            
-            # ---------------------------------------------------------
-            # CLOSE CLEAN VIDEO AND LAUNCH POST-PROCESSING
-            # ---------------------------------------------------------
-            try:
-                with callback.clean_video_lock:
-                    if callback.clean_video_writer is not None:
-                        callback.clean_video_writer.release()
-                        callback.clean_video_writer = None
-                        print(f"[PostProcess] Clean video saved: {callback.clean_video_path}")
-                
-                if callback.clean_video_path and os.path.exists(callback.clean_video_path):
-                    # Build realtime counts from validated_products (entry direction)
-                    realtime_counts = {
-                        label: details["count"]
-                        for label, details in
-                        callback.tracking_data.validated_products.get("entry", {}).items()
-                    }
-                    
-                    post_thread = PostProcessThread(
-                        clean_video_path=callback.clean_video_path,
-                        realtime_counts=realtime_counts,
-                        transaction_id=transaction_id,
-                        hef_path=app.hef_path,
-                        post_process_so=app.post_process_so,
-                        labels_json=app.labels_json
-                    )
-                    post_thread.start()
-                    print(f"[PostProcess] Background verification started for {transaction_id}")
-            except Exception as e:
-                print(f"[PostProcess] Failed to start post-processing: {e}")
             
             # END TRANSACTION MEMORY TRACKING
             if transaction_id:
@@ -4151,7 +3812,6 @@ def delete_images(image_paths):
     
     print(f"Successfully deleted {deleted_count} images")
     return deleted_count
-
 
 # =====================================================================
 # TRANSACTION-BASED MEMORY MANAGEMENT SYSTEM
@@ -5890,8 +5550,8 @@ DEPLOYMENT:
 1. Install dependencies: pip install -r requirements.txt
 2. Configure camera devices (/dev/video0, /dev/video2)
 3. Set up API credentials in code
-4. Run: python app_server.py --host 0.0.0.0 --rtspport 8000
-5. Mobile app connects to: 
+4. Run: python app_server.py --host 0.0.0.0 --port 8000
+5. Mobile app connects to: ws://raspberry-pi-ip:8000/ws/track
 
 MAINTENANCE:
 - Monitor memory usage: curl http://raspberry-pi:8000/stats
