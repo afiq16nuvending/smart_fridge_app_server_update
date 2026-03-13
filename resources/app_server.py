@@ -3257,8 +3257,21 @@ def main():
                                 InputVStreamParams, OutputVStreamParams,
                                 FormatType)
 
-    hef    = HEF(hef_path)
-    target = VDevice()
+    # Poll until the Hailo device is free (GStreamer pipeline may still hold it)
+    hef = HEF(hef_path)
+    target = None
+    for attempt in range(30):  # up to 60 seconds
+        try:
+            target = VDevice()
+            print(f"[PPSubproc] Device acquired on attempt {attempt+1}", file=sys.stderr)
+            break
+        except Exception as e:
+            print(f"[PPSubproc] Device busy (attempt {attempt+1}): {e}", file=sys.stderr)
+            time.sleep(2)
+    if target is None:
+        print(json.dumps({"error": "device unavailable after 60s", "counts": {}}))
+        return
+
     cfg    = ConfigureParams.create_from_hef(hef, interface=HailoStreamInterface.PCIe)
     for ng_name in cfg:
         cfg[ng_name].batch_size = 2
@@ -3373,9 +3386,9 @@ class PostProcessRunner:
             "conf_threshold": self.CONF_THRESHOLD,
         }
         script_path = "/tmp/hailo_postprocess_worker.py"
-        if not os.path.exists(script_path):
-            with open(script_path, "w") as f:
-                f.write(POST_PROCESS_SCRIPT)
+        # Always rewrite to ensure latest version is used
+        with open(script_path, "w") as f:
+            f.write(POST_PROCESS_SCRIPT)
 
         proc = subprocess.run(
             [sys.executable, script_path],
@@ -3404,6 +3417,38 @@ class PostProcessRunner:
 
         print(f"[PostProcess] Post-process detections: {counts}")
         return counts
+
+    def _compare_and_log(self, post_counts):
+        print(f"\n[PostProcess] === Verification Report: {self.transaction_id} ===")
+        print(f"[PostProcess] Realtime counts : {self.realtime_counts}")
+        print(f"[PostProcess] Post-process    : {post_counts}")
+
+        all_labels = set(list(self.realtime_counts.keys()) + list(post_counts.keys()))
+        discrepancies = []
+
+        for label in all_labels:
+            rt_count = self.realtime_counts.get(label, 0)
+            pp_present = 1 if label in post_counts else 0
+            if rt_count == 0 and pp_present == 1:
+                discrepancies.append({'label': label, 'issue': 'MISSED_IN_REALTIME',
+                                      'realtime': rt_count, 'post_process': pp_present})
+            elif rt_count > 0 and pp_present == 0:
+                discrepancies.append({'label': label, 'issue': 'NOT_CONFIRMED_BY_POST',
+                                      'realtime': rt_count, 'post_process': pp_present})
+
+        if discrepancies:
+            print(f"[PostProcess] ⚠️  {len(discrepancies)} discrepancy(ies) found:")
+            for d in discrepancies:
+                print(f"  - {d['label']}: {d['issue']} "
+                      f"(realtime={d['realtime']}, post={d['post_process']})")
+        else:
+            print(f"[PostProcess] ✅ Realtime counts confirmed by post-processing")
+        print(f"[PostProcess] {'='*50}\n")
+
+    def _delete_clean_video(self):
+        """Keep clean video for manual inspection (deletion disabled)."""
+        print(f"[PostProcess] Clean video kept for inspection: {self.clean_video_path}")
+
 
 # =====================================================================
 # TRANSACTION ORCHESTRATION FUNCTION
@@ -3726,7 +3771,7 @@ async def run_tracking(websocket: WebSocket):
                         # Delay to let GStreamer fully release the Hailo device
                         # before the subprocess opens its own fresh VDevice
                         import gc
-                        time.sleep(5)
+                        time.sleep(2)
                         gc.collect()
                         runner = PostProcessRunner(
                             clean_video_path=_clean_video_path,
