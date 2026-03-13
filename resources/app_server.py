@@ -3348,7 +3348,10 @@ class PostProcessThread(threading.Thread):
                     pending_frame = None
 
                     try:
-                        input_dict = {input_name: batch_buffer}
+                        # Pass raw bytes — Hailo C layer reads via PyBUF_SIMPLE
+                        raw_bytes = batch_buffer.tobytes()
+                        print(f"[PostProcess] Sending {len(raw_bytes)} bytes to Hailo")
+                        input_dict = {input_name: raw_bytes}
                         infer_results = infer_pipeline.infer(input_dict)
                         for out_name, out_data in infer_results.items():
                             detections = self._parse_output(
