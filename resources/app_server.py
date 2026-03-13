@@ -3273,8 +3273,7 @@ def main():
         return
 
     cfg    = ConfigureParams.create_from_hef(hef, interface=HailoStreamInterface.PCIe)
-    for ng_name in cfg:
-        cfg[ng_name].batch_size = 2
+    # Do NOT set batch_size — default is 0 (dynamic), accepts any batch size
     ng_list  = target.configure(hef, cfg)
     ng       = ng_list[0]
     ng_params = ng.create_params()
