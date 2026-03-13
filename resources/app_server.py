@@ -3217,14 +3217,15 @@ def detection_callback(pad, info, callback_data):
 # POST-PROCESS SUBPROCESS SCRIPT (written to disk at startup, run after txn)
 # ---------------------------------------------------------------------------
 POST_PROCESS_SCRIPT = """
-import sys, json, os, gc, time
+import sys, json, os, time, threading
 import numpy as np
 import cv2
 
 def main():
-    params = json.loads(sys.stdin.read())
+    params       = json.loads(sys.stdin.read())
     video_path   = params["video_path"]
     hef_path     = params["hef_path"]
+    post_so      = params["post_process_so"]
     labels_json  = params["labels_json"]
     sample_count = params.get("sample_count", 60)
     blur_thresh  = params.get("blur_threshold", 80.0)
@@ -3237,6 +3238,7 @@ def main():
     except Exception:
         label_map = {}
 
+    # Sample sharpest frames from clean video
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         print(json.dumps({"error": "cannot open video", "counts": {}}))
@@ -3248,125 +3250,130 @@ def main():
         print(json.dumps({"error": "empty video", "counts": {}}))
         return
 
-    step = max(1, total // sample_count)
-    indices = list(range(0, total, step))[:sample_count]
-    print(f"[PPSubproc] {total} frames, sampling {len(indices)}", file=sys.stderr)
-
-    from hailo_platform import (HEF, VDevice, HailoStreamInterface,
-                                InferVStreams, ConfigureParams,
-                                InputVStreamParams, OutputVStreamParams,
-                                FormatType)
-
-    # Poll until the Hailo device is free (GStreamer pipeline may still hold it)
-    hef = HEF(hef_path)
-    target = None
-    for attempt in range(30):  # up to 60 seconds
-        try:
-            target = VDevice()
-            print(f"[PPSubproc] Device acquired on attempt {attempt+1}", file=sys.stderr)
+    # Sample frames evenly, pick sharpest
+    step = max(1, total // (sample_count * 3))
+    candidates = []
+    idx = 0
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
             break
-        except Exception as e:
-            print(f"[PPSubproc] Device busy (attempt {attempt+1}): {e}", file=sys.stderr)
-            time.sleep(2)
-    if target is None:
-        print(json.dumps({"error": "device unavailable after 60s", "counts": {}}))
-        return
-
-    cfg    = ConfigureParams.create_from_hef(hef, interface=HailoStreamInterface.PCIe)
-    # Do NOT set batch_size — default is 0 (dynamic), accepts any batch size
-    ng_list  = target.configure(hef, cfg)
-    ng       = ng_list[0]
-    ng_params = ng.create_params()
-
-    in_params  = InputVStreamParams.make(ng,  quantized=True,  format_type=FormatType.UINT8)
-    out_params = OutputVStreamParams.make(ng, quantized=False, format_type=FormatType.FLOAT32)
-
-    best = {}   # label -> best confidence
-
-    # Warm-up probe: try a dummy infer to confirm the device is truly ready.
-    # VDevice() opens fine even when GStreamer PCIe DMA buffers are still active,
-    # so we probe with actual inference before processing real frames.
-    for warmup_attempt in range(20):
-        try:
-            with InferVStreams(ng, in_params, out_params) as probe_pipe:
-                probe_name = list(probe_pipe._input_vstreams_params.keys())[0]
-                with ng.activate(ng_params):
-                    dummy = np.zeros((2, 640, 640, 3), dtype=np.uint8)
-                    probe_pipe.infer({probe_name: dummy})
-            print(f"[PPSubproc] Warm-up succeeded on attempt {warmup_attempt+1}", file=sys.stderr)
-            break
-        except Exception as we:
-            print(f"[PPSubproc] Warm-up attempt {warmup_attempt+1} failed: {we}", file=sys.stderr)
-            time.sleep(3)
-            # Re-configure after failed warm-up to get fresh vstream state
-            try:
-                ng_list2 = target.configure(hef, cfg)
-                ng       = ng_list2[0]
-                ng_params = ng.create_params()
-                in_params  = InputVStreamParams.make(ng,  quantized=True,  format_type=FormatType.UINT8)
-                out_params = OutputVStreamParams.make(ng, quantized=False, format_type=FormatType.FLOAT32)
-            except Exception:
-                pass
-    else:
-        print(json.dumps({"error": "warm-up failed after 20 attempts", "counts": {}}))
-        return
-
-    with InferVStreams(ng, in_params, out_params) as pipe:
-        in_name = list(pipe._input_vstreams_params.keys())[0]
-        print(f"[PPSubproc] input vstream: {in_name}", file=sys.stderr)
-
-        with ng.activate(ng_params):
-            pending = None
-            pending_frame = None
-
-            for idx in indices:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-                ret, frame = cap.read()
-                if not ret or frame is None:
-                    continue
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                blur = cv2.Laplacian(gray, cv2.CV_64F).var()
-                if blur < blur_thresh:
-                    continue
-                resized = cv2.resize(frame, (640, 640))
-                rgb     = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-                arr     = np.ascontiguousarray(rgb.astype(np.uint8))
-
-                if pending is None:
-                    pending       = arr
-                    pending_frame = idx
-                    continue
-
-                # batch of 2
-                batch = np.stack([pending, arr], axis=0)  # (2,640,640,3)
-                pending = None
-
-                try:
-                    results = pipe.infer({in_name: batch})
-                    for out_name, out_data in results.items():
-                        try:
-                            d = out_data[0] if out_data.ndim == 4 else out_data
-                            d = d.reshape(-1, d.shape[-1])
-                            for row in d:
-                                if len(row) < 6: continue
-                                conf = float(row[4])
-                                if conf < 0.3: continue
-                                cls  = int(np.argmax(row[5:]))
-                                lbl  = label_map.get(str(cls), label_map.get(cls, f"class_{cls}"))
-                                cls_conf = float(row[5+cls]) * conf
-                                if lbl not in best or cls_conf > best[lbl]:
-                                    best[lbl] = cls_conf
-                        except Exception as pe:
-                            print(f"[PPSubproc] parse err: {pe}", file=sys.stderr)
-                except Exception as ie:
-                    print(f"[PPSubproc] infer err frame {idx}: {ie}", file=sys.stderr)
-
+        if idx % step == 0:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            score = cv2.Laplacian(gray, cv2.CV_64F).var()
+            if score >= blur_thresh:
+                candidates.append((score, idx, frame))
+        idx += 1
     cap.release()
-    counts = {lbl: 1 for lbl, c in best.items() if c >= conf_thresh}
+
+    # Sort by sharpness, take top sample_count
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    frames = [c[2] for c in candidates[:sample_count]]
+    print(f"[PPSubproc] {total} frames total, selected {len(frames)} sharp frames", file=sys.stderr)
+
+    if not frames:
+        print(json.dumps({"error": "no sharp frames", "counts": {}}))
+        return
+
+    # Write selected frames to a temp video for GStreamer filesrc
+    import tempfile
+    tmp_path = tempfile.mktemp(suffix=".avi")
+    h, w = frames[0].shape[:2]
+    fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+    out = cv2.VideoWriter(tmp_path, fourcc, 5.0, (w, h))
+    for f in frames:
+        out.write(f)
+    out.release()
+    print(f"[PPSubproc] Wrote {len(frames)} frames to temp: {tmp_path}", file=sys.stderr)
+
+    # Run GStreamer pipeline on temp video using same hailonet element as main pipeline
+    import gi
+    gi.require_version("Gst", "1.0")
+    gi.require_version("GLib", "2.0")
+    from gi.repository import Gst, GLib
+    Gst.init(None)
+
+    detections = []
+    lock = threading.Lock()
+    done_event = threading.Event()
+
+    def on_new_sample(sink):
+        sample = sink.emit("pull-sample")
+        if sample is None:
+            return Gst.FlowReturn.OK
+        buf = sample.get_buffer()
+        # Extract hailo metadata via hailo python bindings
+        try:
+            import hailo
+            meta = buf.get_meta("GstHailoTensorMeta")
+            # Try hailo ROI detection metadata approach
+            roi = hailo.get_roi_from_buffer(buf)
+            for det in roi.get_objects_typed(hailo.HAILO_DETECTION):
+                label = det.get_label()
+                conf  = det.get_confidence()
+                if conf >= conf_thresh and label:
+                    with lock:
+                        detections.append(label)
+        except Exception as e:
+            pass
+        return Gst.FlowReturn.OK
+
+    def on_eos(bus, msg, loop):
+        loop.quit()
+
+    def on_error(bus, msg, loop):
+        err, dbg = msg.parse_error()
+        print(f"[PPSubproc] GStreamer error: {err}", file=sys.stderr)
+        loop.quit()
+
+    pipeline_str = (
+        f"filesrc location={tmp_path} ! "
+        "avidemux ! "
+        "queue ! "
+        "videoconvert ! "
+        "video/x-raw, format=RGB ! "
+        "videoscale ! "
+        "video/x-raw, width=640, height=640 ! "
+        f"hailonet hef-path={hef_path} batch-size=2 "
+        "nms-score-threshold=0.3 nms-iou-threshold=0.45 "
+        "output-format-type=HAILO_FORMAT_TYPE_FLOAT32 ! "
+        "queue ! "
+        f"hailofilter function-name=filter_letterbox so-path={post_so} "
+        f"config-path={labels_json} qos=false ! "
+        "queue ! "
+        "appsink name=sink emit-signals=true sync=false"
+    )
+
+    print(f"[PPSubproc] Launching GStreamer pipeline", file=sys.stderr)
+    pipeline = Gst.parse_launch(pipeline_str)
+    sink = pipeline.get_by_name("sink")
+    sink.connect("new-sample", on_new_sample)
+
+    loop = GLib.MainLoop()
+    bus = pipeline.get_bus()
+    bus.add_signal_watch()
+    bus.connect("message::eos",   lambda b, m: on_eos(b, m, loop))
+    bus.connect("message::error", lambda b, m: on_error(b, m, loop))
+
+    pipeline.set_state(Gst.State.PLAYING)
+    loop.run()
+    pipeline.set_state(Gst.State.NULL)
+
+    # Clean up temp file
+    try:
+        os.remove(tmp_path)
+    except Exception:
+        pass
+
+    # Count detections
+    from collections import Counter
+    counts = dict(Counter(detections))
+    print(f"[PPSubproc] Raw detections: {counts}", file=sys.stderr)
     print(json.dumps({"counts": counts}))
 
 main()
 """
+
 
 
 class PostProcessRunner:
@@ -3405,12 +3412,13 @@ class PostProcessRunner:
     def _run_subprocess(self):
         import subprocess, json as _json
         params = {
-            "video_path":     self.clean_video_path,
-            "hef_path":       self.hef_path,
-            "labels_json":    self.labels_json,
-            "sample_count":   self.SAMPLE_COUNT,
-            "blur_threshold": self.BLUR_THRESHOLD,
-            "conf_threshold": self.CONF_THRESHOLD,
+            "video_path":       self.clean_video_path,
+            "hef_path":         self.hef_path,
+            "post_process_so":  self.post_process_so,
+            "labels_json":      self.labels_json,
+            "sample_count":     self.SAMPLE_COUNT,
+            "blur_threshold":   self.BLUR_THRESHOLD,
+            "conf_threshold":   self.CONF_THRESHOLD,
         }
         script_path = "/tmp/hailo_postprocess_worker.py"
         # Always rewrite to ensure latest version is used
