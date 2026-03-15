@@ -1018,7 +1018,7 @@ API Endpoint:
     # Authentication credentials
     username = 'admin'
     password = '1234'
-    api_key = '123456f'
+    api_key = '123456'
     
     # Get current timestamp for database record
     current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
