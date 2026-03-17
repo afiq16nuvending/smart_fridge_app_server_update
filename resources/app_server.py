@@ -189,8 +189,9 @@ unlock_data = 0                # Flag for door unlock control
 # TRACKING DATA STRUCTURES
 # =====================================================================
 
-# Store movement history for each tracked object (last 5 positions)
-movement_history = defaultdict(lambda: deque(maxlen=5))
+# Store movement history for each tracked object (last 3 positions)
+# Reduced from 5 → 3 to confirm direction faster (~0.23s at 13fps vs ~0.38s)
+movement_history = defaultdict(lambda: deque(maxlen=3))
 
 # Store bounding box area history for stability checking
 bbox_area_history = defaultdict(lambda: deque(maxlen=10))
@@ -235,15 +236,17 @@ active_objects_per_camera = {
 cross_camera_candidates = defaultdict(list)
 
 # Per-camera movement tracking
+# Reduced from 5 → 3 frames to confirm direction faster
 camera_movement_history = {
-    0: defaultdict(lambda: deque(maxlen=5)),  # Camera 0 history
-    1: defaultdict(lambda: deque(maxlen=5))   # Camera 1 history
+    0: defaultdict(lambda: deque(maxlen=3)),  # Camera 0 history
+    1: defaultdict(lambda: deque(maxlen=3))   # Camera 1 history
 }
 
 # Per-camera bounding box area history for stability checking
+# Reduced from 5 → 3 to match movement history window
 camera_bbox_area_history = {
-    0: defaultdict(lambda: deque(maxlen=5)),  # Camera 0 bbox areas
-    1: defaultdict(lambda: deque(maxlen=5))   # Camera 1 bbox areas
+    0: defaultdict(lambda: deque(maxlen=3)),  # Camera 0 bbox areas
+    1: defaultdict(lambda: deque(maxlen=3))   # Camera 1 bbox areas
 }
 
 # =====================================================================
@@ -2686,32 +2689,33 @@ ALGORITHM:
 def analyze_movement_direction(track_id, center, tracking_data, camera_id, 
                                global_id, current_bbox):
     """
-    Analyze movement direction based on 5 consecutive frames with enhanced filtering.
-    
-    This sophisticated algorithm prevents false detections from:
-    - Hand movements obscuring objects
-    - Small jittering/noise in tracking
-    - Inconsistent up-down-up movements
-    - Objects just being repositioned slightly
-    
+    Analyze movement direction based on 3 consecutive frames with enhanced filtering.
+
+    Reduced from 5 → 3 frames so direction is confirmed faster:
+      - Old: needs 5 frames  ≈ 0.38s at 13fps
+      - New: needs 3 frames  ≈ 0.23s at 13fps
+
+    Trade-off: slightly more sensitive to noise — the bbox stability
+    and consistency checks compensate for the smaller window.
+
     FILTERING CHECKS (must pass all):
-    
+
     CHECK 1: Bounding Box Stability
         - Rejects if bbox size varies too much (>80% of average)
         - Indicates hand is moving/obscuring object
-    
+
     CHECK 2: Total Displacement
-        - Must move at least 30 pixels over 5 frames
-        - Prevents counting tiny jitters as movement
-    
+        - Must move at least 20 pixels over 3 frames
+        - (reduced from 30px to match the smaller window)
+
     CHECK 3: Movement Consistency
-        - At least 80% of frame-to-frame movements in same direction
-        - Prevents counting erratic up-down-up as intentional
-    
+        - At least 100% of frame-to-frame movements in same direction
+        - With only 2 intervals, both must agree (3-frame window)
+
     CHECK 4: Average Movement Threshold
         - Average movement per frame must exceed 5 pixels
         - Further filters out noise
-    
+
     Args:
         track_id (int): Local track ID
         center (tuple): Current center point (x, y)
@@ -2719,10 +2723,10 @@ def analyze_movement_direction(track_id, center, tracking_data, camera_id,
         camera_id (int): Camera identifier (0 or 1)
         global_id (int): Global track ID
         current_bbox (tuple): Current bounding box (x1, y1, x2, y2)
-        
+
     Returns:
         str or None: 'entry', 'exit', or None
-        
+
     Direction Determination:
         - Positive Y movement (down on screen) = 'exit' (taking out)
         - Negative Y movement (up on screen) = 'entry' (returning)
@@ -2730,64 +2734,66 @@ def analyze_movement_direction(track_id, center, tracking_data, camera_id,
     """
     # Store movement in camera-specific history
     camera_movement_history[camera_id][track_id].appendleft(center)
-    
+
     # Calculate and track bounding box area
     bbox_area = (current_bbox[2] - current_bbox[0]) * (current_bbox[3] - current_bbox[1])
     camera_bbox_area_history[camera_id][track_id].appendleft(bbox_area)
-    
+
     # Copy to global movement history for cross-camera analysis
     global_movement_history[global_id].appendleft((center, camera_id))
-    
-    # Wait until we have enough frames (5 positions)
-    if len(camera_movement_history[camera_id][track_id]) < 5:
+
+    # Wait until we have enough frames (3 positions)
+    if len(camera_movement_history[camera_id][track_id]) < 3:
         return None
-    
+
     # =================================================================
     # CHECK 1: BOUNDING BOX STABILITY
     # =================================================================
     # Reject if bounding box size changing significantly (hand obscuring)
-    if len(camera_bbox_area_history[camera_id][track_id]) >= 5:
+    if len(camera_bbox_area_history[camera_id][track_id]) >= 3:
         areas = list(camera_bbox_area_history[camera_id][track_id])
         avg_area = sum(areas) / len(areas)
         area_variance = sum((a - avg_area) ** 2 for a in areas) / len(areas)
         area_std_dev = area_variance ** 0.5
-        
+
         # If standard deviation > 80% of average, bbox is unstable
         if area_std_dev > (avg_area * 0.8):
             return None  # Likely hand moving/obscuring, not actual object movement
-    
+
     # =================================================================
     # CHECK 2: TOTAL DISPLACEMENT
     # =================================================================
     # Object must actually move a significant distance
     first_y = camera_movement_history[camera_id][track_id][-1][1]  # Oldest Y
-    last_y = camera_movement_history[camera_id][track_id][0][1]    # Newest Y
+    last_y  = camera_movement_history[camera_id][track_id][0][1]   # Newest Y
     total_displacement = abs(last_y - first_y)
-    
-    DISPLACEMENT_THRESHOLD = 30  # Minimum 30 pixels
+
+    # Reduced from 30 → 20 px to match the smaller 3-frame window
+    DISPLACEMENT_THRESHOLD = 20
     if total_displacement < DISPLACEMENT_THRESHOLD:
         return None  # Not enough movement, likely just jittering
-    
+
     # =================================================================
     # CHECK 3: MOVEMENT CONSISTENCY
     # =================================================================
-    # Ensure movement is consistently in one direction
+    # Ensure movement is consistently in one direction.
+    # With 3 frames there are only 2 intervals — both must agree (100%).
     movement_directions = []
     for i in range(1, len(camera_movement_history[camera_id][track_id])):
         curr_y = camera_movement_history[camera_id][track_id][i-1][1]
         prev_y = camera_movement_history[camera_id][track_id][i][1]
         # 1 = downward (exit), -1 = upward (entry)
         movement_directions.append(1 if curr_y > prev_y else -1)
-    
+
     # Count movements in each direction
     positive_movements = sum(1 for d in movement_directions if d > 0)
     negative_movements = sum(1 for d in movement_directions if d < 0)
-    consistency_ratio = max(positive_movements, negative_movements) / len(movement_directions)
-    
-    # Require 80% consistency (4 out of 5 frames in same direction)
-    if consistency_ratio < 0.8:
-        return None  # Movement too erratic (up-down-up-down)
-    
+    consistency_ratio  = max(positive_movements, negative_movements) / len(movement_directions)
+
+    # With 3 frames (2 intervals) both intervals must agree → 100%
+    if consistency_ratio < 1.0:
+        return None  # Movement not consistent across 3 frames
+
     # =================================================================
     # CHECK 4: AVERAGE MOVEMENT THRESHOLD
     # =================================================================
@@ -2797,20 +2803,20 @@ def analyze_movement_direction(track_id, center, tracking_data, camera_id,
         curr_y = camera_movement_history[camera_id][track_id][i-1][1]
         prev_y = camera_movement_history[camera_id][track_id][i][1]
         total_movement += curr_y - prev_y
-    
-    avg_movement = total_movement / 4  # 4 intervals between 5 points
-    
-    FRAME_MOVEMENT_THRESHOLD = 5  # At least 5 pixels per frame
+
+    avg_movement = total_movement / 2  # 2 intervals between 3 points
+
+    FRAME_MOVEMENT_THRESHOLD = 5  # At least 5 pixels per frame average
     if abs(avg_movement) < FRAME_MOVEMENT_THRESHOLD:
         return None  # Movement too slow/small
-    
+
     # =================================================================
     # DETERMINE DIRECTION
     # =================================================================
     # Positive Y movement = moving down = exiting
     # Negative Y movement = moving up = entering
     current_direction = 'exit' if avg_movement > 0 else 'entry'
-    
+
     # =================================================================
     # HANDLE DIRECTION CHANGES
     # =================================================================
@@ -2821,13 +2827,13 @@ def analyze_movement_direction(track_id, center, tracking_data, camera_id,
             # Direction changed - remove from old counted set
             if global_last_counted_direction[global_id] in tracking_data.counted_tracks:
                 tracking_data.counted_tracks[global_last_counted_direction[global_id]].discard(global_id)
-    
+
     # =================================================================
     # UPDATE TRACKING STATE
     # =================================================================
     # Record this direction for future comparison
     global_last_counted_direction[global_id] = current_direction
-        
+
     return current_direction
 
 # =====================================================================
@@ -2861,7 +2867,7 @@ FLOW:
   count confirmed SKU (+1 exit  /  -1 entry)
 
 CLEANUP:
-  All still images are stored in  camera_images/verification/
+  All still images are stored in  saved_videos/{transaction_id}/verification_images/
   They are deleted automatically at transaction end via
   ImageCaptureVerifier.cleanup_transaction_images().
 """
@@ -2872,8 +2878,36 @@ CAPTURE_DELAY_FRAMES  = 4   # ~0.3 s at 13 fps — item clears the door
 # How many frames to capture in the burst
 CAPTURE_BURST_COUNT   = 5   # pick the best one out of 5
 
-# Minimum confidence for a still-image detection to be trusted
+# Default minimum confidence for a still-image detection to be trusted.
+# Used as fallback for any SKU not listed in SKU_MIN_CONFIDENCE below.
 MIN_STILL_CONFIDENCE  = 0.40
+
+# Per-SKU minimum confidence thresholds (Fix #6).
+#
+# WHY: Different products have structurally different baseline confidence
+# levels. Items that are visually distinct (e.g. kimchiFriedRice) hit
+# 0.90+ consistently — a 0.40 floor undersells their quality.
+# Items that are similar-looking (e.g. guava vs pinkGuava) may never
+# exceed 0.50 even under perfect conditions — a 0.40 floor would reject
+# them incorrectly.
+#
+# HOW TO TUNE: After a week of real transaction logs, look at the
+# confirmed confidence values for each SKU and set each threshold to
+# roughly 70% of that SKU's typical best-frame score.
+#
+# Class names must match exactly what your Hailo model returns.
+SKU_MIN_CONFIDENCE: Dict[str, float] = {
+    "chickenKatsuCurry":  0.65,
+    "dakgangjeongRice":   0.65,
+    "kimchiFriedRice":    0.65,
+    "kimchiTuna":         0.65,
+    "mangoMilk":          0.55,
+    "pineappleHoney":     0.55,
+    "mango":              0.45,
+    "dragonFruit":        0.45,
+    "guava":              0.35,   # visually similar to pinkGuava
+    "pinkGuava":          0.35,   # visually similar to guava
+}
 
 
 class ImageCaptureVerifier:
@@ -2910,19 +2944,26 @@ class ImageCaptureVerifier:
         #               "label": str,
         #               "delay_remaining": int,
         #               "frames_captured": [{"path": str, "confidence": float}],
-        #               "camera_id": int } }
+        #               "camera_id": int,
+        #               "queued_at": float } }
         self._pending: Dict[int, dict] = {}
 
         # global_ids that have already been verified this transaction
         # (prevents double-counting if the item lingers in frame)
         self._verified: set = set()
 
+        # Tracks which direction each verified global_id was confirmed in.
+        # Needed to detect direction changes (fix #2).
+        # Format: { global_id: 'entry' | 'exit' }
+        self._verified_directions: Dict[int, str] = {}
+
         # All image paths created this transaction (for cleanup)
         self._all_images: List[str] = []
 
-        # Output directory
+        # Output directory — stored inside saved_videos so images sit alongside
+        # the transaction video and are easy to browse/review
         self._image_dir = os.path.join(
-            "camera_images", "verification", str(transaction_id)
+            "saved_videos", str(transaction_id), "verification_images"
         )
         os.makedirs(self._image_dir, exist_ok=True)
         print(f"[Verifier] Image directory: {self._image_dir}")
@@ -2937,6 +2978,7 @@ class ImageCaptureVerifier:
         direction: str,
         label: str,
         camera_id: int,
+        confidence: float = 0.0,
     ) -> None:
         """
         Called the moment analyze_movement_direction() returns a result.
@@ -2944,39 +2986,116 @@ class ImageCaptureVerifier:
         Starts the countdown before the burst capture begins so the item
         has time to clear the door threshold.
 
+        Camera selection (Fix #5):
+            When both cameras detect the same global_id, the one with the
+            higher live-detection confidence wins.  If this call arrives
+            with a higher confidence than the already-queued camera, the
+            pending state is updated to use the better camera going forward.
+            This prevents the first camera to fire from winning by default.
+
+        Direction-change handling (Fix #2):
+            If a customer takes an item OUT (exit, verified) and then puts
+            it BACK (entry), the global_id will be in self._verified with
+            the old direction.  We detect this case and re-queue with the
+            new direction so the return is counted correctly.
+
         Args:
-            global_id:  Global track ID (cross-camera unique).
-            direction:  'entry' or 'exit'.
-            label:      Product label from live detection.
-            camera_id:  Camera that made the detection (0 or 1).
+            global_id:   Global track ID (cross-camera unique).
+            direction:   'entry' or 'exit'.
+            label:       Product label from live detection.
+            camera_id:   Camera that made the detection (0 or 1).
+            confidence:  Live-detection confidence score for camera selection.
         """
         with self._lock:
+            # --- direction-change re-queue (Fix #2) ---
             if global_id in self._verified:
-                return  # Already processed this item
-            if global_id in self._pending:
-                return  # Already queued
+                old_direction = self._verified_directions.get(global_id)
+                if old_direction is not None and old_direction != direction:
+                    self._verified.discard(global_id)
+                    self._verified_directions.pop(global_id, None)
+                    self._pending.pop(global_id, None)
+                    print(
+                        f"[Verifier] ↩️  global_id={global_id} "
+                        f"direction changed {old_direction}→{direction}, re-queuing"
+                    )
+                else:
+                    return  # Same direction already verified — skip
 
+            # --- camera selection: update if better camera arrives (Fix #5) ---
+            if global_id in self._pending:
+                existing = self._pending[global_id]
+                # Only update camera if:
+                # 1. Burst hasn't started yet (delay_remaining > 0, no frames saved)
+                # 2. New confidence is strictly higher than the registered camera's
+                if (existing["delay_remaining"] > 0
+                        and len(existing["frames_captured"]) == 0
+                        and confidence > existing.get("register_confidence", 0.0)):
+                    old_cam = existing["camera_id"]
+                    existing["camera_id"]           = camera_id
+                    existing["register_confidence"] = confidence
+                    existing["label"]               = label
+                    print(
+                        f"[Verifier] 📷 global_id={global_id} "
+                        f"camera updated cam{old_cam}→cam{camera_id} "
+                        f"(conf {existing.get('register_confidence', 0):.2f}→{confidence:.2f})"
+                    )
+                return  # Already queued — nothing more to do
+
+            # --- new registration ---
             self._pending[global_id] = {
-                "direction":       direction,
-                "label":           label,
-                "camera_id":       camera_id,
-                "delay_remaining": CAPTURE_DELAY_FRAMES,
-                "frames_captured": [],
+                "direction":           direction,
+                "label":               label,
+                "camera_id":           camera_id,
+                "register_confidence": confidence,
+                "delay_remaining":     CAPTURE_DELAY_FRAMES,
+                "frames_captured":     [],
+                "queued_at":           time.monotonic(),
             }
             print(
                 f"[Verifier] Queued global_id={global_id} "
                 f"label={label} direction={direction} "
+                f"cam{camera_id} conf={confidence:.2f} "
                 f"(waiting {CAPTURE_DELAY_FRAMES} frames)"
             )
+
+    def expire_stale_pending(self, timeout_seconds: float = 3.0) -> None:
+        """
+        Discard pending burst requests that have been waiting too long.
+
+        Called once per frame from detection_callback (Fix #4).
+        Prevents silent under-counts from items that left frame before
+        the burst completed, and frees memory during long transactions.
+
+        Args:
+            timeout_seconds: How long a pending item may wait before
+                             being discarded without counting. Default 3s.
+        """
+        now = time.monotonic()
+        with self._lock:
+            expired = [
+                gid for gid, state in self._pending.items()
+                if (now - state.get("queued_at", now)) > timeout_seconds
+            ]
+            for gid in expired:
+                state = self._pending.pop(gid)
+                frames_so_far = len(state["frames_captured"])
+                print(
+                    f"[Verifier] ⏱️  global_id={gid} EXPIRED after "
+                    f"{timeout_seconds:.0f}s — burst incomplete "
+                    f"({frames_so_far}/{CAPTURE_BURST_COUNT} frames captured), "
+                    f"NOT counted. "
+                    f"(label={state['label']} direction={state['direction']})"
+                )
 
     def process_frame(
         self,
         global_id: int,
         frame: np.ndarray,
-        detections,          # hailo detection objects for this frame
+        detections,
         camera_id: int,
         width: int,
         height: int,
+        bbox: tuple = None,
     ) -> dict | None:
         """
         Called every frame for every active track.
@@ -2985,23 +3104,37 @@ class ImageCaptureVerifier:
         the burst.  When the burst is full, picks the best frame,
         cross-checks the label and returns a result dict.
 
+        Lock discipline (Fix #3):
+            The lock is held only for state reads and writes.
+            Disk I/O (cv2.imwrite) happens OUTSIDE the lock so the
+            GStreamer callback thread is never blocked on a slow SD card.
+
+        Crop (Fix #1):
+            When bbox is provided, only the padded crop around the item
+            is saved — not the full frame.  This reduces disk writes
+            by ~85% and focuses the saved image on the item itself.
+
         Args:
-            global_id:  Global track ID.
-            frame:      Current raw RGB numpy frame (before BGR conversion).
-            detections: Hailo detection objects from this frame.
-            camera_id:  Camera originating this frame.
+            global_id:    Global track ID.
+            frame:        Current raw RGB numpy frame (before BGR conversion).
+            detections:   Hailo detection objects from this frame.
+            camera_id:    Camera originating this frame.
             width/height: Frame dimensions.
+            bbox:         Optional (x1, y1, x2, y2) pixel bounding box of the
+                          tracked item.  When provided a padded crop is saved
+                          instead of the full frame.
 
         Returns:
             None while collecting, OR a result dict when ready:
             {
                 "confirmed":   bool,
                 "direction":   str,
-                "label":       str,   # confirmed label (or live label on fail)
+                "label":       str,
                 "confidence":  float,
                 "image_path":  str,
             }
         """
+        # --- Step A: read state under lock, decide what to do ---
         with self._lock:
             if global_id not in self._pending:
                 return None
@@ -3011,113 +3144,139 @@ class ImageCaptureVerifier:
             if state["camera_id"] != camera_id:
                 return None
 
-            # ---- countdown phase ----
+            # countdown phase
             if state["delay_remaining"] > 0:
                 state["delay_remaining"] -= 1
                 return None
 
-            # ---- burst capture phase ----
-            if len(state["frames_captured"]) < CAPTURE_BURST_COUNT:
-                result = self._capture_and_score(
-                    global_id, state, frame, detections, width, height
-                )
-                if result is not None:
-                    state["frames_captured"].append(result)
-                return None
+            # burst complete — finalise under lock and return
+            if len(state["frames_captured"]) >= CAPTURE_BURST_COUNT:
+                return self._finalise(global_id, state)
 
-            # ---- burst complete — pick best frame ----
-            return self._finalise(global_id, state)
+            # burst still collecting — snapshot what we need, release lock
+            frame_index    = len(state["frames_captured"])
+            expected_label = state["label"]
+            cam_id         = state["camera_id"]
+            direction      = state["direction"]
 
-    def cleanup_transaction_images(self) -> int:
-        """
-        Delete all still images captured during this transaction.
-
-        Call this at transaction end (in run_tracking finally block).
-
-        Returns:
-            Number of files deleted.
-        """
-        deleted = 0
-        with self._lock:
-            for path in list(self._all_images):
-                try:
-                    if os.path.exists(path):
-                        os.remove(path)
-                        deleted += 1
-                except Exception as e:
-                    print(f"[Verifier] Could not delete {path}: {e}")
-            self._all_images.clear()
-
-        # Remove the directory itself if empty
-        try:
-            if os.path.isdir(self._image_dir):
-                os.rmdir(self._image_dir)
-                # Also try the parent verification/ dir
-                parent = os.path.dirname(self._image_dir)
-                if os.path.isdir(parent) and not os.listdir(parent):
-                    os.rmdir(parent)
-        except Exception:
-            pass
-
-        print(f"[Verifier] Cleanup complete — {deleted} image(s) deleted.")
-        return deleted
-
-    # -----------------------------------------------------------------
-    # PRIVATE HELPERS
-    # -----------------------------------------------------------------
-
-    def _capture_and_score(
-        self,
-        global_id: int,
-        state: dict,
-        frame: np.ndarray,
-        detections,
-        width: int,
-        height: int,
-    ) -> dict | None:
-        """
-        Save the current frame as a JPEG and find the highest-confidence
-        detection for the expected label in it.
-
-        Returns a dict {"path", "confidence", "label"} or None on failure.
-        """
-        frame_index = len(state["frames_captured"])
+        # --- Step B: crop + disk I/O outside the lock (Fix #1 + Fix #3) ---
         filename = (
-            f"cam{state['camera_id']}_"
-            f"{state['direction']}_"
+            f"cam{cam_id}_"
+            f"{direction}_"
             f"g{global_id}_"
             f"f{frame_index}.jpg"
         )
         img_path = os.path.join(self._image_dir, filename)
 
+        # Crop to padded bounding box when available (Fix #1)
+        # Falls back to full frame if bbox is None or crop is degenerate
+        CROP_PAD = 20   # pixels of padding around the bounding box
         try:
-            # Convert RGB → BGR for OpenCV save
             bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            if bbox is not None:
+                x1b, y1b, x2b, y2b = bbox
+                x1c = max(0, x1b - CROP_PAD)
+                y1c = max(0, y1b - CROP_PAD)
+                x2c = min(width,  x2b + CROP_PAD)
+                y2c = min(height, y2b + CROP_PAD)
+                # Guard against degenerate crops (zero area)
+                if x2c > x1c and y2c > y1c:
+                    bgr = bgr[y1c:y2c, x1c:x2c]
             cv2.imwrite(img_path, bgr, [cv2.IMWRITE_JPEG_QUALITY, 92])
-            self._all_images.append(img_path)
         except Exception as e:
             print(f"[Verifier] Failed to save frame: {e}")
             return None
 
-        # Score: find detections in this frame matching the expected label
-        best_conf = 0.0
-        best_label = state["label"]
+        # Score detections for this frame (CPU only, no I/O)
+        best_conf  = 0.0
+        best_label = expected_label
         for det in detections:
             det_label = det.get_label()
             det_conf  = det.get_confidence()
-            if det_label == state["label"] and det_conf > best_conf:
+            if det_label == expected_label and det_conf > best_conf:
                 best_conf  = det_conf
                 best_label = det_label
 
-        return {"path": img_path, "confidence": best_conf, "label": best_label}
+        scored = {"path": img_path, "confidence": best_conf, "label": best_label}
+
+        # --- Step C: write result back under lock ---
+        with self._lock:
+            if global_id not in self._pending:
+                # Item was expired or cancelled while we were doing I/O —
+                # delete the orphan file and bail out
+                try:
+                    os.remove(img_path)
+                except Exception:
+                    pass
+                return None
+
+            self._pending[global_id]["frames_captured"].append(scored)
+            self._all_images.append(img_path)
+
+            # If this was the last frame needed, finalise now
+            if len(self._pending[global_id]["frames_captured"]) >= CAPTURE_BURST_COUNT:
+                return self._finalise(global_id, self._pending[global_id])
+
+        return None
+
+    def cleanup_transaction_images(self) -> int:
+        """
+        Finalise the verifier at transaction end.
+
+        Images are KEPT on disk inside:
+            saved_videos/{transaction_id}/verification_images/
+
+        This allows post-transaction review of exactly which crop the
+        classifier used for each count decision.  Only the in-memory
+        tracking list is cleared to free RAM.
+
+        Returns:
+            Number of images kept (for logging).
+        """
+        with self._lock:
+            kept = len(self._all_images)
+            self._all_images.clear()
+            self._pending.clear()
+
+        if kept > 0:
+            print(
+                f"[Verifier] Transaction complete — {kept} verification "
+                f"image(s) saved to: {self._image_dir}"
+            )
+        return kept
+
+    # -----------------------------------------------------------------
+    # Private helpers
+    # -----------------------------------------------------------------
+
+    def _confidence_threshold(self, label: str) -> float:
+        """
+        Return the minimum confidence required to trust a still-image
+        detection for the given SKU label (Fix #6).
+
+        Falls back to MIN_STILL_CONFIDENCE for any label not listed in
+        SKU_MIN_CONFIDENCE.
+
+        Args:
+            label: Product label string as returned by the Hailo model.
+
+        Returns:
+            Float threshold in range [0, 1].
+        """
+        return SKU_MIN_CONFIDENCE.get(label, MIN_STILL_CONFIDENCE)
 
     def _finalise(self, global_id: int, state: dict) -> dict:
         """
         Select the best frame from the burst and produce the final result.
-        Removes the item from _pending and adds it to _verified.
+        Removes the item from _pending, adds it to _verified, and records
+        the confirmed direction so direction-changes can be detected later.
+        Uses per-SKU confidence threshold (Fix #6).
         """
         del self._pending[global_id]
         self._verified.add(global_id)
+        # Record which direction was confirmed so register_direction_event
+        # can detect a future direction change and re-queue correctly (Fix #2)
+        self._verified_directions[global_id] = state["direction"]
 
         frames = state["frames_captured"]
         if not frames:
@@ -3134,20 +3293,25 @@ class ImageCaptureVerifier:
         # Pick highest-confidence frame
         best = max(frames, key=lambda f: f["confidence"])
 
-        confirmed  = best["confidence"] >= MIN_STILL_CONFIDENCE
+        # Use per-SKU threshold (Fix #6) — different products have
+        # structurally different confidence baselines
+        threshold   = self._confidence_threshold(state["label"])
+        confirmed   = best["confidence"] >= threshold
         final_label = best["label"] if confirmed else state["label"]
 
         if confirmed:
             print(
                 f"[Verifier] ✅ global_id={global_id} "
                 f"CONFIRMED {state['direction']} of '{final_label}' "
-                f"(conf={best['confidence']:.2f}, img={os.path.basename(best['path'])})"
+                f"(conf={best['confidence']:.2f} >= threshold={threshold:.2f}, "
+                f"img={os.path.basename(best['path'])})"
             )
         else:
             print(
                 f"[Verifier] ⚠️  global_id={global_id} "
                 f"LOW CONFIDENCE {state['direction']} of '{state['label']}' "
-                f"(best={best['confidence']:.2f}) — falling back to live label"
+                f"(best={best['confidence']:.2f} < threshold={threshold:.2f}) "
+                f"— falling back to live label"
             )
 
         return {
@@ -3369,6 +3533,7 @@ def detection_callback(pad, info, callback_data):
                     direction  = direction,
                     label      = label,
                     camera_id  = stream_id,
+                    confidence = confidence,   # Fix #5: best-camera selection
                 )
 
         # -----------------------------------------------------------
@@ -3387,6 +3552,7 @@ def detection_callback(pad, info, callback_data):
                 camera_id  = stream_id,
                 width      = width,
                 height     = height,
+                bbox       = (x1, y1, x2, y2),  # Fix #1: crop to item bbox
             )
 
         # =============================================================
@@ -3504,6 +3670,17 @@ def detection_callback(pad, info, callback_data):
     # =================================================================
     # Remove tracking data for objects no longer in frame
     cleanup_inactive_tracks(stream_id, active_local_track_ids)
+
+    # =================================================================
+    # STEP 7b: EXPIRE STALE VERIFIER PENDING ENTRIES (Fix #4)
+    # =================================================================
+    # Called once per frame (not per detection) so the timeout is based
+    # on wall-clock time, not frame count.
+    # Items queued but never completed (fast customer, item left frame)
+    # are discarded with an explicit log line rather than silently lost.
+    verifier = getattr(user_data, 'image_verifier', None)
+    if verifier is not None:
+        verifier.expire_stale_pending(timeout_seconds=3.0)
 
     # =================================================================
     # STEP 8: UPDATE FPS CALCULATION
@@ -4185,7 +4362,7 @@ def upload_images_to_api(camera1_images, machine_id, machine_identifier,
     File Naming in Upload:
         camera1_0.jpg, camera1_1.jpg, camera1_2.jpg, ...
     """
-    api_url = "https://stg-sfapi.nuboxtech.com/index.php/mobile_app/product/Product/upload_product_images"
+    api_url = "https://stg-sfapi.nuboxtech.com/index.php/mobile_app/product/Product/upload_"
     
     # Authentication credentials
     username = 'admin'
@@ -4583,27 +4760,22 @@ class TransactionMemoryManager:
               f"(removed {tracks_before - tracks_after})")
 
         # -----------------------------------------------------------
-        # Clean verification image directory for this transaction
+        # Verification images for this transaction are kept on disk
         # -----------------------------------------------------------
-        # The ImageCaptureVerifier normally deletes images itself when
-        # cleanup_transaction_images() is called in run_tracking.
-        # This is a secondary safety-net: if any files somehow remain
-        # (e.g. process interrupted), we remove the whole directory.
+        # Images live in saved_videos/{transaction_id}/verification_images/
+        # alongside the transaction video — no cleanup needed here.
         verification_dir = os.path.join(
-            "camera_images", "verification", str(transaction_id)
+            "saved_videos", str(transaction_id), "verification_images"
         )
         if os.path.isdir(verification_dir):
-            try:
-                for img_file in glob.glob(os.path.join(verification_dir, "*.jpg")):
-                    os.remove(img_file)
-                os.rmdir(verification_dir)
-                # Also remove parent verification/ dir if now empty
-                parent_dir = os.path.dirname(verification_dir)
-                if os.path.isdir(parent_dir) and not os.listdir(parent_dir):
-                    os.rmdir(parent_dir)
-                print(f"[Cleanup] Verification image dir removed: {verification_dir}")
-            except Exception as e:
-                print(f"[Cleanup] Could not remove verification dir: {e}")
+            image_count = len([
+                f for f in os.listdir(verification_dir)
+                if f.endswith('.jpg')
+            ])
+            print(
+                f"[Cleanup] Verification images kept: "
+                f"{image_count} file(s) in {verification_dir}"
+            )
     
     def _recreate_global_dictionaries(self):
         """
@@ -4664,8 +4836,8 @@ class TransactionMemoryManager:
         # Recreate camera movement histories
         # -----------------------------------------------------------
         new_camera_movement_history = {
-            0: defaultdict(lambda: deque(maxlen=5)),
-            1: defaultdict(lambda: deque(maxlen=5))
+            0: defaultdict(lambda: deque(maxlen=3)),
+            1: defaultdict(lambda: deque(maxlen=3))
         }
         for cam_id in [0, 1]:
             for track_id, history in camera_movement_history[cam_id].items():
@@ -4673,13 +4845,13 @@ class TransactionMemoryManager:
                     new_camera_movement_history[cam_id][track_id] = history
                     preserve_count += 1
         camera_movement_history = new_camera_movement_history
-        
+
         # -----------------------------------------------------------
         # Recreate bounding box histories
         # -----------------------------------------------------------
         new_camera_bbox_area_history = {
-            0: defaultdict(lambda: deque(maxlen=5)),
-            1: defaultdict(lambda: deque(maxlen=5))
+            0: defaultdict(lambda: deque(maxlen=3)),
+            1: defaultdict(lambda: deque(maxlen=3))
         }
         for cam_id in [0, 1]:
             for track_id, history in camera_bbox_area_history[cam_id].items():
@@ -5920,8 +6092,8 @@ def main():
     # CREATE REQUIRED DIRECTORIES
     # =================================================================
     print("Creating required directories...")
-    os.makedirs('saved_videos', exist_ok=True)      # For recorded transaction videos
-    os.makedirs('camera_images', exist_ok=True)     # For product capture images
+    os.makedirs('saved_videos', exist_ok=True)      # Transaction videos + verification images
+    os.makedirs('camera_images', exist_ok=True)     # Product capture images (admin upload mode)
     os.makedirs("sounds", exist_ok=True)            # For audio files
     os.makedirs("sounds/deposits", exist_ok=True)   # For deposit alert sounds
     print("Directories created successfully")
