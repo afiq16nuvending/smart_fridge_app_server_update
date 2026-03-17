@@ -2006,7 +2006,7 @@ class HailoDetectionCallback(app_callback_class):
                     # Construct API endpoint
                     refresh_endpoint = (f'https://stg-sfapi.nuboxtech.com/index.php/'
                                       f'mobile_app/machine/Machine_listing/'
-                                      f'machine_planogram/{refresh_machine_id')
+                                      f'machine_planogram/{refresh_machine_id}')
                     
                     # Fetch updated planogram
                     api_response = requests.get(
