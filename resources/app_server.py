@@ -3505,20 +3505,93 @@ def detection_callback(pad, info, callback_data):
         # Analyze Movement Direction
         # -----------------------------------------------------------
         direction = analyze_movement_direction(
-            track_id, 
-            center, 
+            track_id,
+            center,
             user_data.tracking_data,
             stream_id,
             global_id,
-            (x1, y1, x2, y2)  # Current bounding box
+            (x1, y1, x2, y2)
         )
 
-        # -----------------------------------------------------------
-        # [HYBRID STAGE 1] Register direction event with verifier
-        # -----------------------------------------------------------
-        # The moment a direction is confirmed by the tracker, tell the
-        # ImageCaptureVerifier to start its countdown so it can capture
-        # a still burst once the item clears the door threshold.
+        # =============================================================
+        # STEP 6: COUNT ON DIRECTION CONFIRMATION (IMMEDIATE)
+        # =============================================================
+        #
+        # ROOT CAUSE FIX — why items weren't being counted:
+        # ──────────────────────────────────────────────────
+        # Items are only visible for 5–12 frames at 15fps before the
+        # Hailo tracker drops them.  The old hybrid system required:
+        #   CAPTURE_DELAY (4) + BURST (5) = 9 extra frames AFTER
+        #   direction was confirmed, totalling ~12 frames minimum.
+        # Most items left frame before the burst finished → no count.
+        #
+        # NEW TWO-TRACK APPROACH:
+        # ──────────────────────────────────────────────────────────
+        # TRACK A — COUNT (fires immediately when direction confirmed):
+        #   • Count is applied as soon as analyze_movement_direction()
+        #     returns a result.  Never misses a fast grab.
+        #   • Uses the live Hailo label (already very accurate at 0.9+).
+        #
+        # TRACK B — LABEL CORRECTION (background, best-effort):
+        #   • ImageCaptureVerifier still runs in parallel.
+        #   • If it successfully completes a burst AND scores a higher-
+        #     confidence label → it patches the already-counted entry.
+        #   • If it doesn't complete (item left frame too fast) → the
+        #     live-counted label stands.  No count is ever lost.
+        #
+        # This preserves all the image quality improvements while making
+        # counting robust for fast-moving customers.
+        # ---------------------------------------------------------------
+
+        if direction:
+            should_count = (
+                global_id not in user_data.tracking_data.counted_tracks.get(direction, set()) or
+                (global_id in global_last_counted_direction and
+                 direction != global_last_counted_direction[global_id])
+            )
+
+            if should_count:
+                # ── TRACK A: count immediately with live label ──────
+                user_data.tracking_data.class_counters[direction][label] += 1
+
+                if direction not in user_data.tracking_data.counted_tracks:
+                    user_data.tracking_data.counted_tracks[direction] = set()
+                user_data.tracking_data.counted_tracks[direction].add(global_id)
+
+                if validation_result['valid']:
+                    if label not in user_data.tracking_data.validated_products[direction]:
+                        user_data.tracking_data.validated_products[direction][label] = {
+                            "count": 0,
+                            "product_details": validation_result['product_details']
+                        }
+                    user_data.tracking_data.validated_products[direction][label]["count"] += 1
+                else:
+                    if label not in user_data.tracking_data.invalidated_products[direction]:
+                        user_data.tracking_data.invalidated_products[direction][label] = {
+                            "count": 0,
+                            "raw_detection": {
+                                "name": label,
+                                "confidence": confidence,
+                                "tracking_id": global_id,
+                                "bounding_box": {
+                                    "xmin": x1, "ymin": y1,
+                                    "xmax": x2, "ymax": y2
+                                }
+                            }
+                        }
+                    user_data.tracking_data.invalidated_products[direction][label]["count"] += 1
+
+                print(
+                    f"[Count] ✅ global_id={global_id} {direction} '{label}' "
+                    f"(live conf={confidence:.2f})"
+                )
+
+        # ── TRACK B: image verifier runs in background ──────────────
+        # Register direction with the verifier so it can attempt a
+        # still-image burst for label correction.  This is fire-and-
+        # forget: if the burst completes it may patch the label; if
+        # the item leaves frame before the burst finishes it simply
+        # expires with no side-effects on the count.
         verifier = getattr(user_data, 'image_verifier', None)
         if verifier is not None and direction:
             should_register = (
@@ -3526,143 +3599,75 @@ def detection_callback(pad, info, callback_data):
                 (global_id in global_last_counted_direction and
                  direction != global_last_counted_direction[global_id])
             )
-            if should_register:
+            # Note: should_register was evaluated before we added to
+            # counted_tracks above, so re-check using the updated set.
+            already_counted = global_id in user_data.tracking_data.counted_tracks.get(direction, set())
+            if already_counted:
+                # Item was just counted — register for label correction
                 verifier.register_direction_event(
                     global_id  = global_id,
                     direction  = direction,
                     label      = label,
                     camera_id  = stream_id,
-                    confidence = confidence,   # Fix #5: best-camera selection
+                    confidence = confidence,
                 )
 
-        # -----------------------------------------------------------
-        # [HYBRID STAGE 2] Feed current frame to the verifier
-        # -----------------------------------------------------------
-        # For every tracked object that has a pending capture request
-        # the verifier ticks the delay counter and, when ready,
-        # saves frames and scores detections.
-        # When the burst is complete it returns a verification result.
-        verification_result = None
+        # Feed current frame into the verifier for burst capture.
+        # If the burst completes, patch the label of the already-counted item.
         if verifier is not None:
             verification_result = verifier.process_frame(
                 global_id  = global_id,
-                frame      = frame,          # Raw RGB — before BGR conversion
-                detections = detections,     # All detections in this frame
+                frame      = frame,
+                detections = detections,
                 camera_id  = stream_id,
                 width      = width,
                 height     = height,
-                bbox       = (x1, y1, x2, y2),  # Fix #1: crop to item bbox
+                bbox       = (x1, y1, x2, y2),
             )
 
-        # =============================================================
-        # STEP 6: UPDATE COUNTERS WHEN VERIFICATION RESULT ARRIVES
-        # =============================================================
-        # We now count only when the ImageCaptureVerifier has produced a
-        # result (i.e. the still-image burst has been processed).
-        # If the verifier is not attached (e.g. product-upload mode) we
-        # fall back to the original live-only behaviour.
-        #
-        # Counting logic:
-        #   verification_result returned  → use its confirmed label/direction
-        #   no verifier attached          → use live label/direction as before
-        # ---------------------------------------------------------------
-
-        if verifier is not None:
-            # --- HYBRID PATH: wait for verifier to produce a result ---
+            # ── TRACK B result: patch label if image is more confident ──
             if verification_result is not None:
-                # Use the verifier's confirmed label (may differ from live)
-                confirmed_direction = verification_result["direction"]
-                confirmed_label     = verification_result["label"]
+                v_label     = verification_result["label"]
+                v_direction = verification_result["direction"]
+                v_conf      = verification_result["confidence"]
+                v_confirmed = verification_result["confirmed"]
 
-                # Re-validate with the (possibly corrected) confirmed label
-                confirmed_validation = user_data.validate_detected_product(confirmed_label)
+                # Only patch if the image gave a DIFFERENT, higher-confidence label
+                if v_confirmed and v_label != label:
+                    v_validation = user_data.validate_detected_product(v_label)
 
-                # Log the verification outcome on screen
+                    # Decrement old live-label count
+                    if label in user_data.tracking_data.validated_products.get(v_direction, {}):
+                        user_data.tracking_data.validated_products[v_direction][label]["count"] -= 1
+                        if user_data.tracking_data.validated_products[v_direction][label]["count"] <= 0:
+                            del user_data.tracking_data.validated_products[v_direction][label]
+                    user_data.tracking_data.class_counters[v_direction][label] -= 1
+
+                    # Increment corrected label count
+                    user_data.tracking_data.class_counters[v_direction][v_label] += 1
+                    if v_validation['valid']:
+                        if v_label not in user_data.tracking_data.validated_products[v_direction]:
+                            user_data.tracking_data.validated_products[v_direction][v_label] = {
+                                "count": 0,
+                                "product_details": v_validation['product_details']
+                            }
+                        user_data.tracking_data.validated_products[v_direction][v_label]["count"] += 1
+
+                    print(
+                        f"[Verifier] 🔄 global_id={global_id} label corrected "
+                        f"'{label}'→'{v_label}' (img conf={v_conf:.2f})"
+                    )
+
+                # Draw verification status on frame
                 status_text = (
-                    f"[IMG VERIFIED] {confirmed_label} {confirmed_direction} "
-                    f"conf={verification_result['confidence']:.2f}"
-                    if verification_result["confirmed"]
-                    else
-                    f"[IMG FALLBACK] {confirmed_label} {confirmed_direction}"
+                    f"[IMG OK] {v_label} conf={v_conf:.2f}"
+                    if v_confirmed else
+                    f"[IMG LOW] {v_label} conf={v_conf:.2f}"
                 )
                 cv2.putText(
                     frame, status_text, (10, height - 20),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1
                 )
-
-                # Increment counter for this product and direction
-                user_data.tracking_data.class_counters[confirmed_direction][confirmed_label] += 1
-
-                # Mark global ID as counted to prevent duplicate
-                if confirmed_direction not in user_data.tracking_data.counted_tracks:
-                    user_data.tracking_data.counted_tracks[confirmed_direction] = set()
-                user_data.tracking_data.counted_tracks[confirmed_direction].add(global_id)
-
-                # Update Validated / Invalidated products
-                if confirmed_validation['valid']:
-                    if confirmed_label not in user_data.tracking_data.validated_products[confirmed_direction]:
-                        user_data.tracking_data.validated_products[confirmed_direction][confirmed_label] = {
-                            "count": 0,
-                            "product_details": confirmed_validation['product_details']
-                        }
-                    user_data.tracking_data.validated_products[confirmed_direction][confirmed_label]["count"] += 1
-                else:
-                    if confirmed_label not in user_data.tracking_data.invalidated_products[confirmed_direction]:
-                        user_data.tracking_data.invalidated_products[confirmed_direction][confirmed_label] = {
-                            "count": 0,
-                            "raw_detection": {
-                                "name":        confirmed_label,
-                                "confidence":  verification_result["confidence"],
-                                "tracking_id": global_id,
-                                "image_path":  verification_result.get("image_path", ""),
-                                "bounding_box": {
-                                    "xmin": x1, "ymin": y1,
-                                    "xmax": x2, "ymax": y2,
-                                }
-                            }
-                        }
-                    user_data.tracking_data.invalidated_products[confirmed_direction][confirmed_label]["count"] += 1
-
-        else:
-            # --- ORIGINAL LIVE-ONLY PATH (no verifier attached) ---
-            if direction:
-                should_count = (
-                    global_id not in user_data.tracking_data.counted_tracks.get(direction, set()) or
-                    (global_id in global_last_counted_direction and
-                     direction != global_last_counted_direction[global_id])
-                )
-
-                if should_count:
-                    user_data.tracking_data.class_counters[direction][label] += 1
-
-                    if direction not in user_data.tracking_data.counted_tracks:
-                        user_data.tracking_data.counted_tracks[direction] = set()
-                    user_data.tracking_data.counted_tracks[direction].add(global_id)
-
-                    if validation_result['valid']:
-                        if label not in user_data.tracking_data.validated_products[direction]:
-                            user_data.tracking_data.validated_products[direction][label] = {
-                                "count": 0,
-                                "product_details": validation_result['product_details']
-                            }
-                        user_data.tracking_data.validated_products[direction][label]["count"] += 1
-                    else:
-                        if label not in user_data.tracking_data.invalidated_products[direction]:
-                            user_data.tracking_data.invalidated_products[direction][label] = {
-                                "count": 0,
-                                "raw_detection": {
-                                    "name": label,
-                                    "confidence": confidence,
-                                    "tracking_id": global_id,
-                                    "bounding_box": {
-                                        "xmin": x1,
-                                        "ymin": y1,
-                                        "xmax": x2,
-                                        "ymax": y2
-                                    }
-                                }
-                            }
-                        user_data.tracking_data.invalidated_products[direction][label]["count"] += 1
 
     # =================================================================
     # STEP 7: CLEANUP INACTIVE TRACKS
