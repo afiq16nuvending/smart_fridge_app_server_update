@@ -184,6 +184,7 @@ print_lock = threading.Lock()     # Thread lock for console output
 done = False                    # Flag indicating transaction completion
 unlock_data = 0                # Flag for door unlock control
 
+
 # =====================================================================
 # TRACKING DATA STRUCTURES
 # =====================================================================
@@ -998,12 +999,12 @@ def stream_video_to_api(video_path, dataset_name, transaction_id, machine_id,
     Returns:
         bool: True if upload successful, False otherwise
         
-    API Endpoint:
+API Endpoint:
         POST /shopping_app/machine/TransactionDataset/insert_transactionDataset
         
     Authentication:
-        - Basic Auth: username='admin', password='1234'
-        - API Key: '123456' in x-api-key header
+        - Basic Auth: username='', password=''
+        - API Key: ' in x-api-key header
         
     Upload Details:
         - Method: HTTP POST with multipart/form-data
@@ -1069,6 +1070,8 @@ def stream_video_to_api(video_path, dataset_name, transaction_id, machine_id,
     except Exception as e:
         print(f"Error during video streaming: {e}")
         return False
+
+
 
 # =====================================================================
 # VIDEO MONITORING AND AUTO-UPLOAD SYSTEM
@@ -1597,6 +1600,19 @@ class HailoDetectionCallback(app_callback_class):
         # Store machine_id in environment variable for persistence
         self.store_machine_id_env(machine_id)
         
+        # =================================================================
+        # IMAGE CAPTURE VERIFIER
+        # =================================================================
+        # Attach the verifier so detection_callback can access it via
+        # user_data.image_verifier.  Only created when transaction_id is
+        # known; falls back gracefully to None (live-only mode) otherwise.
+        if transaction_id:
+            self.image_verifier = ImageCaptureVerifier(transaction_id)
+            print(f"[Verifier] Attached to transaction {transaction_id}")
+        else:
+            self.image_verifier = None
+            print("[Verifier] No transaction_id — running in live-only mode")
+        
         # Load machine planogram (product inventory)
         self.load_machine_planogram()
     
@@ -1862,7 +1878,7 @@ class HailoDetectionCallback(app_callback_class):
             "comp.sink_1"
         )
 
-    # =================================================================
+  # =================================================================
     # API PLANOGRAM FETCHING AND REFRESH SYSTEM
     # =================================================================
     
@@ -2029,7 +2045,7 @@ class HailoDetectionCallback(app_callback_class):
             list: Current planogram data from environment cache
         """
         return self.load_planogram_env()
-    
+
     # =================================================================
     # PRODUCT VALIDATION AGAINST PLANOGRAM
     # =================================================================
@@ -2815,6 +2831,335 @@ def analyze_movement_direction(track_id, center, tracking_data, camera_id,
     return current_direction
 
 # =====================================================================
+# IMAGE CAPTURE VERIFIER
+# =====================================================================
+"""
+HYBRID DETECTION SYSTEM — HOW IT WORKS
+=======================================
+
+PROBLEM with live-only detection:
+- Object partially occluded by hand during motion
+- Bounding box cut off at frame edge during transit
+- Lower classification confidence under motion blur
+
+SOLUTION — Two-stage hybrid:
+  STAGE 1 (Video):  Detect direction of movement (entry / exit)
+  STAGE 2 (Image):  Capture still frames AFTER motion clears,
+                    re-classify at highest confidence, confirm SKU.
+
+FLOW:
+  direction confirmed
+        ↓
+  wait CAPTURE_DELAY_FRAMES (item clears the door threshold)
+        ↓
+  capture CAPTURE_BURST_COUNT consecutive frames
+        ↓
+  pick frame with highest Hailo detection confidence
+        ↓
+  cross-check label vs live label
+        ↓
+  count confirmed SKU (+1 exit  /  -1 entry)
+
+CLEANUP:
+  All still images are stored in  camera_images/verification/
+  They are deleted automatically at transaction end via
+  ImageCaptureVerifier.cleanup_transaction_images().
+"""
+
+# How many frames to wait after direction is confirmed before capturing
+CAPTURE_DELAY_FRAMES  = 4   # ~0.3 s at 13 fps — item clears the door
+
+# How many frames to capture in the burst
+CAPTURE_BURST_COUNT   = 5   # pick the best one out of 5
+
+# Minimum confidence for a still-image detection to be trusted
+MIN_STILL_CONFIDENCE  = 0.40
+
+
+class ImageCaptureVerifier:
+    """
+    Captures a burst of still frames after a direction event is confirmed,
+    selects the highest-confidence detection, and verifies the SKU label
+    against the live-detection label.
+
+    One instance is shared for both cameras per transaction.
+
+    Directory layout:
+        camera_images/
+        └── verification/
+            └── {transaction_id}/
+                ├── cam0_exit_globalId_frame0.jpg
+                ├── cam0_exit_globalId_frame1.jpg
+                └── ...  (deleted at transaction end)
+
+    Thread safety:
+        All public methods are protected by self._lock so they can
+        be called safely from the GStreamer callback thread.
+    """
+
+    def __init__(self, transaction_id: str):
+        """
+        Args:
+            transaction_id: Unique transaction ID — used for the image
+                            sub-directory so images are isolated per session.
+        """
+        self.transaction_id = transaction_id
+        self._lock = threading.Lock()
+
+        # { global_id: {"direction": str,
+        #               "label": str,
+        #               "delay_remaining": int,
+        #               "frames_captured": [{"path": str, "confidence": float}],
+        #               "camera_id": int } }
+        self._pending: Dict[int, dict] = {}
+
+        # global_ids that have already been verified this transaction
+        # (prevents double-counting if the item lingers in frame)
+        self._verified: set = set()
+
+        # All image paths created this transaction (for cleanup)
+        self._all_images: List[str] = []
+
+        # Output directory
+        self._image_dir = os.path.join(
+            "camera_images", "verification", str(transaction_id)
+        )
+        os.makedirs(self._image_dir, exist_ok=True)
+        print(f"[Verifier] Image directory: {self._image_dir}")
+
+    # -----------------------------------------------------------------
+    # PUBLIC API — called from detection_callback
+    # -----------------------------------------------------------------
+
+    def register_direction_event(
+        self,
+        global_id: int,
+        direction: str,
+        label: str,
+        camera_id: int,
+    ) -> None:
+        """
+        Called the moment analyze_movement_direction() returns a result.
+
+        Starts the countdown before the burst capture begins so the item
+        has time to clear the door threshold.
+
+        Args:
+            global_id:  Global track ID (cross-camera unique).
+            direction:  'entry' or 'exit'.
+            label:      Product label from live detection.
+            camera_id:  Camera that made the detection (0 or 1).
+        """
+        with self._lock:
+            if global_id in self._verified:
+                return  # Already processed this item
+            if global_id in self._pending:
+                return  # Already queued
+
+            self._pending[global_id] = {
+                "direction":       direction,
+                "label":           label,
+                "camera_id":       camera_id,
+                "delay_remaining": CAPTURE_DELAY_FRAMES,
+                "frames_captured": [],
+            }
+            print(
+                f"[Verifier] Queued global_id={global_id} "
+                f"label={label} direction={direction} "
+                f"(waiting {CAPTURE_DELAY_FRAMES} frames)"
+            )
+
+    def process_frame(
+        self,
+        global_id: int,
+        frame: np.ndarray,
+        detections,          # hailo detection objects for this frame
+        camera_id: int,
+        width: int,
+        height: int,
+    ) -> dict | None:
+        """
+        Called every frame for every active track.
+
+        Ticks the delay counter; when it reaches zero starts collecting
+        the burst.  When the burst is full, picks the best frame,
+        cross-checks the label and returns a result dict.
+
+        Args:
+            global_id:  Global track ID.
+            frame:      Current raw RGB numpy frame (before BGR conversion).
+            detections: Hailo detection objects from this frame.
+            camera_id:  Camera originating this frame.
+            width/height: Frame dimensions.
+
+        Returns:
+            None while collecting, OR a result dict when ready:
+            {
+                "confirmed":   bool,
+                "direction":   str,
+                "label":       str,   # confirmed label (or live label on fail)
+                "confidence":  float,
+                "image_path":  str,
+            }
+        """
+        with self._lock:
+            if global_id not in self._pending:
+                return None
+            state = self._pending[global_id]
+
+            # Only process from the originating camera
+            if state["camera_id"] != camera_id:
+                return None
+
+            # ---- countdown phase ----
+            if state["delay_remaining"] > 0:
+                state["delay_remaining"] -= 1
+                return None
+
+            # ---- burst capture phase ----
+            if len(state["frames_captured"]) < CAPTURE_BURST_COUNT:
+                result = self._capture_and_score(
+                    global_id, state, frame, detections, width, height
+                )
+                if result is not None:
+                    state["frames_captured"].append(result)
+                return None
+
+            # ---- burst complete — pick best frame ----
+            return self._finalise(global_id, state)
+
+    def cleanup_transaction_images(self) -> int:
+        """
+        Delete all still images captured during this transaction.
+
+        Call this at transaction end (in run_tracking finally block).
+
+        Returns:
+            Number of files deleted.
+        """
+        deleted = 0
+        with self._lock:
+            for path in list(self._all_images):
+                try:
+                    if os.path.exists(path):
+                        os.remove(path)
+                        deleted += 1
+                except Exception as e:
+                    print(f"[Verifier] Could not delete {path}: {e}")
+            self._all_images.clear()
+
+        # Remove the directory itself if empty
+        try:
+            if os.path.isdir(self._image_dir):
+                os.rmdir(self._image_dir)
+                # Also try the parent verification/ dir
+                parent = os.path.dirname(self._image_dir)
+                if os.path.isdir(parent) and not os.listdir(parent):
+                    os.rmdir(parent)
+        except Exception:
+            pass
+
+        print(f"[Verifier] Cleanup complete — {deleted} image(s) deleted.")
+        return deleted
+
+    # -----------------------------------------------------------------
+    # PRIVATE HELPERS
+    # -----------------------------------------------------------------
+
+    def _capture_and_score(
+        self,
+        global_id: int,
+        state: dict,
+        frame: np.ndarray,
+        detections,
+        width: int,
+        height: int,
+    ) -> dict | None:
+        """
+        Save the current frame as a JPEG and find the highest-confidence
+        detection for the expected label in it.
+
+        Returns a dict {"path", "confidence", "label"} or None on failure.
+        """
+        frame_index = len(state["frames_captured"])
+        filename = (
+            f"cam{state['camera_id']}_"
+            f"{state['direction']}_"
+            f"g{global_id}_"
+            f"f{frame_index}.jpg"
+        )
+        img_path = os.path.join(self._image_dir, filename)
+
+        try:
+            # Convert RGB → BGR for OpenCV save
+            bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(img_path, bgr, [cv2.IMWRITE_JPEG_QUALITY, 92])
+            self._all_images.append(img_path)
+        except Exception as e:
+            print(f"[Verifier] Failed to save frame: {e}")
+            return None
+
+        # Score: find detections in this frame matching the expected label
+        best_conf = 0.0
+        best_label = state["label"]
+        for det in detections:
+            det_label = det.get_label()
+            det_conf  = det.get_confidence()
+            if det_label == state["label"] and det_conf > best_conf:
+                best_conf  = det_conf
+                best_label = det_label
+
+        return {"path": img_path, "confidence": best_conf, "label": best_label}
+
+    def _finalise(self, global_id: int, state: dict) -> dict:
+        """
+        Select the best frame from the burst and produce the final result.
+        Removes the item from _pending and adds it to _verified.
+        """
+        del self._pending[global_id]
+        self._verified.add(global_id)
+
+        frames = state["frames_captured"]
+        if not frames:
+            # Nothing was captured — fall back to live label, unconfirmed
+            print(f"[Verifier] global_id={global_id}: no frames captured, using live label.")
+            return {
+                "confirmed":  False,
+                "direction":  state["direction"],
+                "label":      state["label"],
+                "confidence": 0.0,
+                "image_path": "",
+            }
+
+        # Pick highest-confidence frame
+        best = max(frames, key=lambda f: f["confidence"])
+
+        confirmed  = best["confidence"] >= MIN_STILL_CONFIDENCE
+        final_label = best["label"] if confirmed else state["label"]
+
+        if confirmed:
+            print(
+                f"[Verifier] ✅ global_id={global_id} "
+                f"CONFIRMED {state['direction']} of '{final_label}' "
+                f"(conf={best['confidence']:.2f}, img={os.path.basename(best['path'])})"
+            )
+        else:
+            print(
+                f"[Verifier] ⚠️  global_id={global_id} "
+                f"LOW CONFIDENCE {state['direction']} of '{state['label']}' "
+                f"(best={best['confidence']:.2f}) — falling back to live label"
+            )
+
+        return {
+            "confirmed":  confirmed,
+            "direction":  state["direction"],
+            "label":      final_label,
+            "confidence": best["confidence"],
+            "image_path": best["path"],
+        }
+
+
+# =====================================================================
 # MAIN DETECTION CALLBACK FUNCTION
 # =====================================================================
 """
@@ -2829,7 +3174,9 @@ EXECUTION FLOW (per frame):
    - Validate product against planogram
    - Draw bounding box and trail
    - Analyze movement direction
-   - Update counters if movement detected
+   - [NEW] Register direction event with ImageCaptureVerifier
+   - [NEW] Process frame through ImageCaptureVerifier
+   - Update counters when verification result arrives
 5. Update WebSocket with latest data
 6. Calculate price and trigger alerts if needed
 7. Display frame (combined from both cameras)
@@ -3002,61 +3349,155 @@ def detection_callback(pad, info, callback_data):
             global_id,
             (x1, y1, x2, y2)  # Current bounding box
         )
-        
-        # =============================================================
-        # STEP 6: UPDATE COUNTERS IF MOVEMENT DETECTED
-        # =============================================================
-        if direction:
-            # Check if we should count this movement
-            # Count if:
-            # 1. Global ID not yet counted for this direction, OR
-            # 2. Direction changed since last count (customer changed mind)
-            
-            should_count = (
+
+        # -----------------------------------------------------------
+        # [HYBRID STAGE 1] Register direction event with verifier
+        # -----------------------------------------------------------
+        # The moment a direction is confirmed by the tracker, tell the
+        # ImageCaptureVerifier to start its countdown so it can capture
+        # a still burst once the item clears the door threshold.
+        verifier = getattr(user_data, 'image_verifier', None)
+        if verifier is not None and direction:
+            should_register = (
                 global_id not in user_data.tracking_data.counted_tracks.get(direction, set()) or
-                (global_id in global_last_counted_direction and 
+                (global_id in global_last_counted_direction and
                  direction != global_last_counted_direction[global_id])
             )
-            
-            if should_count:
+            if should_register:
+                verifier.register_direction_event(
+                    global_id  = global_id,
+                    direction  = direction,
+                    label      = label,
+                    camera_id  = stream_id,
+                )
+
+        # -----------------------------------------------------------
+        # [HYBRID STAGE 2] Feed current frame to the verifier
+        # -----------------------------------------------------------
+        # For every tracked object that has a pending capture request
+        # the verifier ticks the delay counter and, when ready,
+        # saves frames and scores detections.
+        # When the burst is complete it returns a verification result.
+        verification_result = None
+        if verifier is not None:
+            verification_result = verifier.process_frame(
+                global_id  = global_id,
+                frame      = frame,          # Raw RGB — before BGR conversion
+                detections = detections,     # All detections in this frame
+                camera_id  = stream_id,
+                width      = width,
+                height     = height,
+            )
+
+        # =============================================================
+        # STEP 6: UPDATE COUNTERS WHEN VERIFICATION RESULT ARRIVES
+        # =============================================================
+        # We now count only when the ImageCaptureVerifier has produced a
+        # result (i.e. the still-image burst has been processed).
+        # If the verifier is not attached (e.g. product-upload mode) we
+        # fall back to the original live-only behaviour.
+        #
+        # Counting logic:
+        #   verification_result returned  → use its confirmed label/direction
+        #   no verifier attached          → use live label/direction as before
+        # ---------------------------------------------------------------
+
+        if verifier is not None:
+            # --- HYBRID PATH: wait for verifier to produce a result ---
+            if verification_result is not None:
+                # Use the verifier's confirmed label (may differ from live)
+                confirmed_direction = verification_result["direction"]
+                confirmed_label     = verification_result["label"]
+
+                # Re-validate with the (possibly corrected) confirmed label
+                confirmed_validation = user_data.validate_detected_product(confirmed_label)
+
+                # Log the verification outcome on screen
+                status_text = (
+                    f"[IMG VERIFIED] {confirmed_label} {confirmed_direction} "
+                    f"conf={verification_result['confidence']:.2f}"
+                    if verification_result["confirmed"]
+                    else
+                    f"[IMG FALLBACK] {confirmed_label} {confirmed_direction}"
+                )
+                cv2.putText(
+                    frame, status_text, (10, height - 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1
+                )
+
                 # Increment counter for this product and direction
-                user_data.tracking_data.class_counters[direction][label] += 1
-                
-                # Add to counted tracks set
-                if direction not in user_data.tracking_data.counted_tracks:
-                    user_data.tracking_data.counted_tracks[direction] = set()
-                user_data.tracking_data.counted_tracks[direction].add(global_id)
-                
-                # -----------------------------------------------------
-                # Update Validated/Invalidated Products
-                # -----------------------------------------------------
-                if validation_result['valid']:
-                    # VALID PRODUCT - Add to validated products
-                    if label not in user_data.tracking_data.validated_products[direction]:
-                        user_data.tracking_data.validated_products[direction][label] = {
+                user_data.tracking_data.class_counters[confirmed_direction][confirmed_label] += 1
+
+                # Mark global ID as counted to prevent duplicate
+                if confirmed_direction not in user_data.tracking_data.counted_tracks:
+                    user_data.tracking_data.counted_tracks[confirmed_direction] = set()
+                user_data.tracking_data.counted_tracks[confirmed_direction].add(global_id)
+
+                # Update Validated / Invalidated products
+                if confirmed_validation['valid']:
+                    if confirmed_label not in user_data.tracking_data.validated_products[confirmed_direction]:
+                        user_data.tracking_data.validated_products[confirmed_direction][confirmed_label] = {
                             "count": 0,
-                            "product_details": validation_result['product_details']
+                            "product_details": confirmed_validation['product_details']
                         }
-                    user_data.tracking_data.validated_products[direction][label]["count"] += 1
-                    
+                    user_data.tracking_data.validated_products[confirmed_direction][confirmed_label]["count"] += 1
                 else:
-                    # INVALID PRODUCT - Add to invalidated products
-                    if label not in user_data.tracking_data.invalidated_products[direction]:
-                        user_data.tracking_data.invalidated_products[direction][label] = {
+                    if confirmed_label not in user_data.tracking_data.invalidated_products[confirmed_direction]:
+                        user_data.tracking_data.invalidated_products[confirmed_direction][confirmed_label] = {
                             "count": 0,
                             "raw_detection": {
-                                "name": label,
-                                "confidence": confidence,
+                                "name":        confirmed_label,
+                                "confidence":  verification_result["confidence"],
                                 "tracking_id": global_id,
+                                "image_path":  verification_result.get("image_path", ""),
                                 "bounding_box": {
-                                    "xmin": x1,
-                                    "ymin": y1,
-                                    "xmax": x2,
-                                    "ymax": y2
+                                    "xmin": x1, "ymin": y1,
+                                    "xmax": x2, "ymax": y2,
                                 }
                             }
                         }
-                    user_data.tracking_data.invalidated_products[direction][label]["count"] += 1
+                    user_data.tracking_data.invalidated_products[confirmed_direction][confirmed_label]["count"] += 1
+
+        else:
+            # --- ORIGINAL LIVE-ONLY PATH (no verifier attached) ---
+            if direction:
+                should_count = (
+                    global_id not in user_data.tracking_data.counted_tracks.get(direction, set()) or
+                    (global_id in global_last_counted_direction and
+                     direction != global_last_counted_direction[global_id])
+                )
+
+                if should_count:
+                    user_data.tracking_data.class_counters[direction][label] += 1
+
+                    if direction not in user_data.tracking_data.counted_tracks:
+                        user_data.tracking_data.counted_tracks[direction] = set()
+                    user_data.tracking_data.counted_tracks[direction].add(global_id)
+
+                    if validation_result['valid']:
+                        if label not in user_data.tracking_data.validated_products[direction]:
+                            user_data.tracking_data.validated_products[direction][label] = {
+                                "count": 0,
+                                "product_details": validation_result['product_details']
+                            }
+                        user_data.tracking_data.validated_products[direction][label]["count"] += 1
+                    else:
+                        if label not in user_data.tracking_data.invalidated_products[direction]:
+                            user_data.tracking_data.invalidated_products[direction][label] = {
+                                "count": 0,
+                                "raw_detection": {
+                                    "name": label,
+                                    "confidence": confidence,
+                                    "tracking_id": global_id,
+                                    "bounding_box": {
+                                        "xmin": x1,
+                                        "ymin": y1,
+                                        "xmax": x2,
+                                        "ymax": y2
+                                    }
+                                }
+                            }
+                        user_data.tracking_data.invalidated_products[direction][label]["count"] += 1
 
     # =================================================================
     # STEP 7: CLEANUP INACTIVE TRACKS
@@ -3448,6 +3889,15 @@ async def run_tracking(websocket: WebSocket):
                 transaction_memory_manager.end_transaction(transaction_id)
                 print(f"[Memory] Transaction {transaction_id} ended")
             
+            # ==========================================================
+            # CLEAN UP VERIFICATION IMAGES (normal path)
+            # ==========================================================
+            # Delete all still frames captured by the ImageCaptureVerifier
+            # during this transaction.  This runs even if the verifier had
+            # zero captures (no-op in that case).
+            if hasattr(callback, 'image_verifier') and callback.image_verifier is not None:
+                callback.image_verifier.cleanup_transaction_images()
+            
     except Exception as e:
         print(f"Error during tracking: {e}")
         
@@ -3478,6 +3928,19 @@ async def run_tracking(websocket: WebSocket):
             cover_alert_thread = None
             alert_thread.join()
             alert_thread = None
+        
+        # ==========================================================
+        # CLEAN UP VERIFICATION IMAGES (safety net / error path)
+        # ==========================================================
+        # This runs regardless of whether the normal cleanup above
+        # already ran — cleanup_transaction_images() is idempotent
+        # (self._all_images is cleared on first call, so a second
+        # call is a harmless no-op).
+        try:
+            if hasattr(callback, 'image_verifier') and callback.image_verifier is not None:
+                callback.image_verifier.cleanup_transaction_images()
+        except Exception as cleanup_err:
+            print(f"[Verifier] Cleanup error in finally block: {cleanup_err}")
             
         await door_monitor_task
         callback.tracking_data.shutdown_event.set()
@@ -3813,6 +4276,7 @@ def delete_images(image_paths):
     print(f"Successfully deleted {deleted_count} images")
     return deleted_count
 
+
 # =====================================================================
 # TRANSACTION-BASED MEMORY MANAGEMENT SYSTEM
 # =====================================================================
@@ -4117,6 +4581,29 @@ class TransactionMemoryManager:
               f"(removed {trails_before - trails_after})")
         print(f"[Cleanup] Tracks: {tracks_before} -> {tracks_after} "
               f"(removed {tracks_before - tracks_after})")
+
+        # -----------------------------------------------------------
+        # Clean verification image directory for this transaction
+        # -----------------------------------------------------------
+        # The ImageCaptureVerifier normally deletes images itself when
+        # cleanup_transaction_images() is called in run_tracking.
+        # This is a secondary safety-net: if any files somehow remain
+        # (e.g. process interrupted), we remove the whole directory.
+        verification_dir = os.path.join(
+            "camera_images", "verification", str(transaction_id)
+        )
+        if os.path.isdir(verification_dir):
+            try:
+                for img_file in glob.glob(os.path.join(verification_dir, "*.jpg")):
+                    os.remove(img_file)
+                os.rmdir(verification_dir)
+                # Also remove parent verification/ dir if now empty
+                parent_dir = os.path.dirname(verification_dir)
+                if os.path.isdir(parent_dir) and not os.listdir(parent_dir):
+                    os.rmdir(parent_dir)
+                print(f"[Cleanup] Verification image dir removed: {verification_dir}")
+            except Exception as e:
+                print(f"[Cleanup] Could not remove verification dir: {e}")
     
     def _recreate_global_dictionaries(self):
         """
@@ -5550,8 +6037,8 @@ DEPLOYMENT:
 1. Install dependencies: pip install -r requirements.txt
 2. Configure camera devices (/dev/video0, /dev/video2)
 3. Set up API credentials in code
-4. Run: python app_server.py --host 0.0.0.0 --port 8000
-5. Mobile app connects to: ws://raspberry-pi-ip:8000/ws/track
+4. Run: python app_server.py --host 0.0.0.0 --rtspport 8000
+5. Mobile app connects to: 
 
 MAINTENANCE:
 - Monitor memory usage: curl http://raspberry-pi:8000/stats
