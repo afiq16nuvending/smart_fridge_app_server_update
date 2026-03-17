@@ -4362,7 +4362,7 @@ def upload_images_to_api(camera1_images, machine_id, machine_identifier,
     File Naming in Upload:
         camera1_0.jpg, camera1_1.jpg, camera1_2.jpg, ...
     """
-    api_url = "https://stg-sfapi.nuboxtech.com/index.php/mobile_app/product/Product/upload_"
+    api_url = "https://stg-sfapi.nuboxtech.com/index.php/mobile_app/product/Product/upload_product_images"
     
     # Authentication credentials
     username = 'admin'
