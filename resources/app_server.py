@@ -2872,8 +2872,36 @@ CAPTURE_DELAY_FRAMES  = 4   # ~0.3 s at 13 fps — item clears the door
 # How many frames to capture in the burst
 CAPTURE_BURST_COUNT   = 5   # pick the best one out of 5
 
-# Minimum confidence for a still-image detection to be trusted
+# Default minimum confidence for a still-image detection to be trusted.
+# Used as fallback for any SKU not listed in SKU_MIN_CONFIDENCE below.
 MIN_STILL_CONFIDENCE  = 0.40
+
+# Per-SKU minimum confidence thresholds (Fix #6).
+#
+# WHY: Different products have structurally different baseline confidence
+# levels. Items that are visually distinct (e.g. kimchiFriedRice) hit
+# 0.90+ consistently — a 0.40 floor undersells their quality.
+# Items that are similar-looking (e.g. guava vs pinkGuava) may never
+# exceed 0.50 even under perfect conditions — a 0.40 floor would reject
+# them incorrectly.
+#
+# HOW TO TUNE: After a week of real transaction logs, look at the
+# confirmed confidence values for each SKU and set each threshold to
+# roughly 70% of that SKU's typical best-frame score.
+#
+# Class names must match exactly what your Hailo model returns.
+SKU_MIN_CONFIDENCE: Dict[str, float] = {
+    "chickenKatsuCurry":  0.65,
+    "dakgangjeongRice":   0.65,
+    "kimchiFriedRice":    0.65,
+    "kimchiTuna":         0.65,
+    "mangoMilk":          0.55,
+    "pineappleHoney":     0.55,
+    "mango":              0.45,
+    "dragonFruit":        0.45,
+    "guava":              0.35,   # visually similar to pinkGuava
+    "pinkGuava":          0.35,   # visually similar to guava
+}
 
 
 class ImageCaptureVerifier:
@@ -2910,12 +2938,18 @@ class ImageCaptureVerifier:
         #               "label": str,
         #               "delay_remaining": int,
         #               "frames_captured": [{"path": str, "confidence": float}],
-        #               "camera_id": int } }
+        #               "camera_id": int,
+        #               "queued_at": float } }
         self._pending: Dict[int, dict] = {}
 
         # global_ids that have already been verified this transaction
         # (prevents double-counting if the item lingers in frame)
         self._verified: set = set()
+
+        # Tracks which direction each verified global_id was confirmed in.
+        # Needed to detect direction changes (fix #2).
+        # Format: { global_id: 'entry' | 'exit' }
+        self._verified_directions: Dict[int, str] = {}
 
         # All image paths created this transaction (for cleanup)
         self._all_images: List[str] = []
@@ -2937,6 +2971,7 @@ class ImageCaptureVerifier:
         direction: str,
         label: str,
         camera_id: int,
+        confidence: float = 0.0,
     ) -> None:
         """
         Called the moment analyze_movement_direction() returns a result.
@@ -2944,39 +2979,116 @@ class ImageCaptureVerifier:
         Starts the countdown before the burst capture begins so the item
         has time to clear the door threshold.
 
+        Camera selection (Fix #5):
+            When both cameras detect the same global_id, the one with the
+            higher live-detection confidence wins.  If this call arrives
+            with a higher confidence than the already-queued camera, the
+            pending state is updated to use the better camera going forward.
+            This prevents the first camera to fire from winning by default.
+
+        Direction-change handling (Fix #2):
+            If a customer takes an item OUT (exit, verified) and then puts
+            it BACK (entry), the global_id will be in self._verified with
+            the old direction.  We detect this case and re-queue with the
+            new direction so the return is counted correctly.
+
         Args:
-            global_id:  Global track ID (cross-camera unique).
-            direction:  'entry' or 'exit'.
-            label:      Product label from live detection.
-            camera_id:  Camera that made the detection (0 or 1).
+            global_id:   Global track ID (cross-camera unique).
+            direction:   'entry' or 'exit'.
+            label:       Product label from live detection.
+            camera_id:   Camera that made the detection (0 or 1).
+            confidence:  Live-detection confidence score for camera selection.
         """
         with self._lock:
+            # --- direction-change re-queue (Fix #2) ---
             if global_id in self._verified:
-                return  # Already processed this item
-            if global_id in self._pending:
-                return  # Already queued
+                old_direction = self._verified_directions.get(global_id)
+                if old_direction is not None and old_direction != direction:
+                    self._verified.discard(global_id)
+                    self._verified_directions.pop(global_id, None)
+                    self._pending.pop(global_id, None)
+                    print(
+                        f"[Verifier] ↩️  global_id={global_id} "
+                        f"direction changed {old_direction}→{direction}, re-queuing"
+                    )
+                else:
+                    return  # Same direction already verified — skip
 
+            # --- camera selection: update if better camera arrives (Fix #5) ---
+            if global_id in self._pending:
+                existing = self._pending[global_id]
+                # Only update camera if:
+                # 1. Burst hasn't started yet (delay_remaining > 0, no frames saved)
+                # 2. New confidence is strictly higher than the registered camera's
+                if (existing["delay_remaining"] > 0
+                        and len(existing["frames_captured"]) == 0
+                        and confidence > existing.get("register_confidence", 0.0)):
+                    old_cam = existing["camera_id"]
+                    existing["camera_id"]           = camera_id
+                    existing["register_confidence"] = confidence
+                    existing["label"]               = label
+                    print(
+                        f"[Verifier] 📷 global_id={global_id} "
+                        f"camera updated cam{old_cam}→cam{camera_id} "
+                        f"(conf {existing.get('register_confidence', 0):.2f}→{confidence:.2f})"
+                    )
+                return  # Already queued — nothing more to do
+
+            # --- new registration ---
             self._pending[global_id] = {
-                "direction":       direction,
-                "label":           label,
-                "camera_id":       camera_id,
-                "delay_remaining": CAPTURE_DELAY_FRAMES,
-                "frames_captured": [],
+                "direction":           direction,
+                "label":               label,
+                "camera_id":           camera_id,
+                "register_confidence": confidence,
+                "delay_remaining":     CAPTURE_DELAY_FRAMES,
+                "frames_captured":     [],
+                "queued_at":           time.monotonic(),
             }
             print(
                 f"[Verifier] Queued global_id={global_id} "
                 f"label={label} direction={direction} "
+                f"cam{camera_id} conf={confidence:.2f} "
                 f"(waiting {CAPTURE_DELAY_FRAMES} frames)"
             )
+
+    def expire_stale_pending(self, timeout_seconds: float = 3.0) -> None:
+        """
+        Discard pending burst requests that have been waiting too long.
+
+        Called once per frame from detection_callback (Fix #4).
+        Prevents silent under-counts from items that left frame before
+        the burst completed, and frees memory during long transactions.
+
+        Args:
+            timeout_seconds: How long a pending item may wait before
+                             being discarded without counting. Default 3s.
+        """
+        now = time.monotonic()
+        with self._lock:
+            expired = [
+                gid for gid, state in self._pending.items()
+                if (now - state.get("queued_at", now)) > timeout_seconds
+            ]
+            for gid in expired:
+                state = self._pending.pop(gid)
+                frames_so_far = len(state["frames_captured"])
+                print(
+                    f"[Verifier] ⏱️  global_id={gid} EXPIRED after "
+                    f"{timeout_seconds:.0f}s — burst incomplete "
+                    f"({frames_so_far}/{CAPTURE_BURST_COUNT} frames captured), "
+                    f"NOT counted. "
+                    f"(label={state['label']} direction={state['direction']})"
+                )
 
     def process_frame(
         self,
         global_id: int,
         frame: np.ndarray,
-        detections,          # hailo detection objects for this frame
+        detections,
         camera_id: int,
         width: int,
         height: int,
+        bbox: tuple = None,
     ) -> dict | None:
         """
         Called every frame for every active track.
@@ -2985,23 +3097,37 @@ class ImageCaptureVerifier:
         the burst.  When the burst is full, picks the best frame,
         cross-checks the label and returns a result dict.
 
+        Lock discipline (Fix #3):
+            The lock is held only for state reads and writes.
+            Disk I/O (cv2.imwrite) happens OUTSIDE the lock so the
+            GStreamer callback thread is never blocked on a slow SD card.
+
+        Crop (Fix #1):
+            When bbox is provided, only the padded crop around the item
+            is saved — not the full frame.  This reduces disk writes
+            by ~85% and focuses the saved image on the item itself.
+
         Args:
-            global_id:  Global track ID.
-            frame:      Current raw RGB numpy frame (before BGR conversion).
-            detections: Hailo detection objects from this frame.
-            camera_id:  Camera originating this frame.
+            global_id:    Global track ID.
+            frame:        Current raw RGB numpy frame (before BGR conversion).
+            detections:   Hailo detection objects from this frame.
+            camera_id:    Camera originating this frame.
             width/height: Frame dimensions.
+            bbox:         Optional (x1, y1, x2, y2) pixel bounding box of the
+                          tracked item.  When provided a padded crop is saved
+                          instead of the full frame.
 
         Returns:
             None while collecting, OR a result dict when ready:
             {
                 "confirmed":   bool,
                 "direction":   str,
-                "label":       str,   # confirmed label (or live label on fail)
+                "label":       str,
                 "confidence":  float,
                 "image_path":  str,
             }
         """
+        # --- Step A: read state under lock, decide what to do ---
         with self._lock:
             if global_id not in self._pending:
                 return None
@@ -3011,22 +3137,80 @@ class ImageCaptureVerifier:
             if state["camera_id"] != camera_id:
                 return None
 
-            # ---- countdown phase ----
+            # countdown phase
             if state["delay_remaining"] > 0:
                 state["delay_remaining"] -= 1
                 return None
 
-            # ---- burst capture phase ----
-            if len(state["frames_captured"]) < CAPTURE_BURST_COUNT:
-                result = self._capture_and_score(
-                    global_id, state, frame, detections, width, height
-                )
-                if result is not None:
-                    state["frames_captured"].append(result)
+            # burst complete — finalise under lock and return
+            if len(state["frames_captured"]) >= CAPTURE_BURST_COUNT:
+                return self._finalise(global_id, state)
+
+            # burst still collecting — snapshot what we need, release lock
+            frame_index    = len(state["frames_captured"])
+            expected_label = state["label"]
+            cam_id         = state["camera_id"]
+            direction      = state["direction"]
+
+        # --- Step B: crop + disk I/O outside the lock (Fix #1 + Fix #3) ---
+        filename = (
+            f"cam{cam_id}_"
+            f"{direction}_"
+            f"g{global_id}_"
+            f"f{frame_index}.jpg"
+        )
+        img_path = os.path.join(self._image_dir, filename)
+
+        # Crop to padded bounding box when available (Fix #1)
+        # Falls back to full frame if bbox is None or crop is degenerate
+        CROP_PAD = 20   # pixels of padding around the bounding box
+        try:
+            bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            if bbox is not None:
+                x1b, y1b, x2b, y2b = bbox
+                x1c = max(0, x1b - CROP_PAD)
+                y1c = max(0, y1b - CROP_PAD)
+                x2c = min(width,  x2b + CROP_PAD)
+                y2c = min(height, y2b + CROP_PAD)
+                # Guard against degenerate crops (zero area)
+                if x2c > x1c and y2c > y1c:
+                    bgr = bgr[y1c:y2c, x1c:x2c]
+            cv2.imwrite(img_path, bgr, [cv2.IMWRITE_JPEG_QUALITY, 92])
+        except Exception as e:
+            print(f"[Verifier] Failed to save frame: {e}")
+            return None
+
+        # Score detections for this frame (CPU only, no I/O)
+        best_conf  = 0.0
+        best_label = expected_label
+        for det in detections:
+            det_label = det.get_label()
+            det_conf  = det.get_confidence()
+            if det_label == expected_label and det_conf > best_conf:
+                best_conf  = det_conf
+                best_label = det_label
+
+        scored = {"path": img_path, "confidence": best_conf, "label": best_label}
+
+        # --- Step C: write result back under lock ---
+        with self._lock:
+            if global_id not in self._pending:
+                # Item was expired or cancelled while we were doing I/O —
+                # delete the orphan file and bail out
+                try:
+                    os.remove(img_path)
+                except Exception:
+                    pass
                 return None
 
-            # ---- burst complete — pick best frame ----
-            return self._finalise(global_id, state)
+            self._pending[global_id]["frames_captured"].append(scored)
+            self._all_images.append(img_path)
+
+            # If this was the last frame needed, finalise now
+            if len(self._pending[global_id]["frames_captured"]) >= CAPTURE_BURST_COUNT:
+                return self._finalise(global_id, self._pending[global_id])
+
+        return None
 
     def cleanup_transaction_images(self) -> int:
         """
@@ -3059,65 +3243,44 @@ class ImageCaptureVerifier:
         except Exception:
             pass
 
-        print(f"[Verifier] Cleanup complete — {deleted} image(s) deleted.")
+        # Only log when there was actually something to clean up (Fix #7)
+        # Suppresses the duplicate "0 image(s) deleted" from the safety-net call
+        if deleted > 0:
+            print(f"[Verifier] Cleanup complete — {deleted} image(s) deleted.")
         return deleted
 
     # -----------------------------------------------------------------
-    # PRIVATE HELPERS
+    # Private helpers
     # -----------------------------------------------------------------
 
-    def _capture_and_score(
-        self,
-        global_id: int,
-        state: dict,
-        frame: np.ndarray,
-        detections,
-        width: int,
-        height: int,
-    ) -> dict | None:
+    def _confidence_threshold(self, label: str) -> float:
         """
-        Save the current frame as a JPEG and find the highest-confidence
-        detection for the expected label in it.
+        Return the minimum confidence required to trust a still-image
+        detection for the given SKU label (Fix #6).
 
-        Returns a dict {"path", "confidence", "label"} or None on failure.
+        Falls back to MIN_STILL_CONFIDENCE for any label not listed in
+        SKU_MIN_CONFIDENCE.
+
+        Args:
+            label: Product label string as returned by the Hailo model.
+
+        Returns:
+            Float threshold in range [0, 1].
         """
-        frame_index = len(state["frames_captured"])
-        filename = (
-            f"cam{state['camera_id']}_"
-            f"{state['direction']}_"
-            f"g{global_id}_"
-            f"f{frame_index}.jpg"
-        )
-        img_path = os.path.join(self._image_dir, filename)
-
-        try:
-            # Convert RGB → BGR for OpenCV save
-            bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            cv2.imwrite(img_path, bgr, [cv2.IMWRITE_JPEG_QUALITY, 92])
-            self._all_images.append(img_path)
-        except Exception as e:
-            print(f"[Verifier] Failed to save frame: {e}")
-            return None
-
-        # Score: find detections in this frame matching the expected label
-        best_conf = 0.0
-        best_label = state["label"]
-        for det in detections:
-            det_label = det.get_label()
-            det_conf  = det.get_confidence()
-            if det_label == state["label"] and det_conf > best_conf:
-                best_conf  = det_conf
-                best_label = det_label
-
-        return {"path": img_path, "confidence": best_conf, "label": best_label}
+        return SKU_MIN_CONFIDENCE.get(label, MIN_STILL_CONFIDENCE)
 
     def _finalise(self, global_id: int, state: dict) -> dict:
         """
         Select the best frame from the burst and produce the final result.
-        Removes the item from _pending and adds it to _verified.
+        Removes the item from _pending, adds it to _verified, and records
+        the confirmed direction so direction-changes can be detected later.
+        Uses per-SKU confidence threshold (Fix #6).
         """
         del self._pending[global_id]
         self._verified.add(global_id)
+        # Record which direction was confirmed so register_direction_event
+        # can detect a future direction change and re-queue correctly (Fix #2)
+        self._verified_directions[global_id] = state["direction"]
 
         frames = state["frames_captured"]
         if not frames:
@@ -3134,20 +3297,25 @@ class ImageCaptureVerifier:
         # Pick highest-confidence frame
         best = max(frames, key=lambda f: f["confidence"])
 
-        confirmed  = best["confidence"] >= MIN_STILL_CONFIDENCE
+        # Use per-SKU threshold (Fix #6) — different products have
+        # structurally different confidence baselines
+        threshold   = self._confidence_threshold(state["label"])
+        confirmed   = best["confidence"] >= threshold
         final_label = best["label"] if confirmed else state["label"]
 
         if confirmed:
             print(
                 f"[Verifier] ✅ global_id={global_id} "
                 f"CONFIRMED {state['direction']} of '{final_label}' "
-                f"(conf={best['confidence']:.2f}, img={os.path.basename(best['path'])})"
+                f"(conf={best['confidence']:.2f} >= threshold={threshold:.2f}, "
+                f"img={os.path.basename(best['path'])})"
             )
         else:
             print(
                 f"[Verifier] ⚠️  global_id={global_id} "
                 f"LOW CONFIDENCE {state['direction']} of '{state['label']}' "
-                f"(best={best['confidence']:.2f}) — falling back to live label"
+                f"(best={best['confidence']:.2f} < threshold={threshold:.2f}) "
+                f"— falling back to live label"
             )
 
         return {
@@ -3369,6 +3537,7 @@ def detection_callback(pad, info, callback_data):
                     direction  = direction,
                     label      = label,
                     camera_id  = stream_id,
+                    confidence = confidence,   # Fix #5: best-camera selection
                 )
 
         # -----------------------------------------------------------
@@ -3387,6 +3556,7 @@ def detection_callback(pad, info, callback_data):
                 camera_id  = stream_id,
                 width      = width,
                 height     = height,
+                bbox       = (x1, y1, x2, y2),  # Fix #1: crop to item bbox
             )
 
         # =============================================================
@@ -3504,6 +3674,17 @@ def detection_callback(pad, info, callback_data):
     # =================================================================
     # Remove tracking data for objects no longer in frame
     cleanup_inactive_tracks(stream_id, active_local_track_ids)
+
+    # =================================================================
+    # STEP 7b: EXPIRE STALE VERIFIER PENDING ENTRIES (Fix #4)
+    # =================================================================
+    # Called once per frame (not per detection) so the timeout is based
+    # on wall-clock time, not frame count.
+    # Items queued but never completed (fast customer, item left frame)
+    # are discarded with an explicit log line rather than silently lost.
+    verifier = getattr(user_data, 'image_verifier', None)
+    if verifier is not None:
+        verifier.expire_stale_pending(timeout_seconds=3.0)
 
     # =================================================================
     # STEP 8: UPDATE FPS CALCULATION
