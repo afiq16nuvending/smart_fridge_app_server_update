@@ -189,9 +189,10 @@ unlock_data = 0                # Flag for door unlock control
 # TRACKING DATA STRUCTURES
 # =====================================================================
 
-# Store movement history for each tracked object (last 3 positions)
-# Reduced from 5 → 3 to confirm direction faster (~0.23s at 13fps vs ~0.38s)
-movement_history = defaultdict(lambda: deque(maxlen=3))
+# Store movement history for each tracked object
+# Using maxlen=8: catches fast-moving items that drop frames mid-motion.
+# Net displacement across 8 frames is more robust than per-frame intervals.
+movement_history = defaultdict(lambda: deque(maxlen=8))
 
 # Store bounding box area history for stability checking
 bbox_area_history = defaultdict(lambda: deque(maxlen=10))
@@ -236,17 +237,24 @@ active_objects_per_camera = {
 cross_camera_candidates = defaultdict(list)
 
 # Per-camera movement tracking
-# Reduced from 5 → 3 frames to confirm direction faster
+# maxlen=8: large enough to catch fast-moving items even with dropped frames
 camera_movement_history = {
-    0: defaultdict(lambda: deque(maxlen=3)),  # Camera 0 history
-    1: defaultdict(lambda: deque(maxlen=3))   # Camera 1 history
+    0: defaultdict(lambda: deque(maxlen=8)),  # Camera 0 history
+    1: defaultdict(lambda: deque(maxlen=8))   # Camera 1 history
 }
 
 # Per-camera bounding box area history for stability checking
-# Reduced from 5 → 3 to match movement history window
+# Kept at 5 — used only for anti-tamper (camera cover), not direction gating
 camera_bbox_area_history = {
-    0: defaultdict(lambda: deque(maxlen=3)),  # Camera 0 bbox areas
-    1: defaultdict(lambda: deque(maxlen=3))   # Camera 1 bbox areas
+    0: defaultdict(lambda: deque(maxlen=5)),  # Camera 0 bbox areas
+    1: defaultdict(lambda: deque(maxlen=5))   # Camera 1 bbox areas
+}
+
+# Last-seen center per (camera_id, track_id) — used to bridge short gaps
+# when tracker loses the item for 1-2 frames mid-motion
+camera_last_seen_center = {
+    0: {},  # Camera 0: track_id -> (center, timestamp)
+    1: {}   # Camera 1: track_id -> (center, timestamp)
 }
 
 # =====================================================================
@@ -1998,7 +2006,7 @@ class HailoDetectionCallback(app_callback_class):
                     # Construct API endpoint
                     refresh_endpoint = (f'https://stg-sfapi.nuboxtech.com/index.php/'
                                       f'mobile_app/machine/Machine_listing/'
-                                      f'machine_planogram/{refresh_machine_id}')
+                                      f'machine_planogram/{refresh_machine_id')
                     
                     # Fetch updated planogram
                     api_response = requests.get(
@@ -2686,35 +2694,48 @@ ALGORITHM:
 6. Determine direction based on Y-axis movement
 """
 
-def analyze_movement_direction(track_id, center, tracking_data, camera_id, 
+def analyze_movement_direction(track_id, center, tracking_data, camera_id,
                                global_id, current_bbox):
     """
-    Analyze movement direction based on 3 consecutive frames with enhanced filtering.
+    Analyze movement direction using a NET DISPLACEMENT approach.
 
-    Reduced from 5 → 3 frames so direction is confirmed faster:
-      - Old: needs 5 frames  ≈ 0.38s at 13fps
-      - New: needs 3 frames  ≈ 0.23s at 13fps
+    WHY THE OLD APPROACH FAILED (root-cause from transaction video):
+    ---------------------------------------------------------------
+    At 21fps customers take items in ~7 frames (y: 327→462 = +135px).
+    The Hailo tracker DROPS the bounding box during fast motion for
+    several consecutive frames (hand wrapping item, partial occlusion).
+    With a 3-frame window requiring 100% per-interval consistency, even
+    ONE gap resets the history and the count never fires.
 
-    Trade-off: slightly more sensitive to noise — the bbox stability
-    and consistency checks compensate for the smaller window.
+    The bbox stability check also failed: when a hand grabs an item
+    the bbox height fluctuates wildly (5px → 124px → 47px in 6 frames)
+    triggering the 80% std-dev rejection even though the CENTER position
+    was moving cleanly downward the whole time.
 
-    FILTERING CHECKS (must pass all):
+    NEW APPROACH — Net Displacement over 8-frame rolling window:
+    -------------------------------------------------------------
+    STEP 1: Record center in an 8-frame history (maxlen=8).
+            The larger window survives short detection gaps.
 
-    CHECK 1: Bounding Box Stability
-        - Rejects if bbox size varies too much (>80% of average)
-        - Indicates hand is moving/obscuring object
+    STEP 2: Require only MIN_POINTS=3 positions (not all 8) before
+            attempting detection — fast grabs are still caught.
 
-    CHECK 2: Total Displacement
-        - Must move at least 20 pixels over 3 frames
-        - (reduced from 30px to match the smaller window)
+    STEP 3: NET DISPLACEMENT = newest_y - oldest_y in the window.
+            |displacement| >= 40px → item has clearly moved.
+            Direction = sign of net displacement.
 
-    CHECK 3: Movement Consistency
-        - At least 100% of frame-to-frame movements in same direction
-        - With only 2 intervals, both must agree (3-frame window)
+    STEP 4: DOMINANT DIRECTION CHECK over frame-to-frame intervals.
+            Require 60% majority (not 100%) — tolerates jitter frames
+            and short tracking gaps without discarding the whole reading.
 
-    CHECK 4: Average Movement Threshold
-        - Average movement per frame must exceed 5 pixels
-        - Further filters out noise
+    STEP 5: Bbox stability check REMOVED from the direction gate.
+            Bbox wobble during grab is normal; it must not block counting.
+            Camera-cover darkness check (is_frame_dark) is unchanged.
+
+    Thresholds (tunable at top of this function):
+        NET_DISPLACEMENT_THRESHOLD = 40 px  (net first→last)
+        MIN_POINTS                 = 3      (min positions needed)
+        CONSISTENCY_THRESHOLD      = 0.60   (60% interval majority)
 
     Args:
         track_id (int): Local track ID
@@ -2726,114 +2747,92 @@ def analyze_movement_direction(track_id, center, tracking_data, camera_id,
 
     Returns:
         str or None: 'entry', 'exit', or None
-
-    Direction Determination:
-        - Positive Y movement (down on screen) = 'exit' (taking out)
-        - Negative Y movement (up on screen) = 'entry' (returning)
-        - Y increases downward in image coordinates!
     """
-    # Store movement in camera-specific history
+    # Tunable thresholds
+    NET_DISPLACEMENT_THRESHOLD = 40   # px — net Y displacement required
+    MIN_POINTS                 = 3    # minimum history positions needed
+    CONSISTENCY_THRESHOLD      = 0.60 # 60% of intervals must agree
+
+    # ------------------------------------------------------------------
+    # 1. Record this frame's center into rolling history
+    # ------------------------------------------------------------------
     camera_movement_history[camera_id][track_id].appendleft(center)
 
-    # Calculate and track bounding box area
+    # Record bbox area (for memory-manager bookkeeping only — not used
+    # for direction gating any more)
     bbox_area = (current_bbox[2] - current_bbox[0]) * (current_bbox[3] - current_bbox[1])
     camera_bbox_area_history[camera_id][track_id].appendleft(bbox_area)
 
-    # Copy to global movement history for cross-camera analysis
+    # Update last-seen center (used by gap-bridging / expiry logic)
+    camera_last_seen_center[camera_id][track_id] = (center, time.monotonic())
+
+    # Propagate to global cross-camera history
     global_movement_history[global_id].appendleft((center, camera_id))
 
-    # Wait until we have enough frames (3 positions)
-    if len(camera_movement_history[camera_id][track_id]) < 3:
+    # ------------------------------------------------------------------
+    # 2. Need at least MIN_POINTS before we can judge
+    # ------------------------------------------------------------------
+    history = camera_movement_history[camera_id][track_id]
+    if len(history) < MIN_POINTS:
         return None
 
-    # =================================================================
-    # CHECK 1: BOUNDING BOX STABILITY
-    # =================================================================
-    # Reject if bounding box size changing significantly (hand obscuring)
-    if len(camera_bbox_area_history[camera_id][track_id]) >= 3:
-        areas = list(camera_bbox_area_history[camera_id][track_id])
-        avg_area = sum(areas) / len(areas)
-        area_variance = sum((a - avg_area) ** 2 for a in areas) / len(areas)
-        area_std_dev = area_variance ** 0.5
+    # ------------------------------------------------------------------
+    # 3. Extract Y positions (index 0 = newest, -1 = oldest)
+    # ------------------------------------------------------------------
+    y_positions = [pt[1] for pt in history]
+    newest_y    = y_positions[0]
+    oldest_y    = y_positions[-1]
 
-        # If standard deviation > 80% of average, bbox is unstable
-        if area_std_dev > (avg_area * 0.8):
-            return None  # Likely hand moving/obscuring, not actual object movement
+    # ------------------------------------------------------------------
+    # 4. NET DISPLACEMENT CHECK
+    #    A large net Y movement in one direction is the primary signal.
+    #    Positive net = moving down = EXIT (item taken from fridge).
+    #    Negative net = moving up   = ENTRY (item put back into fridge).
+    # ------------------------------------------------------------------
+    net_displacement = newest_y - oldest_y
+    if abs(net_displacement) < NET_DISPLACEMENT_THRESHOLD:
+        return None  # Not enough net movement — jitter or small reposition
 
-    # =================================================================
-    # CHECK 2: TOTAL DISPLACEMENT
-    # =================================================================
-    # Object must actually move a significant distance
-    first_y = camera_movement_history[camera_id][track_id][-1][1]  # Oldest Y
-    last_y  = camera_movement_history[camera_id][track_id][0][1]   # Newest Y
-    total_displacement = abs(last_y - first_y)
+    # ------------------------------------------------------------------
+    # 5. DOMINANT DIRECTION CHECK
+    #    Count frame-to-frame intervals; require a 60% majority.
+    #    This tolerates a few wobbly or missing frames without rejecting
+    #    a clearly directional movement.
+    # ------------------------------------------------------------------
+    intervals = []
+    for i in range(len(y_positions) - 1):
+        dy = y_positions[i] - y_positions[i + 1]  # newer - older
+        if dy != 0:
+            intervals.append(1 if dy > 0 else -1)  # 1=down=exit, -1=up=entry
 
-    # Reduced from 30 → 20 px to match the smaller 3-frame window
-    DISPLACEMENT_THRESHOLD = 20
-    if total_displacement < DISPLACEMENT_THRESHOLD:
-        return None  # Not enough movement, likely just jittering
+    if not intervals:
+        return None  # All positions identical — stationary object
 
-    # =================================================================
-    # CHECK 3: MOVEMENT CONSISTENCY
-    # =================================================================
-    # Ensure movement is consistently in one direction.
-    # With 3 frames there are only 2 intervals — both must agree (100%).
-    movement_directions = []
-    for i in range(1, len(camera_movement_history[camera_id][track_id])):
-        curr_y = camera_movement_history[camera_id][track_id][i-1][1]
-        prev_y = camera_movement_history[camera_id][track_id][i][1]
-        # 1 = downward (exit), -1 = upward (entry)
-        movement_directions.append(1 if curr_y > prev_y else -1)
+    positive = sum(1 for d in intervals if d > 0)
+    negative = sum(1 for d in intervals if d < 0)
+    dominant = max(positive, negative)
+    ratio    = dominant / len(intervals)
 
-    # Count movements in each direction
-    positive_movements = sum(1 for d in movement_directions if d > 0)
-    negative_movements = sum(1 for d in movement_directions if d < 0)
-    consistency_ratio  = max(positive_movements, negative_movements) / len(movement_directions)
+    if ratio < CONSISTENCY_THRESHOLD:
+        return None  # Too erratic — not a genuine take/return movement
 
-    # With 3 frames (2 intervals) both intervals must agree → 100%
-    if consistency_ratio < 1.0:
-        return None  # Movement not consistent across 3 frames
+    # ------------------------------------------------------------------
+    # 6. DETERMINE DIRECTION
+    #    Use the net displacement sign as final arbiter (more robust than
+    #    the interval majority, which can be skewed by a jitter cluster).
+    # ------------------------------------------------------------------
+    current_direction = 'exit' if net_displacement > 0 else 'entry'
 
-    # =================================================================
-    # CHECK 4: AVERAGE MOVEMENT THRESHOLD
-    # =================================================================
-    # Calculate average movement per frame
-    total_movement = 0
-    for i in range(1, len(camera_movement_history[camera_id][track_id])):
-        curr_y = camera_movement_history[camera_id][track_id][i-1][1]
-        prev_y = camera_movement_history[camera_id][track_id][i][1]
-        total_movement += curr_y - prev_y
-
-    avg_movement = total_movement / 2  # 2 intervals between 3 points
-
-    FRAME_MOVEMENT_THRESHOLD = 5  # At least 5 pixels per frame average
-    if abs(avg_movement) < FRAME_MOVEMENT_THRESHOLD:
-        return None  # Movement too slow/small
-
-    # =================================================================
-    # DETERMINE DIRECTION
-    # =================================================================
-    # Positive Y movement = moving down = exiting
-    # Negative Y movement = moving up = entering
-    current_direction = 'exit' if avg_movement > 0 else 'entry'
-
-    # =================================================================
-    # HANDLE DIRECTION CHANGES
-    # =================================================================
-    # If direction changed since last count, remove from old direction's set
-    # This allows re-counting if customer changes mind (takes out, puts back)
+    # ------------------------------------------------------------------
+    # 7. HANDLE DIRECTION CHANGES
+    #    Customer took item out then put it back → allow re-count.
+    # ------------------------------------------------------------------
     if global_id in global_last_counted_direction:
         if current_direction != global_last_counted_direction[global_id]:
-            # Direction changed - remove from old counted set
             if global_last_counted_direction[global_id] in tracking_data.counted_tracks:
                 tracking_data.counted_tracks[global_last_counted_direction[global_id]].discard(global_id)
 
-    # =================================================================
-    # UPDATE TRACKING STATE
-    # =================================================================
-    # Record this direction for future comparison
     global_last_counted_direction[global_id] = current_direction
-
     return current_direction
 
 # =====================================================================
@@ -4683,6 +4682,7 @@ class TransactionMemoryManager:
         global object_trails, global_trails, camera_movement_history
         global camera_bbox_area_history, local_to_global_id_map
         global active_objects_per_camera, global_movement_history
+        global camera_last_seen_center
         
         tracks_to_clean = trans_data['tracks_created']
         trails_to_clean = trans_data['trails_created']
@@ -4758,6 +4758,14 @@ class TransactionMemoryManager:
               f"(removed {trails_before - trails_after})")
         print(f"[Cleanup] Tracks: {tracks_before} -> {tracks_after} "
               f"(removed {tracks_before - tracks_after})")
+
+        # -----------------------------------------------------------
+        # Clean last-seen center cache for inactive tracks
+        # -----------------------------------------------------------
+        for cam_id in [0, 1]:
+            for track_id in list(camera_last_seen_center[cam_id].keys()):
+                if track_id in tracks_to_clean:
+                    del camera_last_seen_center[cam_id][track_id]
 
         # -----------------------------------------------------------
         # Verification images for this transaction are kept on disk
@@ -4836,8 +4844,8 @@ class TransactionMemoryManager:
         # Recreate camera movement histories
         # -----------------------------------------------------------
         new_camera_movement_history = {
-            0: defaultdict(lambda: deque(maxlen=3)),
-            1: defaultdict(lambda: deque(maxlen=3))
+            0: defaultdict(lambda: deque(maxlen=8)),
+            1: defaultdict(lambda: deque(maxlen=8))
         }
         for cam_id in [0, 1]:
             for track_id, history in camera_movement_history[cam_id].items():
@@ -4850,14 +4858,20 @@ class TransactionMemoryManager:
         # Recreate bounding box histories
         # -----------------------------------------------------------
         new_camera_bbox_area_history = {
-            0: defaultdict(lambda: deque(maxlen=3)),
-            1: defaultdict(lambda: deque(maxlen=3))
+            0: defaultdict(lambda: deque(maxlen=5)),
+            1: defaultdict(lambda: deque(maxlen=5))
         }
         for cam_id in [0, 1]:
             for track_id, history in camera_bbox_area_history[cam_id].items():
                 if track_id in active_tracks:
                     new_camera_bbox_area_history[cam_id][track_id] = history
         camera_bbox_area_history = new_camera_bbox_area_history
+
+        # -----------------------------------------------------------
+        # Clear last-seen centers (small dict, safe to wipe entirely)
+        # -----------------------------------------------------------
+        global camera_last_seen_center
+        camera_last_seen_center = {0: {}, 1: {}}
         
         print(f"[Cleanup] Preserved {preserve_count} items from active transactions")
         print(f"[Cleanup] Dictionary recreation complete")
