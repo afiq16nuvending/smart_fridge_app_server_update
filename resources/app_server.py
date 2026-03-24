@@ -457,7 +457,7 @@ def draw_counts(frame, class_counters, label):
     19: "pinkGuava",
     20: "prawnAndChickenWontonNoodles",
     21: "thaiGreenChickenCurryWithRice",
-    22: "uncleChinChickenRice" 
+    22: "uncleChinChickenRice"  
       
 }
     
