@@ -1651,19 +1651,21 @@ def number_to_words(n):
 # Behaviour summary:
 #
 # EXIT  (item taken out):
-#   Counts up cumulatively per product.
-#   "one 100plus removed" → "two 100plus removed" → ...
+#   Always announces "one X removed" for every single exit event.
+#   No cumulative count — same as entry behaviour.
 #
 # ENTRY (item returned):
-#   Always announces as ONE regardless of how many have been returned.
-#   Every single return event says "one 100plus returned".
-#   This gives a per-event acknowledgement without a running total.
+#   Always announces "one X returned" for every single entry event.
+#   No running total.
 #
 # CLOSING SUMMARY (after door closes):
-#   Called once via speak_closing_summary().
+#   Called once via speak_closing_summary() from the websocket finally
+#   block, AFTER speak_door_close() has fully finished playing.
+#   This guarantees the closing TTS never overlaps the door-close TTS.
 #   Lists net exit items (exit minus entry).
-#   If net = 0: "Thank you for visiting. No items were taken..."
-#   If net > 0: "Thank you for shopping... items taken are X and Y..."
+#   If net = 0: "Thank you for visiting. Have a great day!"
+#   If net > 0: "Thank you for shopping... items taken are X and Y...
+#                Your refund will be processed shortly."
 #
 # All audio is non-blocking — zero impact on the GStreamer pipeline.
 #
@@ -1687,37 +1689,30 @@ class ProductMovementAnnouncer:
     """
     Real-time TTS announcer for product entry and exit events.
 
-    EXIT behaviour — cumulative count:
-        1st exit of 100plus → "one 100plus removed"
-        2nd exit of 100plus → "two 100plus removed"
-        3rd exit of 100plus → "three 100plus removed"
+    EXIT behaviour — always one per event:
+        Every exit event → "one 100plus removed"
+        (no cumulative count — mirrors entry behaviour)
 
-    ENTRY behaviour — always one:
-        Every return event → "one 100plus returned"
-        (no running total for entries — each return is acknowledged once)
+    ENTRY behaviour — always one per event:
+        Every entry event → "one 100plus returned"
 
-    CLOSING SUMMARY — called once when the door closes:
+    CLOSING SUMMARY — called once from websocket_endpoint finally block,
+    after speak_door_close() has fully finished so the two never overlap:
         Net items taken > 0:
             "Thank you for shopping with us. The items you have taken
              are two 100plus and one mangoMilk. Your refund will be
-             processed shortly. We hope to see you again soon."
+             processed shortly."
         Net items taken = 0:
-            "Thank you for visiting. No items were taken today.
-             Have a wonderful day and we hope to see you again soon."
+            "Thank you for visiting. Have a great day!"
 
     Thread-safe. All audio is non-blocking.
     """
 
     def __init__(self):
-        # exit: tracks cumulative count per label for TTS
-        # entry: not tracked (always says "one")
-        self._exit_announced: Dict[str, int] = {}
         self._lock = threading.Lock()
 
     def reset(self):
         """Clear state. Call at the start of each new transaction."""
-        with self._lock:
-            self._exit_announced.clear()
         print("[MovementTTS] Announcer reset for new transaction")
 
     def _beep_and_speak(self, text: str):
@@ -1739,24 +1734,17 @@ class ProductMovementAnnouncer:
 
         threading.Thread(target=_run, daemon=True).start()
 
-    def on_exit(self, label: str, new_count: int):
+    def on_exit(self, label: str):
         """
-        Called when the exit counter increments for a product.
-        Announces cumulatively: "one X removed", "two X removed", etc.
+        Called every time a product is taken out (exit event).
+        Always announces "one X removed" regardless of how many
+        have been taken — mirrors the entry behaviour exactly.
 
         Args:
-            label     (str): Product label.
-            new_count (int): Updated exit count after the increment.
+            label (str): Product label.
         """
-        with self._lock:
-            last = self._exit_announced.get(label, 0)
-            if new_count <= last:
-                return
-            self._exit_announced[label] = new_count
-
         spoken_name = SPEECH_NAMES.get(label, label)
-        count_word  = number_to_words(new_count)
-        text        = f"{count_word} {spoken_name} removed"
+        text        = f"one {spoken_name} removed"
 
         self._beep_and_speak(text)
         print(f"[MovementTTS] EXIT — '{text}'")
@@ -1777,68 +1765,75 @@ class ProductMovementAnnouncer:
 
     def speak_closing_summary(self, class_counters: dict):
         """
-        Speak the end-of-transaction summary after the door closes.
+        Speak the end-of-transaction summary.
 
-        Calculates net items taken (exit count minus entry count) for
-        each product and composes a professional closing message.
+        This method is BLOCKING — it waits for any currently-playing
+        audio (i.e. the door-close TTS) to finish before generating and
+        playing the closing message. This guarantees the two announcements
+        never overlap regardless of how long the door-close TTS takes.
 
-        Net > 0  → lists items taken, thanks customer, mentions refund.
-        Net = 0  → confirms nothing was taken, wishes customer well.
+        Call this from the websocket_endpoint finally block AFTER
+        tts_manager.speak_door_close() has returned.
 
-        Runs asynchronously in a background thread.
+        Net > 0:
+            "Thank you for shopping with us. The item(s) you have taken
+             are/is X. Your refund will be processed shortly."
+        Net = 0:
+            "Thank you for visiting. Have a great day!"
 
         Args:
-            class_counters (dict): The tracking_data.class_counters dict
-                                   with 'entry' and 'exit' sub-dicts.
+            class_counters (dict): tracking_data.class_counters with
+                                   'entry' and 'exit' sub-dicts.
         """
-        def _run():
-            # Build net counts per product
-            all_labels   = (set(class_counters["exit"].keys()) |
-                            set(class_counters["entry"].keys()))
-            net_items    = {}  # label -> net count taken
+        # Build net counts per product
+        all_labels = (set(class_counters["exit"].keys()) |
+                      set(class_counters["entry"].keys()))
+        net_items  = {}
 
-            for lbl in all_labels:
-                exit_count  = class_counters["exit"].get(lbl, 0)
-                entry_count = class_counters["entry"].get(lbl, 0)
-                net         = max(0, exit_count - entry_count)
-                if net > 0:
-                    net_items[lbl] = net
+        for lbl in all_labels:
+            exit_count  = class_counters["exit"].get(lbl, 0)
+            entry_count = class_counters["entry"].get(lbl, 0)
+            net         = max(0, exit_count - entry_count)
+            if net > 0:
+                net_items[lbl] = net
 
-            if not net_items:
-                # Nothing was taken
-                message = (
-                    "Thank you for visiting. "
-                    "No items were taken today. "
-                    "Have a wonderful day, and we hope to see you again soon."
-                )
+        if not net_items:
+            message = "Thank you for visiting. Have a great day!"
+        else:
+            item_phrases = []
+            for lbl, count in net_items.items():
+                spoken_name = SPEECH_NAMES.get(lbl, lbl)
+                count_word  = number_to_words(count)
+                item_phrases.append(f"{count_word} {spoken_name}")
+
+            if len(item_phrases) == 1:
+                items_text = item_phrases[0]
+            elif len(item_phrases) == 2:
+                items_text = f"{item_phrases[0]} and {item_phrases[1]}"
             else:
-                # Build the item list: "two 100plus", "one mangoMilk", etc.
-                item_phrases = []
-                for lbl, count in net_items.items():
-                    spoken_name   = SPEECH_NAMES.get(lbl, lbl)
-                    count_word    = number_to_words(count)
-                    item_phrases.append(f"{count_word} {spoken_name}")
+                items_text = (", ".join(item_phrases[:-1]) +
+                              f", and {item_phrases[-1]}")
 
-                if len(item_phrases) == 1:
-                    items_text = item_phrases[0]
-                elif len(item_phrases) == 2:
-                    items_text = f"{item_phrases[0]} and {item_phrases[1]}"
-                else:
-                    items_text = (", ".join(item_phrases[:-1]) +
-                                  f", and {item_phrases[-1]}")
+            plural  = len(item_phrases) > 1
+            message = (
+                f"Thank you for shopping with us. "
+                f"The item{'s' if plural else ''} you have taken "
+                f"{'are' if plural else 'is'} {items_text}. "
+                f"Your refund will be processed shortly."
+            )
 
-                message = (
-                    f"Thank you for shopping with us. "
-                    f"The item{'s' if len(item_phrases) > 1 else ''} you have taken "
-                    f"{'are' if len(item_phrases) > 1 else 'is'} {items_text}. "
-                    f"Your refund will be processed shortly. "
-                    f"We hope to see you again soon."
-                )
+        print(f"[MovementTTS] CLOSING — '{message}'")
 
-            print(f"[MovementTTS] CLOSING — '{message}'")
-            tts_manager.speak_async(message, lang='en')
+        # Wait for any currently-playing audio to finish (door-close TTS),
+        # then speak the closing message synchronously so the caller can
+        # be sure it is fully done before continuing.
+        try:
+            while tts_manager.is_audio_playing():
+                time.sleep(0.1)
+        except Exception:
+            pass
 
-        threading.Thread(target=_run, daemon=True).start()
+        tts_manager.speak_async(message, lang='en')
 
 
 # Global instance — shared across all detection_callback invocations
@@ -1965,8 +1960,7 @@ def detection_callback(pad, info, callback_data):
                 # Both fire in a daemon thread — zero pipeline impact.
                 # ---------------------------------------------------------
                 if direction == "exit":
-                    new_exit_count = user_data.tracking_data.class_counters["exit"][label]
-                    product_movement_announcer.on_exit(label, new_exit_count)
+                    product_movement_announcer.on_exit(label)
                 else:
                     product_movement_announcer.on_entry(label)
                 # ---------------------------------------------------------
@@ -2208,18 +2202,6 @@ async def run_tracking(websocket: WebSocket):
                 current_pipeline_app = detection_app
 
             detection_app.run()
-
-            # ---------------------------------------------------------
-            # CLOSING TTS SUMMARY
-            # Fires after the pipeline stops (door has closed).
-            # Speaks net items taken or "no items taken" message.
-            # Brief pause first so it doesn't overlap pipeline teardown.
-            # ---------------------------------------------------------
-            time.sleep(1.0)
-            product_movement_announcer.speak_closing_summary(
-                callback.tracking_data.class_counters
-            )
-            # ---------------------------------------------------------
 
             if transaction_id:
                 transaction_memory_manager.end_transaction(transaction_id)
@@ -2976,6 +2958,19 @@ async def websocket_endpoint(websocket: WebSocket):
         await cleanup_websocket_sounds()
 
         tts_manager.speak_door_close()
+
+        # -----------------------------------------------------------------
+        # CLOSING TTS SUMMARY
+        # Called here — AFTER speak_door_close() has fully finished
+        # (speak_door_close uses play_mp3_sync so it blocks until done).
+        # speak_closing_summary then polls is_audio_playing() and waits
+        # for silence before playing, so the two can never overlap.
+        # -----------------------------------------------------------------
+        if 'callback' in locals() and hasattr(callback, 'tracking_data'):
+            product_movement_announcer.speak_closing_summary(
+                callback.tracking_data.class_counters
+            )
+        # -----------------------------------------------------------------
 
         GPIO.output(DOOR_LOCK_PIN, GPIO.HIGH)
         time.sleep(0.3)
