@@ -1768,15 +1768,15 @@ class ProductMovementAnnouncer:
         Speak the end-of-transaction summary synchronously.
 
         This method BLOCKS until the closing message has fully played.
-        It must be called after speak_door_close() has returned so the
-        two announcements never overlap.
+        Called from run_tracking() after speak_door_close(), so the
+        two announcements play in sequence and stop_all_audio() in
+        the websocket finally block cannot cut them off.
 
         How it works:
         1. Builds the closing message text.
-        2. Generates a gTTS MP3 into a temp file.
-        3. Plays it with play_mp3_sync (blocking) so the finally block
-           in websocket_endpoint does not continue, and the process
-           does not tear down, until the audio is fully done.
+        2. Generates a gTTS MP3 to sounds/closing/closing_summary.mp3.
+        3. Plays it with play_mp3_sync (blocking) — fully done before
+           run_tracking returns.
 
         Net > 0:
             "Thank you for shopping with us. The item(s) you have taken
@@ -2228,6 +2228,22 @@ async def run_tracking(websocket: WebSocket):
                 current_pipeline_app = detection_app
 
             detection_app.run()
+
+            # ---------------------------------------------------------
+            # DOOR CLOSE TTS + CLOSING SUMMARY
+            # Both called here inside run_tracking, before the websocket
+            # finally block, so cleanup_websocket_sounds() cannot
+            # call stop_all_audio() and cut off the audio.
+            # speak_door_close() blocks until done, then
+            # speak_closing_summary() generates and plays the summary.
+            # ---------------------------------------------------------
+            tts_manager.speak_door_close()
+
+            if 'callback' in locals() and hasattr(callback, 'tracking_data'):
+                product_movement_announcer.speak_closing_summary(
+                    callback.tracking_data.class_counters
+                )
+            # ---------------------------------------------------------
 
             if transaction_id:
                 transaction_memory_manager.end_transaction(transaction_id)
@@ -2982,21 +2998,6 @@ async def websocket_endpoint(websocket: WebSocket):
                     current_pipeline_app = None
 
         await cleanup_websocket_sounds()
-
-        tts_manager.speak_door_close()
-
-        # -----------------------------------------------------------------
-        # CLOSING TTS SUMMARY
-        # Called here — AFTER speak_door_close() has fully finished
-        # (speak_door_close uses play_mp3_sync so it blocks until done).
-        # speak_closing_summary then polls is_audio_playing() and waits
-        # for silence before playing, so the two can never overlap.
-        # -----------------------------------------------------------------
-        if 'callback' in locals() and hasattr(callback, 'tracking_data'):
-            product_movement_announcer.speak_closing_summary(
-                callback.tracking_data.class_counters
-            )
-        # -----------------------------------------------------------------
 
         GPIO.output(DOOR_LOCK_PIN, GPIO.HIGH)
         time.sleep(0.3)
