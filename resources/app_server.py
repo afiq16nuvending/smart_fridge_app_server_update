@@ -30,7 +30,7 @@ WORKFLOW:
 2. Deposit deducted → Door unlocks → Cameras start
 3. Customer takes/returns items → AI tracks movements
 4. Price calculated in real-time → beep + TTS announces every entry and exit
-5. Door closes → Video saved → Refund processed
+5. Door closes → Closing TTS summary plays → Video saved → Refund processed
 6. System cleans up memory → Ready for next customer
 
 AUTHOR: Afiq
@@ -135,11 +135,11 @@ data_deque: Dict[int, deque] = {}
 # =====================================================================
 # Pin numbers using BCM (Broadcom) numbering scheme
 
-DOOR_LOCK_PIN  = 25   # Controls electromagnetic door lock
-DOOR_SWITCH_PIN = 26  # Detects if door is open/closed
-LED_GREEN      = 23   # Green status LED
-LED_RED        = 18   # Red alert LED
-BUZZER_PIN     = 20   # Alert buzzer
+DOOR_LOCK_PIN   = 25   # Controls electromagnetic door lock
+DOOR_SWITCH_PIN = 26   # Detects if door is open/closed
+LED_GREEN       = 23   # Green status LED
+LED_RED         = 18   # Red alert LED
+BUZZER_PIN      = 20   # Alert buzzer
 
 # =====================================================================
 # GPIO INITIALIZATION
@@ -148,11 +148,11 @@ BUZZER_PIN     = 20   # Alert buzzer
 GPIO.setmode(GPIO.BCM)
 GPIO.setwarnings(False)
 
-GPIO.setup(BUZZER_PIN,    GPIO.OUT, initial=GPIO.HIGH)  # Buzzer OFF (active low)
-GPIO.setup(LED_GREEN,     GPIO.OUT, initial=GPIO.HIGH)  # Green LED OFF
-GPIO.setup(LED_RED,       GPIO.OUT, initial=GPIO.HIGH)  # Red LED OFF
-GPIO.setup(DOOR_LOCK_PIN, GPIO.OUT, initial=GPIO.HIGH)  # Door LOCKED
-GPIO.setup(DOOR_SWITCH_PIN, GPIO.IN)                    # Door sensor (0=closed, 1=open)
+GPIO.setup(BUZZER_PIN,      GPIO.OUT, initial=GPIO.HIGH)  # Buzzer OFF (active low)
+GPIO.setup(LED_GREEN,       GPIO.OUT, initial=GPIO.HIGH)  # Green LED OFF
+GPIO.setup(LED_RED,         GPIO.OUT, initial=GPIO.HIGH)  # Red LED OFF
+GPIO.setup(DOOR_LOCK_PIN,   GPIO.OUT, initial=GPIO.HIGH)  # Door LOCKED
+GPIO.setup(DOOR_SWITCH_PIN, GPIO.IN)                      # Door sensor (0=closed, 1=open)
 
 # =====================================================================
 # GLOBAL STATE FLAGS
@@ -162,8 +162,8 @@ readyToProcess = False
 blink          = False
 alert_thread   = None
 
-camera_covered             = False
-cover_alert_thread         = None
+camera_covered               = False
+cover_alert_thread           = None
 camera_covered_sound_playing = False
 price_alert_sound_playing    = False
 last_alerted_label           = None
@@ -179,23 +179,23 @@ unlock_data = 0
 # TRACKING DATA STRUCTURES
 # =====================================================================
 
-movement_history      = defaultdict(lambda: deque(maxlen=5))
-bbox_area_history     = defaultdict(lambda: deque(maxlen=10))
-movement_direction    = {}
+movement_history       = defaultdict(lambda: deque(maxlen=5))
+bbox_area_history      = defaultdict(lambda: deque(maxlen=10))
+movement_direction     = {}
 last_counted_direction = {}
 
-object_trails  = defaultdict(lambda: deque(maxlen=30))
-global_trails  = defaultdict(lambda: deque(maxlen=30))
+object_trails = defaultdict(lambda: deque(maxlen=30))
+global_trails = defaultdict(lambda: deque(maxlen=30))
 
 # =====================================================================
 # CROSS-CAMERA TRACKING STRUCTURES
 # =====================================================================
 
-global_track_counter      = 0
-local_to_global_id_map    = {}
-global_movement_history   = defaultdict(deque)
+global_track_counter          = 0
+local_to_global_id_map        = {}
+global_movement_history       = defaultdict(deque)
 global_last_counted_direction = {}
-global_track_labels       = {}
+global_track_labels           = {}
 
 active_objects_per_camera = {
     0: defaultdict(dict),
@@ -356,7 +356,7 @@ def draw_counts(frame, class_counters, label):
     cv2.putText(frame, f'Total Exit: {total_exit}', (30, 80),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
-    y_offset  = 110
+    y_offset   = 110
     all_labels = set(class_counters["entry"].keys()) | set(class_counters["exit"].keys())
 
     for lbl in all_labels:
@@ -576,19 +576,23 @@ def generate_beep_file(path="sounds/beep.wav", freq=880, duration=0.12, volume=0
     t           = np.linspace(0, duration, n_samples, endpoint=False)
 
     # Sine wave with a short fade-out to avoid a hard click at the end
-    sine        = np.sin(2 * np.pi * freq * t)
-    fade_len    = int(n_samples * 0.2)
-    fade        = np.ones(n_samples)
+    sine     = np.sin(2 * np.pi * freq * t)
+    fade_len = int(n_samples * 0.2)
+    fade     = np.ones(n_samples)
     fade[-fade_len:] = np.linspace(1.0, 0.0, fade_len)
-    samples     = (sine * fade * volume * 32767).astype(np.int16)
+    samples  = (sine * fade * volume * 32767).astype(np.int16)
 
     with wave.open(path, 'w') as wf:
-        wf.setnchannels(1)       # mono
-        wf.setsampwidth(2)       # 16-bit
+        wf.setnchannels(1)        # mono
+        wf.setsampwidth(2)        # 16-bit
         wf.setframerate(sample_rate)
         wf.writeframes(samples.tobytes())
 
     print(f"Beep sound generated: {path}")
+
+# =====================================================================
+# CAMERA COVER ALERT HANDLER
+# =====================================================================
 
 def handle_cover_alert():
     """
@@ -637,16 +641,16 @@ def display_user_data_frame(user_data):
     video_dir = os.path.join(os.getcwd(), "saved_videos")
     os.makedirs(video_dir, exist_ok=True)
 
-    fourcc       = cv2.VideoWriter_fourcc(*'XVID')
-    output_video = None
-    timestamp    = time.strftime('%Y%m%d_%H%M%S')
-    dataset_name = f"hailo_detection_{timestamp}_{transaction_id}"
-    filename     = os.path.join(video_dir, f"{dataset_name}.avi")
+    fourcc        = cv2.VideoWriter_fourcc(*'XVID')
+    output_video  = None
+    timestamp     = time.strftime('%Y%m%d_%H%M%S')
+    dataset_name  = f"hailo_detection_{timestamp}_{transaction_id}"
+    filename      = os.path.join(video_dir, f"{dataset_name}.avi")
 
-    frame_count      = 0
-    fps_start_time   = None
-    fps_calculated   = False
-    actual_fps       = 13.0
+    frame_count       = 0
+    fps_start_time    = None
+    fps_calculated    = False
+    actual_fps        = 13.0
     fps_sample_frames = 30
 
     try:
@@ -727,37 +731,37 @@ def stream_video_to_api(video_path, dataset_name, transaction_id,
     """
     # API endpoint URL
     api_url = "https://stg-sfapi.nuboxtech.com/index.php/shopping_app/machine/TransactionDataset/insert_transactionDataset"
-    
+
     # Authentication credentials
     username = 'admin'
     password = '1234'
-    api_key = '123456'
-    
+    api_key  = '123456'
+
     # Get current timestamp for database record
     current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    
+
     # Extract filename from path
     filename = os.path.basename(video_path)
-    
+
     # Prepare payload (form data)
     payload = {
-        'machine_id': machine_id,
-        'created_by': user_id,
-        'dataset_url': f"assets/video/machine_transaction_dataset/{machine_identifier}/{dataset_name}.avi",
-        'dataset_name': dataset_name,
-        'transaction_id': transaction_id,
+        'machine_id':       machine_id,
+        'created_by':       user_id,
+        'dataset_url':      f"assets/video/machine_transaction_dataset/{machine_identifier}/{dataset_name}.avi",
+        'dataset_name':     dataset_name,
+        'transaction_id':   transaction_id,
         'created_datetime': current_time
     }
-    
+
     # Prepare headers
     headers = {'x-api-key': api_key}
-    
+
     print(f"Streaming video to API: {video_path}")
     print(f"Payload: {payload}")
-    
+
     try:
         with open(video_path, 'rb') as video_file:
-            files = {'video': (filename, video_file, 'video/avi')}
+            files    = {'video': (filename, video_file, 'video/avi')}
             response = requests.post(
                 api_url,
                 auth=HTTPBasicAuth(username, password),
@@ -766,16 +770,16 @@ def stream_video_to_api(video_path, dataset_name, transaction_id,
                 files=files,
                 timeout=30.0
             )
-            
+
             print(f"API Response Status: {response.status_code}")
-            
+
             if response.status_code == 200:
                 print("Video uploaded successfully")
                 return True
             else:
                 print(f"Upload failed with status: {response.text}")
                 return False
-                
+
     except Exception as e:
         print(f"Error during video streaming: {e}")
         return False
@@ -813,9 +817,6 @@ def remove_lock_file(video_path):
 def monitor_and_send_videos(video_dir, machine_id, machine_identifier, user_id):
     """
     Background thread that watches for completed videos and uploads them.
-
-    Runs continuously, checking every 10 seconds for new .avi files.
-    Marks each file with a lock during upload to prevent double-processing.
 
     Args:
         video_dir          (str): Directory to watch for video files.
@@ -856,7 +857,7 @@ def monitor_and_send_videos(video_dir, machine_id, machine_identifier, user_id):
                         except Exception:
                             transaction_id = None
 
-                        success = stream_video_to_api(
+                        stream_video_to_api(
                             video_path, dataset_name, transaction_id,
                             machine_id, user_id, machine_identifier
                         )
@@ -893,9 +894,6 @@ def monitor_and_send_videos(video_dir, machine_id, machine_identifier, user_id):
 def is_file_complete_enhanced(file_path, stable_time=5):
     """
     Check that a video file is no longer being written to.
-
-    A file is 'complete' when its size and modification time are
-    unchanged for stable_time seconds and it can be opened exclusively.
 
     Args:
         file_path   (str): Path to video file.
@@ -944,10 +942,6 @@ def is_file_complete_enhanced(file_path, stable_time=5):
 class WebSocketDataManager:
     """
     Thread-safe manager for real-time detection data updates.
-
-    Stores current validated/invalidated product counts and provides
-    thread-safe read/write access for the detection callback and
-    WebSocket sender threads.
     """
 
     def __init__(self):
@@ -980,9 +974,6 @@ class WebSocketDataManager:
 class TrackingData:
     """
     Central container for all per-transaction tracking state.
-
-    Holds product detection results, entry/exit counters, counted
-    track ID sets, planogram data, and transaction metadata.
     """
 
     def __init__(self):
@@ -1035,10 +1026,6 @@ class TrackingData:
 class HailoDetectionCallback(app_callback_class):
     """
     Callback class for the Hailo AI detection pipeline.
-
-    Initialises tracking data, loads the machine planogram from the API,
-    manages background planogram refreshes, and validates detected
-    products against inventory.
     """
 
     def __init__(self, websocket=None, deposit=0.0, machine_id=None,
@@ -1071,21 +1058,18 @@ class HailoDetectionCallback(app_callback_class):
     # -----------------------------------------------------------------
 
     def store_machine_id_env(self, machine_id):
-        """Store machine_id in environment for cross-thread access."""
         if machine_id is not None:
             os.environ['MACHINE_ID'] = str(machine_id)
             print(f"Machine ID {machine_id} stored in environment")
 
     def load_machine_id_env(self):
-        """Load machine_id from environment."""
         return os.environ.get('MACHINE_ID')
 
     # -----------------------------------------------------------------
-    # PLANOGRAM CACHING (environment variables)
+    # PLANOGRAM CACHING
     # -----------------------------------------------------------------
 
     def is_planogram_valid_for_machine(self, machine_id):
-        """Check if cached planogram belongs to this machine."""
         try:
             stored = os.environ.get('PLANOGRAM_MACHINE_ID')
             return stored == str(machine_id) if stored else False
@@ -1094,7 +1078,6 @@ class HailoDetectionCallback(app_callback_class):
             return False
 
     def store_planogram_env(self, planogram_data):
-        """Serialize and cache planogram data in environment."""
         try:
             os.environ['MACHINE_PLANOGRAM'] = json.dumps(planogram_data)
             current_machine_id = self.load_machine_id_env()
@@ -1106,7 +1089,6 @@ class HailoDetectionCallback(app_callback_class):
             print(f"Error storing planogram: {e}")
 
     def load_planogram_env(self):
-        """Load and deserialize planogram from environment cache."""
         try:
             planogram_json = os.environ.get('MACHINE_PLANOGRAM')
             if planogram_json:
@@ -1122,14 +1104,6 @@ class HailoDetectionCallback(app_callback_class):
     # -----------------------------------------------------------------
 
     def load_machine_planogram(self):
-        """
-        Load planogram with intelligent caching.
-
-        Priority:
-        1. Use valid cached planogram if available.
-        2. Otherwise fetch from API.
-        3. Start background refresh thread.
-        """
         try:
             current_machine_id = self.load_machine_id_env()
 
@@ -1172,11 +1146,8 @@ class HailoDetectionCallback(app_callback_class):
 
     def get_fallback_pipeline_string(self):
         """
-        Return the hardcoded GStreamer pipeline string (fallback when
-        the API does not provide one).
-
-        NOTE: The GStreamer pipeline is NEVER modified — this string is
-        read-only configuration.
+        Return the hardcoded GStreamer pipeline string.
+        NOTE: The GStreamer pipeline is NEVER modified.
         """
         return (
             "hailoroundrobin mode=0 name=fun ! "
@@ -1237,21 +1208,15 @@ class HailoDetectionCallback(app_callback_class):
     # -----------------------------------------------------------------
 
     def fetch_and_store_initial_planogram(self, machine_id):
-        """
-        Fetch the planogram from the API on first run (no valid cache).
-
-        Args:
-            machine_id (str): Machine database ID.
-        """
         # API authentication credentials
         username = 'admin'
         password = '1234'
-        api_key = '123456'
-        headers = {'x-api-key': api_key}
-        
+        api_key  = '123456'
+        headers  = {'x-api-key': api_key}
+
         # Construct API endpoint URL
         api_endpoint = (f'https://stg-sfapi.nuboxtech.com/index.php/'
-                      f'mobile_app/machine/Machine_listing/machine_planogram/{machine_id}')
+                        f'mobile_app/machine/Machine_listing/machine_planogram/{machine_id}')
 
         video_monitor_thread = threading.Thread(
             target=monitor_and_send_videos,
@@ -1288,16 +1253,12 @@ class HailoDetectionCallback(app_callback_class):
             self.tracking_data.machine_planogram = []
 
     def start_planogram_refresh_thread(self):
-        """
-        Start a background thread that refreshes the planogram every
-        1000 seconds (~16 minutes).
-        """
         def refresh_planogram():
             # API credentials
             username = 'admin'
             password = '1234'
-            api_key = '123456'
-            headers = {'x-api-key': api_key}
+            api_key  = '123456'
+            headers  = {'x-api-key': api_key}
 
             while True:
                 try:
@@ -1309,8 +1270,8 @@ class HailoDetectionCallback(app_callback_class):
 
                     # Construct API endpoint
                     refresh_endpoint = (f'https://stg-sfapi.nuboxtech.com/index.php/'
-                                      f'mobile_app/machine/Machine_listing/'
-                                      f'machine_planogram/{refresh_machine_id}')
+                                        f'mobile_app/machine/Machine_listing/'
+                                        f'machine_planogram/{refresh_machine_id}')
 
                     api_response = requests.get(
                         refresh_endpoint,
@@ -1340,7 +1301,6 @@ class HailoDetectionCallback(app_callback_class):
         print("Planogram refresh thread started (every 1000 seconds)")
 
     def get_planogram_from_env(self):
-        """Return current planogram from environment cache."""
         return self.load_planogram_env()
 
     # -----------------------------------------------------------------
@@ -1348,21 +1308,6 @@ class HailoDetectionCallback(app_callback_class):
     # -----------------------------------------------------------------
 
     def validate_detected_product(self, detected_product):
-        """
-        Validate a detected product label against the machine planogram.
-
-        Normalisation: strips spaces, converts to lowercase before matching.
-
-        Args:
-            detected_product (str): Product label from the AI detector.
-
-        Returns:
-            dict: {
-                "valid":           bool,
-                "product_details": dict or None,
-                "message":         str
-            }
-        """
         current_planogram = self.load_planogram_env()
         if current_planogram:
             self.tracking_data.machine_planogram = current_planogram
@@ -1393,12 +1338,8 @@ class HailoDetectionCallback(app_callback_class):
 
 class HailoDetectionApp:
     """
-    Manages the GStreamer pipeline and the Hailo detection lifecycle.
-
-    Connects buffer probes to identity elements for both camera streams,
-    monitors the door for auto-shutdown, and manages graceful cleanup.
-
-    NOTE: The GStreamer pipeline string is NEVER modified here.
+    Manages the GStreamer pipeline and Hailo detection lifecycle.
+    NOTE: The GStreamer pipeline string is NEVER modified.
     All detection logic is injected via buffer probes on the existing
     identity elements.
     """
@@ -1413,15 +1354,15 @@ class HailoDetectionApp:
         self.shutdown_called = False
         self.shutdown_lock   = threading.Lock()
 
-        self.use_frame           = True
-        self.labels_json         = 'resources/labels.json'
-        self.hef_path            = 'resources/ai_model.hef'
-        self.arch                = 'hailo8'
-        self.show_fps            = True
-        self.batch_size          = 2
-        self.network_width       = 640
-        self.network_height      = 640
-        self.network_format      = "RGB"
+        self.use_frame          = True
+        self.labels_json        = 'resources/labels.json'
+        self.hef_path           = 'resources/ai_model.hef'
+        self.arch               = 'hailo8'
+        self.show_fps           = True
+        self.batch_size         = 2
+        self.network_width      = 640
+        self.network_height     = 640
+        self.network_format     = "RGB"
 
         self.post_process_so = os.path.join(
             os.path.dirname(__file__),
@@ -1433,18 +1374,10 @@ class HailoDetectionApp:
         self.door_monitor_thread.start()
 
     def get_pipeline_string(self):
-        """
-        Return the GStreamer pipeline string.
-        Falls back to the hardcoded string if the API does not provide one.
-        """
         print("Using fallback pipeline string")
         return self.user_data.get_fallback_pipeline_string()
 
     def create_pipeline(self):
-        """
-        Parse the pipeline string and attach buffer probes to both
-        identity_callback_0 and identity_callback_1 elements.
-        """
         Gst.init(None)
         pipeline_string = self.get_pipeline_string()
         self.pipeline   = Gst.parse_launch(pipeline_string)
@@ -1477,12 +1410,7 @@ class HailoDetectionApp:
         return True
 
     def monitor_door(self):
-        """
-        Poll the door sensor every 100 ms and initiate shutdown when
-        the door closes (with a 5 second startup grace period).
-        """
         start_time = time.time()
-
         while self.door_monitor_active:
             door_sw = GPIO.input(DOOR_SWITCH_PIN)
             if door_sw == 0 and time.time() - start_time > 5:
@@ -1492,10 +1420,6 @@ class HailoDetectionApp:
             time.sleep(0.1)
 
     def shutdown(self, signum=None, frame=None):
-        """
-        Gracefully stop the GStreamer pipeline and free resources.
-        Protected against double-invocation via a threading lock.
-        """
         with self.shutdown_lock:
             if self.shutdown_called:
                 return
@@ -1518,9 +1442,7 @@ class HailoDetectionApp:
         GLib.idle_add(self.loop.quit)
 
     def bus_call(self, bus, message, loop):
-        """Handle GStreamer bus messages (EOS / ERROR)."""
         t = message.type
-
         if t == Gst.MessageType.EOS:
             print("End-of-stream")
             loop.quit()
@@ -1528,14 +1450,9 @@ class HailoDetectionApp:
             err, debug = message.parse_error()
             print(f"Pipeline error: {err}, {debug}")
             loop.quit()
-
         return True
 
     def run(self):
-        """
-        Set the pipeline to PLAYING and run the GLib main loop.
-        Blocks until shutdown is triggered.
-        """
         signal.signal(signal.SIGINT, self.shutdown)
 
         if self.use_frame:
@@ -1588,23 +1505,6 @@ class HailoDetectionApp:
 # =====================================================================
 
 def get_global_track_id(camera_id, local_track_id, features=None, label=None):
-    """
-    Return (or create) a global track ID for cross-camera deduplication.
-
-    Rules:
-    - Same (camera, local_id) → same global_id (always)
-    - Same label seen on the other camera → share that camera's global_id
-    - No match found → create a new global_id
-
-    Args:
-        camera_id      (int): Camera identifier (0 or 1).
-        local_track_id (int): Hailo tracker's local track ID.
-        features:            Feature vector (unused, reserved for future).
-        label          (str): Product class label.
-
-    Returns:
-        int: Global track ID.
-    """
     global global_track_counter, local_to_global_id_map
     global global_track_labels, active_objects_per_camera
 
@@ -1617,8 +1517,8 @@ def get_global_track_id(camera_id, local_track_id, features=None, label=None):
         local_to_global_id_map[(camera_id, local_track_id)] = new_id
         return new_id
 
-    other_camera   = 1 if camera_id == 0 else 0
-    available      = []
+    other_camera = 1 if camera_id == 0 else 0
+    available    = []
 
     if label in active_objects_per_camera[other_camera]:
         for other_local_id, other_global_id in active_objects_per_camera[other_camera][label].items():
@@ -1645,13 +1545,6 @@ def get_global_track_id(camera_id, local_track_id, features=None, label=None):
 
 
 def cleanup_inactive_tracks(camera_id, active_local_track_ids):
-    """
-    Remove tracking data for tracks no longer visible in the current frame.
-
-    Args:
-        camera_id              (int): Camera identifier (0 or 1).
-        active_local_track_ids (set): Track IDs present in the current frame.
-    """
     global local_to_global_id_map, active_objects_per_camera
 
     inactive = [
@@ -1662,7 +1555,6 @@ def cleanup_inactive_tracks(camera_id, active_local_track_ids):
 
     for cam_id, local_id, global_id in inactive:
         del local_to_global_id_map[(cam_id, local_id)]
-
         label = global_track_labels.get(global_id)
         if label and label in active_objects_per_camera[cam_id]:
             if local_id in active_objects_per_camera[cam_id][label]:
@@ -1676,30 +1568,6 @@ def cleanup_inactive_tracks(camera_id, active_local_track_ids):
 
 def analyze_movement_direction(track_id, center, tracking_data,
                                camera_id, global_id, current_bbox):
-    """
-    Determine whether an object is being taken out (exit) or returned (entry).
-
-    Uses 5-frame history with four validation checks:
-    1. Bounding-box stability  (rejects hand occlusion)
-    2. Total displacement      (≥ 30 px — rejects jitter)
-    3. Movement consistency    (≥ 80 % in one direction)
-    4. Average movement/frame  (≥ 5 px — rejects slow drift)
-
-    Y increases downward in image coordinates:
-    - Positive avg_movement → object moving down → 'exit' (taken out)
-    - Negative avg_movement → object moving up   → 'entry' (returned)
-
-    Args:
-        track_id     (int):          Local track ID.
-        center       (tuple):        Current (x, y) centre pixel.
-        tracking_data:               TrackingData instance.
-        camera_id    (int):          Camera identifier (0 or 1).
-        global_id    (int):          Global track ID.
-        current_bbox (tuple):        (x1, y1, x2, y2) bounding box.
-
-    Returns:
-        str or None: 'exit', 'entry', or None.
-    """
     camera_movement_history[camera_id][track_id].appendleft(center)
 
     bbox_area = (current_bbox[2] - current_bbox[0]) * (current_bbox[3] - current_bbox[1])
@@ -1712,12 +1580,12 @@ def analyze_movement_direction(track_id, center, tracking_data,
 
     # CHECK 1: Bounding-box stability
     if len(camera_bbox_area_history[camera_id][track_id]) >= 5:
-        areas      = list(camera_bbox_area_history[camera_id][track_id])
-        avg_area   = sum(areas) / len(areas)
-        variance   = sum((a - avg_area) ** 2 for a in areas) / len(areas)
-        std_dev    = variance ** 0.5
+        areas    = list(camera_bbox_area_history[camera_id][track_id])
+        avg_area = sum(areas) / len(areas)
+        variance = sum((a - avg_area) ** 2 for a in areas) / len(areas)
+        std_dev  = variance ** 0.5
         if std_dev > avg_area * 0.8:
-            return None  # bbox unstable — probably a hand occluding the object
+            return None
 
     # CHECK 2: Total displacement
     history            = camera_movement_history[camera_id][track_id]
@@ -1728,9 +1596,9 @@ def analyze_movement_direction(track_id, center, tracking_data,
         return None
 
     # CHECK 3: Directional consistency
-    deltas     = [history[i-1][1] - history[i][1] for i in range(1, len(history))]
-    n_positive = sum(1 for d in deltas if d > 0)
-    n_negative = sum(1 for d in deltas if d < 0)
+    deltas      = [history[i-1][1] - history[i][1] for i in range(1, len(history))]
+    n_positive  = sum(1 for d in deltas if d > 0)
+    n_negative  = sum(1 for d in deltas if d < 0)
     consistency = max(n_positive, n_negative) / len(deltas)
     if consistency < 0.8:
         return None
@@ -1753,20 +1621,53 @@ def analyze_movement_direction(track_id, center, tracking_data,
     return current_direction
 
 # =====================================================================
+# NUMBER TO WORDS HELPER
+# =====================================================================
+
+def number_to_words(n):
+    """
+    Convert an integer (1-20) to its spoken word equivalent.
+
+    Used so TTS says "two 100plus removed" instead of "2 100plus removed".
+
+    Args:
+        n (int): Number to convert.
+
+    Returns:
+        str: Word representation, or the digit string for numbers > 20.
+    """
+    words = {
+        1: "one",   2: "two",      3: "three",  4: "four",
+        5: "five",  6: "six",      7: "seven",  8: "eight",
+        9: "nine",  10: "ten",     11: "eleven", 12: "twelve",
+        13: "thirteen", 14: "fourteen", 15: "fifteen", 16: "sixteen",
+        17: "seventeen", 18: "eighteen", 19: "nineteen", 20: "twenty"
+    }
+    return words.get(n, str(n))
+
+# =====================================================================
 # PRODUCT MOVEMENT TTS ANNOUNCER
 # =====================================================================
-# Announces product entries and exits in real time via a short buzzer
-# beep followed by a TTS phrase.
+# Behaviour summary:
 #
-# Exit  (item taken out) → beep + "[product] removed"
-# Entry (item put back)  → beep + "[product] added"
+# EXIT  (item taken out):
+#   Counts up cumulatively per product.
+#   "one 100plus removed" → "two 100plus removed" → ...
 #
-# Both directions fire immediately when the counter increments.
-# All audio is asynchronous — zero impact on the GStreamer pipeline.
+# ENTRY (item returned):
+#   Always announces as ONE regardless of how many have been returned.
+#   Every single return event says "one 100plus returned".
+#   This gives a per-event acknowledgement without a running total.
 #
-# To make label names sound more natural in speech, add entries to
-# SPEECH_NAMES below.
-# e.g. "mangoMilk": "mango milk"
+# CLOSING SUMMARY (after door closes):
+#   Called once via speak_closing_summary().
+#   Lists net exit items (exit minus entry).
+#   If net = 0: "Thank you for visiting. No items were taken..."
+#   If net > 0: "Thank you for shopping... items taken are X and Y..."
+#
+# All audio is non-blocking — zero impact on the GStreamer pipeline.
+#
+# Add entries to SPEECH_NAMES to make label names sound more natural.
 # =====================================================================
 
 SPEECH_NAMES: Dict[str, str] = {
@@ -1784,85 +1685,160 @@ SPEECH_NAMES: Dict[str, str] = {
 
 class ProductMovementAnnouncer:
     """
-    Tracks entry and exit counts per product and announces each change
-    with a short buzzer beep followed by a TTS phrase.
+    Real-time TTS announcer for product entry and exit events.
 
-    Announcement examples:
-        Item taken out → beep + "Coca-Cola removed"
-        Item put back  → beep + "Coca-Cola added"
+    EXIT behaviour — cumulative count:
+        1st exit of 100plus → "one 100plus removed"
+        2nd exit of 100plus → "two 100plus removed"
+        3rd exit of 100plus → "three 100plus removed"
 
-    Design:
-    - Thread-safe: detection_callback runs in a GStreamer pipeline thread.
-    - Non-blocking: beep runs in a daemon thread, TTS uses speak_async().
-    - Per-direction tracking: entry and exit counts are tracked separately
-      so putting an item back after taking it re-announces correctly.
-    - Resets cleanly between transactions via reset().
+    ENTRY behaviour — always one:
+        Every return event → "one 100plus returned"
+        (no running total for entries — each return is acknowledged once)
+
+    CLOSING SUMMARY — called once when the door closes:
+        Net items taken > 0:
+            "Thank you for shopping with us. The items you have taken
+             are two 100plus and one mangoMilk. Your refund will be
+             processed shortly. We hope to see you again soon."
+        Net items taken = 0:
+            "Thank you for visiting. No items were taken today.
+             Have a wonderful day and we hope to see you again soon."
+
+    Thread-safe. All audio is non-blocking.
     """
 
     def __init__(self):
-        # Maps direction -> {label -> last announced count}
-        self._announced_counts: Dict[str, Dict[str, int]] = {
-            "exit":  {},
-            "entry": {}
-        }
+        # exit: tracks cumulative count per label for TTS
+        # entry: not tracked (always says "one")
+        self._exit_announced: Dict[str, int] = {}
         self._lock = threading.Lock()
 
     def reset(self):
-        """Clear all per-product counters. Call at the start of each transaction."""
+        """Clear state. Call at the start of each new transaction."""
         with self._lock:
-            self._announced_counts = {"exit": {}, "entry": {}}
+            self._exit_announced.clear()
         print("[MovementTTS] Announcer reset for new transaction")
 
     def _beep_and_speak(self, text: str):
         """
-        Play a short buzzer beep then speak the TTS phrase.
-        Runs entirely in a background daemon thread — never blocks the caller.
-
-        Beep duration is kept short (0.1 s) so it acts as an audio cue
-        rather than an interruption.
+        Play the beep WAV then speak the TTS phrase, both through pygame.
+        Runs in a background daemon thread — never blocks the caller.
 
         Args:
             text (str): The phrase to speak after the beep.
         """
         def _run():
             try:
-                # Play the pre-generated beep through pygame (same speaker as TTS)
                 beep_path = "sounds/beep.wav"
                 if os.path.exists(beep_path):
                     tts_manager.play_mp3_sync(beep_path, volume=0.6)
             except Exception as e:
-                print(f"[MovementTTS] Beep playback error: {e}")
-
-            # TTS fires right after the beep finishes
+                print(f"[MovementTTS] Beep error: {e}")
             tts_manager.speak_async(text, lang='en')
 
         threading.Thread(target=_run, daemon=True).start()
 
-    def on_count_updated(self, label: str, direction: str, new_count: int):
+    def on_exit(self, label: str, new_count: int):
         """
-        Call this whenever the counter for a product/direction increments.
-        Only announces when the count genuinely increases since last announcement.
+        Called when the exit counter increments for a product.
+        Announces cumulatively: "one X removed", "two X removed", etc.
 
         Args:
-            label     (str): Product label, e.g. "100plus".
-            direction (str): "exit" (taken out) or "entry" (put back).
-            new_count (int): Updated count after the increment.
+            label     (str): Product label.
+            new_count (int): Updated exit count after the increment.
         """
         with self._lock:
-            last = self._announced_counts[direction].get(label, 0)
+            last = self._exit_announced.get(label, 0)
             if new_count <= last:
                 return
-            self._announced_counts[direction][label] = new_count
+            self._exit_announced[label] = new_count
 
         spoken_name = SPEECH_NAMES.get(label, label)
-
-        if direction == "exit":
-            text = f"{spoken_name} removed"
-        else:
-            text = f"{spoken_name} added"
+        count_word  = number_to_words(new_count)
+        text        = f"{count_word} {spoken_name} removed"
 
         self._beep_and_speak(text)
-        print(f"[MovementTTS] {direction.upper()} — '{text}'")
+        print(f"[MovementTTS] EXIT — '{text}'")
+
+    def on_entry(self, label: str):
+        """
+        Called every time a product is returned (entry event).
+        Always announces "one X returned" regardless of total returns.
+
+        Args:
+            label (str): Product label.
+        """
+        spoken_name = SPEECH_NAMES.get(label, label)
+        text        = f"one {spoken_name} returned"
+
+        self._beep_and_speak(text)
+        print(f"[MovementTTS] ENTRY — '{text}'")
+
+    def speak_closing_summary(self, class_counters: dict):
+        """
+        Speak the end-of-transaction summary after the door closes.
+
+        Calculates net items taken (exit count minus entry count) for
+        each product and composes a professional closing message.
+
+        Net > 0  → lists items taken, thanks customer, mentions refund.
+        Net = 0  → confirms nothing was taken, wishes customer well.
+
+        Runs asynchronously in a background thread.
+
+        Args:
+            class_counters (dict): The tracking_data.class_counters dict
+                                   with 'entry' and 'exit' sub-dicts.
+        """
+        def _run():
+            # Build net counts per product
+            all_labels   = (set(class_counters["exit"].keys()) |
+                            set(class_counters["entry"].keys()))
+            net_items    = {}  # label -> net count taken
+
+            for lbl in all_labels:
+                exit_count  = class_counters["exit"].get(lbl, 0)
+                entry_count = class_counters["entry"].get(lbl, 0)
+                net         = max(0, exit_count - entry_count)
+                if net > 0:
+                    net_items[lbl] = net
+
+            if not net_items:
+                # Nothing was taken
+                message = (
+                    "Thank you for visiting. "
+                    "No items were taken today. "
+                    "Have a wonderful day, and we hope to see you again soon."
+                )
+            else:
+                # Build the item list: "two 100plus", "one mangoMilk", etc.
+                item_phrases = []
+                for lbl, count in net_items.items():
+                    spoken_name   = SPEECH_NAMES.get(lbl, lbl)
+                    count_word    = number_to_words(count)
+                    item_phrases.append(f"{count_word} {spoken_name}")
+
+                if len(item_phrases) == 1:
+                    items_text = item_phrases[0]
+                elif len(item_phrases) == 2:
+                    items_text = f"{item_phrases[0]} and {item_phrases[1]}"
+                else:
+                    items_text = (", ".join(item_phrases[:-1]) +
+                                  f", and {item_phrases[-1]}")
+
+                message = (
+                    f"Thank you for shopping with us. "
+                    f"The item{'s' if len(item_phrases) > 1 else ''} you have taken "
+                    f"{'are' if len(item_phrases) > 1 else 'is'} {items_text}. "
+                    f"Your refund will be processed shortly. "
+                    f"We hope to see you again soon."
+                )
+
+            print(f"[MovementTTS] CLOSING — '{message}'")
+            tts_manager.speak_async(message, lang='en')
+
+        threading.Thread(target=_run, daemon=True).start()
 
 
 # Global instance — shared across all detection_callback invocations
@@ -1875,20 +1851,13 @@ product_movement_announcer = ProductMovementAnnouncer()
 # probe on identity_callback_0 and identity_callback_1.
 # Frequency: ~13-15 fps per camera.
 # Thread: GStreamer pipeline thread.
-#
 # PIPELINE IS NEVER MODIFIED. All logic is injected here.
 # =====================================================================
 
 def detection_callback(pad, info, callback_data):
     """
-    Process each video frame: detect objects, track them, validate against
-    the planogram, count entries/exits, announce exits via TTS, and send
-    data to the WebSocket.
-
-    Args:
-        pad           (Gst.Pad):  GStreamer pad that triggered this probe.
-        info          (Gst.PadProbeInfo): Contains the frame buffer.
-        callback_data (dict):     {'user_data': ..., 'stream_id': int}
+    Process each video frame: detect, track, validate, count, announce,
+    and push data to the WebSocket.
 
     Returns:
         Gst.PadProbeReturn.OK: Always continue pipeline processing.
@@ -1906,20 +1875,14 @@ def detection_callback(pad, info, callback_data):
     if not all([format, width, height]):
         return Gst.PadProbeReturn.OK
 
-    # -----------------------------------------------------------------
     # STEP 1: Get AI detections from Hailo
-    # -----------------------------------------------------------------
     roi        = hailo.get_roi_from_buffer(buffer)
     detections = roi.get_objects_typed(hailo.HAILO_DETECTION)
 
-    # -----------------------------------------------------------------
     # STEP 2: Get video frame for visualization
-    # -----------------------------------------------------------------
     frame = get_numpy_from_buffer(buffer, format, width, height)
 
-    # -----------------------------------------------------------------
-    # STEP 3: Camera cover detection (security)
-    # -----------------------------------------------------------------
+    # STEP 3: Camera cover detection
     if is_frame_dark(frame):
         if not camera_covered:
             camera_covered = True
@@ -1932,38 +1895,31 @@ def detection_callback(pad, info, callback_data):
         if camera_covered:
             camera_covered = False
 
-    # -----------------------------------------------------------------
     # STEP 4: Track active objects for cleanup
-    # -----------------------------------------------------------------
     active_local_track_ids = set()
 
     if hasattr(user_data, 'transaction_id') and user_data.transaction_id:
         transaction_memory_manager.track_frame(user_data.transaction_id)
 
-    # -----------------------------------------------------------------
     # STEP 5: Process each detection
-    # -----------------------------------------------------------------
     for detection in detections:
         label      = detection.get_label()
         bbox       = detection.get_bbox()
         confidence = detection.get_confidence()
         class_id   = detection.get_class_id()
 
-        # Extract Hailo tracker's local track ID
         track_id = 0
         track    = detection.get_objects_typed(hailo.HAILO_UNIQUE_ID)
         if len(track) == 1:
             track_id = track[0].get_id()
             active_local_track_ids.add(track_id)
 
-        # Pixel coordinates from normalised bbox
-        x1 = int(bbox.xmin() * width)
-        y1 = int(bbox.ymin() * height)
-        x2 = int(bbox.xmax() * width)
-        y2 = int(bbox.ymax() * height)
+        x1     = int(bbox.xmin() * width)
+        y1     = int(bbox.ymin() * height)
+        x2     = int(bbox.xmax() * width)
+        y2     = int(bbox.ymax() * height)
         center = (int((x1 + x2) / 2), int((y1 + y2) / 2))
 
-        # Resolve cross-camera global ID
         global_id = get_global_track_id(stream_id, track_id, None, label)
 
         if hasattr(user_data, 'transaction_id') and user_data.transaction_id:
@@ -1971,10 +1927,8 @@ def detection_callback(pad, info, callback_data):
                 user_data.transaction_id, track_id, global_id
             )
 
-        # Validate against planogram
         validation_result = user_data.validate_detected_product(label)
 
-        # Draw bounding box and label
         color = compute_color_for_labels(class_id)
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
@@ -1984,18 +1938,14 @@ def detection_callback(pad, info, callback_data):
         cv2.putText(frame, label_text, (x1, y1 - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, text_color, 2)
 
-        # Draw movement trail
         draw_trail(frame, track_id, center, color, global_id=global_id)
 
-        # Analyse movement direction
         direction = analyze_movement_direction(
             track_id, center, user_data.tracking_data,
             stream_id, global_id, (x1, y1, x2, y2)
         )
 
-        # -----------------------------------------------------------------
-        # STEP 6: Update counters if a confirmed direction is detected
-        # -----------------------------------------------------------------
+        # STEP 6: Update counters and announce
         if direction:
             should_count = (
                 global_id not in user_data.tracking_data.counted_tracks.get(direction, set()) or
@@ -2004,18 +1954,21 @@ def detection_callback(pad, info, callback_data):
             )
 
             if should_count:
-                # Increment the direction counter
                 user_data.tracking_data.class_counters[direction][label] += 1
 
                 # ---------------------------------------------------------
-                # MOVEMENT TTS ANNOUNCEMENT (entry + exit)
-                # Fires immediately after the counter increments.
-                # Plays a short beep then speaks the phrase.
-                # _beep_and_speak() runs in a daemon thread —
-                # zero impact on the GStreamer pipeline.
+                # MOVEMENT TTS ANNOUNCEMENT
+                #
+                # EXIT  → cumulative: "one X removed", "two X removed" ...
+                # ENTRY → always one: "one X returned" every time
+                #
+                # Both fire in a daemon thread — zero pipeline impact.
                 # ---------------------------------------------------------
-                new_count = user_data.tracking_data.class_counters[direction][label]
-                product_movement_announcer.on_count_updated(label, direction, new_count)
+                if direction == "exit":
+                    new_exit_count = user_data.tracking_data.class_counters["exit"][label]
+                    product_movement_announcer.on_exit(label, new_exit_count)
+                else:
+                    product_movement_announcer.on_entry(label)
                 # ---------------------------------------------------------
 
                 if direction not in user_data.tracking_data.counted_tracks:
@@ -2043,30 +1996,20 @@ def detection_callback(pad, info, callback_data):
                         }
                     user_data.tracking_data.invalidated_products[direction][label]["count"] += 1
 
-    # -----------------------------------------------------------------
     # STEP 7: Cleanup inactive tracks
-    # -----------------------------------------------------------------
     cleanup_inactive_tracks(stream_id, active_local_track_ids)
 
-    # -----------------------------------------------------------------
     # STEP 8: Update FPS timestamp
-    # -----------------------------------------------------------------
     user_data.tracking_data.last_time = time.time()
 
-    # -----------------------------------------------------------------
     # STEP 9: Draw on-screen counters
-    # -----------------------------------------------------------------
     current_label = next((det.get_label() for det in detections), None)
     draw_counts(frame, user_data.tracking_data.class_counters, current_label)
 
-    # -----------------------------------------------------------------
     # STEP 10: Convert RGB → BGR for OpenCV
-    # -----------------------------------------------------------------
     frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
-    # -----------------------------------------------------------------
     # STEP 11: Store frame per camera and combine
-    # -----------------------------------------------------------------
     if stream_id == 0:
         user_data.frame_left = frame
     elif stream_id == 1:
@@ -2076,9 +2019,7 @@ def detection_callback(pad, info, callback_data):
         combined_frame = np.hstack((user_data.frame_left, user_data.frame_right))
         user_data.set_frame(combined_frame)
 
-    # -----------------------------------------------------------------
     # STEP 12: Update WebSocket data
-    # -----------------------------------------------------------------
     websocket_data = {
         "validated_products": {
             "entry": {
@@ -2103,9 +2044,7 @@ def detection_callback(pad, info, callback_data):
     }
     user_data.tracking_data.websocket_data_manager.update_data(websocket_data)
 
-    # -----------------------------------------------------------------
     # STEP 13: Price check and deposit alert
-    # -----------------------------------------------------------------
     current_data = user_data.tracking_data.websocket_data_manager.get_current_data()
     calculate_total_price_and_control_buzzer(current_data, user_data.deposit, current_label)
 
@@ -2118,15 +2057,6 @@ def detection_callback(pad, info, callback_data):
 async def run_tracking(websocket: WebSocket):
     """
     Orchestrate the full lifecycle of one customer transaction.
-
-    Phases:
-    1. Wait for 'start_preview' or 'product_upload' WebSocket message.
-    2. Unlock the door.
-    3a. Product upload mode: capture images and upload to API.
-    3b. Detection mode: run Hailo pipeline and stream results.
-
-    Args:
-        websocket (WebSocket): FastAPI WebSocket connection.
     """
     global unlock_data, done, current_pipeline_app
 
@@ -2139,9 +2069,7 @@ async def run_tracking(websocket: WebSocket):
     product_name       = None
     image_count        = None
 
-    # -----------------------------------------------------------------
     # PHASE 1: Wait for start message
-    # -----------------------------------------------------------------
     while True:
         try:
             message_text = await websocket.receive_text()
@@ -2177,18 +2105,14 @@ async def run_tracking(websocket: WebSocket):
             })
             return
 
-    # -----------------------------------------------------------------
     # PHASE 2: Door control
-    # -----------------------------------------------------------------
     if unlock_data == 1:
         print("Unlocking door for 0.5 seconds")
         readyToProcess = True
         unlock_data    = 0
 
     try:
-        # =============================================================
         # MODE 1: Product Upload
-        # =============================================================
         if isinstance(message, dict) and message.get('action') == 'product_upload':
             done               = True
             machine_id         = message.get('machine_id')
@@ -2207,7 +2131,6 @@ async def run_tracking(websocket: WebSocket):
 
             if camera1_images:
                 tts_manager.play_mp3_sync(f"{alert_dir}/all_complete.mp3", volume=0.8)
-
                 if upload_images_to_api(camera1_images, machine_id, machine_identifier,
                                         user_id, product_name, image_count):
                     delete_images(camera1_images)
@@ -2217,9 +2140,7 @@ async def run_tracking(websocket: WebSocket):
             else:
                 tts_manager.play_mp3_sync(f"{alert_dir}/upload_failed.mp3", volume=0.8)
 
-        # =============================================================
         # MODE 2: Detection / Transaction
-        # =============================================================
         else:
             if transaction_id:
                 transaction_memory_manager.start_transaction(transaction_id)
@@ -2288,6 +2209,18 @@ async def run_tracking(websocket: WebSocket):
 
             detection_app.run()
 
+            # ---------------------------------------------------------
+            # CLOSING TTS SUMMARY
+            # Fires after the pipeline stops (door has closed).
+            # Speaks net items taken or "no items taken" message.
+            # Brief pause first so it doesn't overlap pipeline teardown.
+            # ---------------------------------------------------------
+            time.sleep(1.0)
+            product_movement_announcer.speak_closing_summary(
+                callback.tracking_data.class_counters
+            )
+            # ---------------------------------------------------------
+
             if transaction_id:
                 transaction_memory_manager.end_transaction(transaction_id)
                 print(f"[Memory] Transaction {transaction_id} ended")
@@ -2330,24 +2263,15 @@ async def run_tracking(websocket: WebSocket):
 # =====================================================================
 
 def setup_product_upload_alerts():
-    """
-    Pre-generate TTS MP3 files for the product capture workflow.
-
-    Files are cached — only generated once.
-    Saved to sounds/product_upload_alerts/
-
-    Returns:
-        dict: Map of alert name → file path.
-    """
     alert_dir = "sounds/product_upload_alerts"
     os.makedirs(alert_dir, exist_ok=True)
 
     alerts = {
-        "start_capture": "Get ready to capture images. Please prepare your products.",
-        "camera_switch": "Switching to the next camera. Please wait.",
-        "capture_ready": "Position your product now. Image will be captured shortly.",
+        "start_capture":  "Get ready to capture images. Please prepare your products.",
+        "camera_switch":  "Switching to the next camera. Please wait.",
+        "capture_ready":  "Position your product now. Image will be captured shortly.",
         "image_captured": "Image captured successfully.",
-        "next_position": "Next position.",
+        "next_position":  "Next position.",
         "upload_success": "All images uploaded successfully. Thank you.",
         "upload_failed":  "Upload failed. Please contact support.",
         "all_complete":   "Image capture completed. Processing your upload."
@@ -2366,19 +2290,6 @@ def setup_product_upload_alerts():
 
 
 def capture_images(device_id, num_images=3):
-    """
-    Capture images from a camera with audio guidance.
-
-    Uses MJPEG for fast capture and clears the buffer before each shot
-    to ensure a fresh frame.
-
-    Args:
-        device_id  (int): Camera device ID (0 or 2).
-        num_images (int): Number of images to capture.
-
-    Returns:
-        list: Paths to saved image files, or [] on failure.
-    """
     image_paths = []
     alert_dir   = "sounds/product_upload_alerts"
     os.makedirs('camera_images', exist_ok=True)
@@ -2399,7 +2310,7 @@ def capture_images(device_id, num_images=3):
 
         for i in range(1, num_images + 1):
             time.sleep(0.5)
-            for _ in range(5):        # flush stale frames
+            for _ in range(5):
                 cap.read()
 
             ret, frame = cap.read()
@@ -2430,26 +2341,12 @@ def capture_images(device_id, num_images=3):
 
 def upload_images_to_api(camera1_images, machine_id, machine_identifier,
                          user_id, product_name, image_count):
-    """
-    Upload captured product images to the backend API for AI training.
-
-    Args:
-        camera1_images     (list): Paths to captured images.
-        machine_id         (str):  Machine database ID.
-        machine_identifier (str):  Machine name/code.
-        user_id            (str):  Admin user ID.
-        product_name       (str):  Name of the new product.
-        image_count        (int):  Number of images per camera.
-
-    Returns:
-        bool: True if upload succeeded (HTTP 200).
-    """
     api_url = "https://stg-sfapi.nuboxtech.com/index.php/mobile_app/product/Product/upload_product_images"
-    
+
     # Authentication credentials
     username = 'admin'
     password = '1234'
-    api_key = '123456'
+    api_key  = '123456'
 
     headers = {'x-api-key': api_key}
     payload = {
@@ -2493,15 +2390,6 @@ def upload_images_to_api(camera1_images, machine_id, machine_identifier,
 
 
 def delete_images(image_paths):
-    """
-    Delete local image files after a successful upload.
-
-    Args:
-        image_paths (list): File paths to delete.
-
-    Returns:
-        int: Number of files deleted.
-    """
     deleted = 0
     for path in image_paths:
         try:
@@ -2519,17 +2407,6 @@ def delete_images(image_paths):
 # =====================================================================
 
 class TransactionMemoryManager:
-    """
-    Aggressively frees memory after each transaction to keep the system
-    stable across 24/7 operation.
-
-    Strategy:
-    1. Track all objects (tracks, trails) created per transaction.
-    2. On transaction end: remove them from global dicts.
-    3. Recreate global dicts from scratch (forces Python to release memory).
-    4. Run multiple GC passes.
-    5. Call malloc_trim() to return freed pages to the OS (Linux only).
-    """
 
     def __init__(self):
         self.active_transactions = {}
@@ -2545,7 +2422,6 @@ class TransactionMemoryManager:
         with self.lock:
             process      = psutil.Process()
             memory_start = process.memory_info().rss / 1024 / 1024
-
             self.active_transactions[transaction_id] = {
                 'start_time':       time.time(),
                 'start_memory_mb':  memory_start,
@@ -2562,11 +2438,11 @@ class TransactionMemoryManager:
                 print(f"[Transaction] Warning: {transaction_id} not found")
                 return
 
-            trans_data  = self.active_transactions[transaction_id]
-            duration    = time.time() - trans_data['start_time']
-            process     = psutil.Process()
-            mem_before  = process.memory_info().rss / 1024 / 1024
-            mem_used    = mem_before - trans_data['start_memory_mb']
+            trans_data = self.active_transactions[transaction_id]
+            duration   = time.time() - trans_data['start_time']
+            process    = psutil.Process()
+            mem_before = process.memory_info().rss / 1024 / 1024
+            mem_used   = mem_before - trans_data['start_memory_mb']
 
             print(f"[Transaction] {transaction_id} ending | "
                   f"duration: {duration:.1f}s | memory used: {mem_used:.1f}MB")
@@ -2586,10 +2462,9 @@ class TransactionMemoryManager:
             self._aggressive_garbage_collection()
             self._release_memory_to_os()
 
-            mem_after  = process.memory_info().rss / 1024 / 1024
-            mem_freed  = mem_before - mem_after
-            print(f"[Transaction] Freed {mem_freed:.1f}MB | "
-                  f"memory now: {mem_after:.1f}MB")
+            mem_after = process.memory_info().rss / 1024 / 1024
+            mem_freed = mem_before - mem_after
+            print(f"[Transaction] Freed {mem_freed:.1f}MB | memory now: {mem_after:.1f}MB")
 
     def _cleanup_transaction_data(self, transaction_id, trans_data):
         global object_trails, global_trails, camera_movement_history
@@ -2644,7 +2519,7 @@ class TransactionMemoryManager:
 
         print("[Cleanup] Recreating global dictionaries…")
 
-        active_tracks = set()
+        active_tracks     = set()
         active_trails_set = set()
         for td in self.active_transactions.values():
             active_tracks.update(td['tracks_created'])
@@ -2716,11 +2591,11 @@ class TransactionMemoryManager:
         process     = psutil.Process()
         memory_info = process.memory_info()
         return {
-            'current_memory_mb':    memory_info.rss / 1024 / 1024,
-            'active_transactions':  len(self.active_transactions),
-            'total_transactions':   self.global_stats['total_transactions'],
-            'total_cleanups':       self.global_stats['total_cleanups'],
-            'recent_transactions':  list(self.transaction_history)[-10:]
+            'current_memory_mb':   memory_info.rss / 1024 / 1024,
+            'active_transactions': len(self.active_transactions),
+            'total_transactions':  self.global_stats['total_transactions'],
+            'total_cleanups':      self.global_stats['total_cleanups'],
+            'recent_transactions': list(self.transaction_history)[-10:]
         }
 
     def print_stats(self):
@@ -2747,54 +2622,30 @@ transaction_memory_manager = TransactionMemoryManager()
 # =====================================================================
 
 class TTSManager:
-    """
-    Manages TTS generation (gTTS) and audio playback (pygame.mixer).
-
-    Supports:
-    - Synchronous and asynchronous MP3 playback
-    - In-memory TTS generation (no disk I/O for dynamic messages)
-    - Pre-generated and cached alert files
-    - Fallback to espeak / festival when gTTS is unavailable
-    """
 
     def __init__(self):
-        self.tts_lock          = Lock()
-        self.audio_lock        = Lock()
+        self.tts_lock           = Lock()
+        self.audio_lock         = Lock()
         self.deposit_sounds_dir = "sounds/deposits"
         self.init_audio_player()
 
     def init_audio_player(self):
-        """Initialise pygame mixer for MP3 playback."""
         try:
             pygame.mixer.init(frequency=22050, size=-16, channels=2, buffer=512)
             print("Audio player initialised")
         except Exception as e:
             print(f"Error initialising audio player: {e}")
 
-    # -----------------------------------------------------------------
-    # MP3 PLAYBACK
-    # -----------------------------------------------------------------
-
     def play_mp3(self, file_path, volume=0.7, wait_for_completion=True):
-        """
-        Play an MP3 file.
-
-        Args:
-            file_path           (str):   Path to the MP3 file.
-            volume              (float): Playback volume 0.0-1.0.
-            wait_for_completion (bool):  Block until playback finishes.
-
-        Returns:
-            bool: True if playback started successfully.
-        """
         def _play():
             with self.audio_lock:
                 try:
                     if not os.path.exists(file_path):
                         print(f"MP3 not found: {file_path}")
                         return False
-                    if not file_path.lower().endswith('.mp3'):
-                        print(f"Not an MP3: {file_path}")
+                    if not file_path.lower().endswith('.mp3') and \
+                       not file_path.lower().endswith('.wav'):
+                        print(f"Unsupported format: {file_path}")
                         return False
 
                     pygame.mixer.music.load(file_path)
@@ -2817,18 +2668,12 @@ class TTSManager:
             return True
 
     def play_mp3_async(self, file_path, volume=0.7):
-        """Play MP3 asynchronously (non-blocking shortcut)."""
         return self.play_mp3(file_path, volume, wait_for_completion=False)
 
     def play_mp3_sync(self, file_path, volume=0.7):
-        """Play MP3 synchronously (blocking shortcut)."""
         return self.play_mp3(file_path, volume, wait_for_completion=True)
 
     def play_sound_effect(self, file_path, volume=0.7):
-        """
-        Play a short sound effect using pygame.mixer.Sound (can overlap
-        with music channel).
-        """
         try:
             if not os.path.exists(file_path):
                 return False
@@ -2840,12 +2685,7 @@ class TTSManager:
             print(f"Error playing sound effect: {e}")
             return False
 
-    # -----------------------------------------------------------------
-    # AUDIO CONTROL
-    # -----------------------------------------------------------------
-
     def stop_all_audio(self):
-        """Stop all audio playback immediately."""
         try:
             pygame.mixer.music.stop()
             pygame.mixer.stop()
@@ -2876,15 +2716,7 @@ class TTSManager:
         except Exception:
             return False
 
-    # -----------------------------------------------------------------
-    # DEPOSIT ALERT SYSTEM
-    # -----------------------------------------------------------------
-
     def generate_common_deposit_messages(self):
-        """
-        Pre-generate deposit alert MP3s for common products and combinations.
-        Called during system startup.
-        """
         try:
             common_products = [
                 "100plus", "coconut", "mineral",
@@ -2906,15 +2738,6 @@ class TTSManager:
             print(f"Error generating deposit messages: {e}")
 
     def generate_deposit_audio_file(self, label):
-        """
-        Generate and cache a deposit-exceeded MP3 for given product(s).
-
-        Args:
-            label (str or list): Product name(s) to mention.
-
-        Returns:
-            str: Path to the MP3 file, or None on error.
-        """
         try:
             if isinstance(label, str) and "," in label:
                 return self.generate_deposit_audio_file(
@@ -2950,12 +2773,6 @@ class TTSManager:
             return None
 
     def speak_deposit(self, label):
-        """
-        Play deposit-exceeded TTS for one or more products.
-
-        Args:
-            label (str or list): Product(s) to mention.
-        """
         try:
             if isinstance(label, str) and "," in label:
                 label = [item.strip() for item in label.split(",")]
@@ -2992,47 +2809,30 @@ class TTSManager:
             except Exception:
                 pass
 
-    # -----------------------------------------------------------------
-    # DOOR CONTROL AUDIO
-    # -----------------------------------------------------------------
-
     def generate_door_audio_files(self):
-        """Pre-generate door open/close TTS files."""
         try:
-            gTTS(text="Open the door",    lang='en', slow=False).save("sounds/door_open.mp3")
-            gTTS(text="Door is closing",  lang='en', slow=False).save("sounds/door_close.mp3")
+            gTTS(text="Open the door",   lang='en', slow=False).save("sounds/door_open.mp3")
+            gTTS(text="Door is closing", lang='en', slow=False).save("sounds/door_close.mp3")
             print("Door audio files generated")
         except Exception as e:
             print(f"Error generating door audio: {e}")
 
     def speak_door_open(self):
-        """Play the door-open announcement."""
         self.play_mp3_sync("sounds/door_open.mp3", volume=0.8)
 
     def speak_door_close(self):
-        """Play the door-closing announcement."""
         self.play_mp3_sync("sounds/door_close.mp3", volume=0.8)
-
-    # -----------------------------------------------------------------
-    # DYNAMIC TTS (real-time, non-blocking)
-    # -----------------------------------------------------------------
 
     def speak_async(self, text, lang='en'):
         """
         Speak text asynchronously using gTTS.
-
-        Generates audio in memory (no disk write) and plays it in a
-        background daemon thread — never blocks the caller.
-
-        Args:
-            text (str): Text to speak.
-            lang (str): Language code ('en', 'ms', etc.).
+        Generates audio in memory and plays in a background thread.
         """
         def _speak():
             with self.tts_lock:
                 try:
-                    tts    = gTTS(text=text, lang=lang, slow=False)
-                    buf    = io.BytesIO()
+                    tts = gTTS(text=text, lang=lang, slow=False)
+                    buf = io.BytesIO()
                     tts.write_to_fp(buf)
                     buf.seek(0)
                     pygame.mixer.music.load(buf)
@@ -3051,12 +2851,7 @@ class TTSManager:
     def speak_malay(self, text):
         self.speak_async(text, lang='ms')
 
-    # -----------------------------------------------------------------
-    # FALLBACK TTS ENGINES
-    # -----------------------------------------------------------------
-
     def fallback_speak(self, text):
-        """Fallback TTS using espeak (works offline)."""
         try:
             subprocess.run(['which', 'espeak'], check=True, capture_output=True)
             subprocess.run(
@@ -3067,7 +2862,6 @@ class TTSManager:
             self.alternative_fallback(text)
 
     def alternative_fallback(self, text):
-        """Fallback TTS using festival (works offline)."""
         try:
             subprocess.run(['which', 'festival'], check=True, capture_output=True)
             temp_file = '/tmp/tts_temp.txt'
@@ -3078,18 +2872,12 @@ class TTSManager:
         except (subprocess.CalledProcessError, FileNotFoundError):
             print(f"No TTS fallback available. Would have spoken: {text}")
 
-    # -----------------------------------------------------------------
-    # TESTING & CLEANUP
-    # -----------------------------------------------------------------
-
     def test_voice(self):
-        """Test TTS with a sample phrase."""
         self.speak_english("Testing voice clarity. Can you hear this clearly?")
         time.sleep(3)
         self.speak_malay("Ujian suara yang jelas. Boleh dengar dengan baik?")
 
     def cleanup(self):
-        """Release pygame mixer resources."""
         try:
             self.stop_all_audio()
             pygame.mixer.quit()
@@ -3104,20 +2892,11 @@ tts_manager = TTSManager()
 # WEBSOCKET ENDPOINT
 # =====================================================================
 
-done = False  # Transaction completion flag
+done = False
 
 
 @app.websocket("/ws/track")
 async def websocket_endpoint(websocket: WebSocket):
-    """
-    Primary WebSocket endpoint for mobile app communication.
-
-    Full transaction lifecycle:
-    1. Accept connection → announce door open → unlock door → LEDs green
-    2. Wait up to 5 seconds for door to open
-    3. Run tracking (detection_callback handles the AI side)
-    4. On disconnect: lock door → announce door close → LEDs red → cleanup
-    """
     global readyToProcess, done, current_pipeline_app
 
     deposit            = 0.0
@@ -3214,7 +2993,6 @@ async def websocket_endpoint(websocket: WebSocket):
 # =====================================================================
 
 async def cleanup_websocket_sounds():
-    """Stop all audio alerts when the WebSocket connection closes."""
     global camera_covered_sound_playing, price_alert_sound_playing
 
     camera_covered_sound_playing = False
@@ -3228,19 +3006,13 @@ async def cleanup_websocket_sounds():
 
 @app.get("/health")
 async def health_check():
-    """
-    Simple health check.
-
-    Returns system status, memory usage, and transaction counts.
-    Usage: curl http://<pi-ip>:8000/health
-    """
     stats = transaction_memory_manager.get_stats()
     return {
-        "status":               "healthy" if stats['current_memory_mb'] < 1000 else "warning",
-        "memory_mb":            round(stats['current_memory_mb'], 2),
-        "active_transactions":  stats['active_transactions'],
-        "total_transactions":   stats['total_transactions'],
-        "uptime_hours":         round(
+        "status":              "healthy" if stats['current_memory_mb'] < 1000 else "warning",
+        "memory_mb":           round(stats['current_memory_mb'], 2),
+        "active_transactions": stats['active_transactions'],
+        "total_transactions":  stats['total_transactions'],
+        "uptime_hours":        round(
             (time.time() - app.start_time) / 3600, 2
         ) if hasattr(app, 'start_time') else 0
     }
@@ -3248,16 +3020,10 @@ async def health_check():
 
 @app.get("/stats")
 async def get_stats():
-    """
-    Detailed statistics endpoint.
-
-    Returns memory, transaction, and recent transaction history.
-    Usage: curl http://<pi-ip>:8000/stats
-    """
     stats = transaction_memory_manager.get_stats()
     return {
         "memory": {
-            "current_mb":  round(stats['current_memory_mb'], 2),
+            "current_mb":   round(stats['current_memory_mb'], 2),
             "available_mb": round(psutil.virtual_memory().available / 1024 / 1024, 2),
             "percent":      round(psutil.virtual_memory().percent, 2)
         },
@@ -3274,19 +3040,6 @@ async def get_stats():
 # =====================================================================
 
 def main():
-    """
-    System entry point.
-
-    Steps:
-    1. Parse --host and --port arguments.
-    2. Create required directories.
-    3. Generate static audio files.
-    4. Register GPIO cleanup handler.
-    5. Start FastAPI / Uvicorn server.
-
-    Usage:
-        python app_server.py --host 0.0.0.0 --port 8000
-    """
     parser = argparse.ArgumentParser(
         description='Smart Fridge Object Detection and Tracking System'
     )
@@ -3299,9 +3052,9 @@ def main():
     app.start_time = time.time()
 
     print("Creating required directories…")
-    os.makedirs('saved_videos',   exist_ok=True)
-    os.makedirs('camera_images',  exist_ok=True)
-    os.makedirs('sounds',         exist_ok=True)
+    os.makedirs('saved_videos',    exist_ok=True)
+    os.makedirs('camera_images',   exist_ok=True)
+    os.makedirs('sounds',          exist_ok=True)
     os.makedirs('sounds/deposits', exist_ok=True)
     print("Directories ready")
 
