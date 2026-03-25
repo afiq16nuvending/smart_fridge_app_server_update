@@ -14,7 +14,7 @@ MAIN COMPONENTS:
 3. Multi-camera tracking system
 4. GPIO control for door locks, LEDs, and buzzer
 5. Transaction memory management
-6. Text-to-speech alerts (beep + spoken announcement for every entry and exit)
+6. Text-to-speech alerts (including real-time exit announcements)
 
 HARDWARE REQUIREMENTS:
 - Raspberry Pi 5 with Hailo-8L AI accelerator
@@ -29,13 +29,13 @@ WORKFLOW:
 1. Customer opens app → WebSocket connects
 2. Deposit deducted → Door unlocks → Cameras start
 3. Customer takes/returns items → AI tracks movements
-4. Price calculated in real-time → beep + TTS announces every entry and exit
+4. Price calculated in real-time → TTS announces each exit
 5. Door closes → Video saved → Refund processed
 6. System cleans up memory → Ready for next customer
 
-AUTHOR: Afiq
+AUTHOR: MIKE
 VERSION: 2.0
-LAST UPDATED: 2025
+LAST UPDATED: 24/3/26
 =====================================================================
 """
 
@@ -63,7 +63,6 @@ import hashlib
 import io
 import tempfile
 import subprocess
-import wave
 
 # Concurrency and Threading
 import threading
@@ -550,45 +549,8 @@ def setup_cover_alert_sound():
     return alert_file
 
 # =====================================================================
-# BEEP SOUND GENERATOR
+# CAMERA COVER ALERT HANDLER
 # =====================================================================
-
-def generate_beep_file(path="sounds/beep.wav", freq=880, duration=0.12, volume=0.8):
-    """
-    Generate a short sine-wave beep WAV file and save it to disk.
-
-    Played through pygame before each TTS announcement so the beep and
-    voice both come from the same speaker output.
-
-    Only generated once — skipped if the file already exists.
-
-    Args:
-        path     (str):   Output file path.
-        freq     (int):   Tone frequency in Hz (880 = high A, crisp and clear).
-        duration (float): Beep length in seconds (0.12 s is short but audible).
-        volume   (float): Amplitude scale 0.0-1.0.
-    """
-    if os.path.exists(path):
-        return
-
-    sample_rate = 22050
-    n_samples   = int(sample_rate * duration)
-    t           = np.linspace(0, duration, n_samples, endpoint=False)
-
-    # Sine wave with a short fade-out to avoid a hard click at the end
-    sine        = np.sin(2 * np.pi * freq * t)
-    fade_len    = int(n_samples * 0.2)
-    fade        = np.ones(n_samples)
-    fade[-fade_len:] = np.linspace(1.0, 0.0, fade_len)
-    samples     = (sine * fade * volume * 32767).astype(np.int16)
-
-    with wave.open(path, 'w') as wf:
-        wf.setnchannels(1)       # mono
-        wf.setsampwidth(2)       # 16-bit
-        wf.setframerate(sample_rate)
-        wf.writeframes(samples.tobytes())
-
-    print(f"Beep sound generated: {path}")
 
 def handle_cover_alert():
     """
@@ -1753,20 +1715,16 @@ def analyze_movement_direction(track_id, center, tracking_data,
     return current_direction
 
 # =====================================================================
-# PRODUCT MOVEMENT TTS ANNOUNCER
+# PRODUCT EXIT TTS ANNOUNCER
 # =====================================================================
-# Announces product entries and exits in real time via a short buzzer
-# beep followed by a TTS phrase.
+# Announces product exits in real time as items are detected leaving
+# the fridge. Completely decoupled from the GStreamer pipeline —
+# all audio fires asynchronously so the probe returns immediately.
 #
-# Exit  (item taken out) → beep + "[product] removed"
-# Entry (item put back)  → beep + "[product] added"
+# Announcement format: "1 100plus removed", "2 mangoMilk removed", etc.
 #
-# Both directions fire immediately when the counter increments.
-# All audio is asynchronous — zero impact on the GStreamer pipeline.
-#
-# To make label names sound more natural in speech, add entries to
-# SPEECH_NAMES below.
-# e.g. "mangoMilk": "mango milk"
+# Optional: add a SPEECH_NAMES dict to make labels more natural.
+# e.g. SPEECH_NAMES = {"100plus": "100 plus", "mangoMilk": "mango milk"}
 # =====================================================================
 
 SPEECH_NAMES: Dict[str, str] = {
@@ -1782,91 +1740,53 @@ SPEECH_NAMES: Dict[str, str] = {
 }
 
 
-class ProductMovementAnnouncer:
+class ProductExitAnnouncer:
     """
-    Tracks entry and exit counts per product and announces each change
-    with a short buzzer beep followed by a TTS phrase.
+    Tracks exit counts per product and speaks a TTS alert whenever
+    the count increases.
 
-    Announcement examples:
-        Item taken out → beep + "Coca-Cola removed"
-        Item put back  → beep + "Coca-Cola added"
+    Thread-safe — detection_callback runs in a GStreamer pipeline thread.
+    All audio playback is delegated to tts_manager.speak_async() which
+    is non-blocking, so the pipeline probe returns immediately.
 
-    Design:
-    - Thread-safe: detection_callback runs in a GStreamer pipeline thread.
-    - Non-blocking: beep runs in a daemon thread, TTS uses speak_async().
-    - Per-direction tracking: entry and exit counts are tracked separately
-      so putting an item back after taking it re-announces correctly.
-    - Resets cleanly between transactions via reset().
+    Call reset() at the start of each new transaction to clear state.
     """
 
     def __init__(self):
-        # Maps direction -> {label -> last announced count}
-        self._announced_counts: Dict[str, Dict[str, int]] = {
-            "exit":  {},
-            "entry": {}
-        }
+        self._announced_counts: Dict[str, int] = {}
         self._lock = threading.Lock()
 
     def reset(self):
-        """Clear all per-product counters. Call at the start of each transaction."""
+        """Clear per-product counters. Call at the start of each transaction."""
         with self._lock:
-            self._announced_counts = {"exit": {}, "entry": {}}
-        print("[MovementTTS] Announcer reset for new transaction")
+            self._announced_counts.clear()
+        print("[ExitTTS] Announcer reset for new transaction")
 
-    def _beep_and_speak(self, text: str):
+    def on_exit_count_updated(self, label: str, new_count: int):
         """
-        Play a short buzzer beep then speak the TTS phrase.
-        Runs entirely in a background daemon thread — never blocks the caller.
-
-        Beep duration is kept short (0.1 s) so it acts as an audio cue
-        rather than an interruption.
+        Called immediately after the exit counter increments for a product.
+        Speaks a TTS announcement only when the count genuinely increases.
 
         Args:
-            text (str): The phrase to speak after the beep.
-        """
-        def _run():
-            try:
-                # Play the pre-generated beep through pygame (same speaker as TTS)
-                beep_path = "sounds/beep.wav"
-                if os.path.exists(beep_path):
-                    tts_manager.play_mp3_sync(beep_path, volume=0.6)
-            except Exception as e:
-                print(f"[MovementTTS] Beep playback error: {e}")
-
-            # TTS fires right after the beep finishes
-            tts_manager.speak_async(text, lang='en')
-
-        threading.Thread(target=_run, daemon=True).start()
-
-    def on_count_updated(self, label: str, direction: str, new_count: int):
-        """
-        Call this whenever the counter for a product/direction increments.
-        Only announces when the count genuinely increases since last announcement.
-
-        Args:
-            label     (str): Product label, e.g. "100plus".
-            direction (str): "exit" (taken out) or "entry" (put back).
-            new_count (int): Updated count after the increment.
+            label     (str): Product label (e.g. "100plus").
+            new_count (int): Updated exit count after the increment.
         """
         with self._lock:
-            last = self._announced_counts[direction].get(label, 0)
-            if new_count <= last:
+            last_announced = self._announced_counts.get(label, 0)
+            if new_count <= last_announced:
                 return
-            self._announced_counts[direction][label] = new_count
+            self._announced_counts[label] = new_count
 
         spoken_name = SPEECH_NAMES.get(label, label)
+        text        = f"{new_count} {spoken_name} removed"
 
-        if direction == "exit":
-            text = f"{spoken_name} removed"
-        else:
-            text = f"{spoken_name} added"
-
-        self._beep_and_speak(text)
-        print(f"[MovementTTS] {direction.upper()} — '{text}'")
+        # Non-blocking — spins a daemon thread internally
+        tts_manager.speak_async(text, lang='en')
+        print(f"[ExitTTS] '{text}'")
 
 
 # Global instance — shared across all detection_callback invocations
-product_movement_announcer = ProductMovementAnnouncer()
+product_exit_announcer = ProductExitAnnouncer()
 
 # =====================================================================
 # MAIN DETECTION CALLBACK FUNCTION
@@ -2008,14 +1928,13 @@ def detection_callback(pad, info, callback_data):
                 user_data.tracking_data.class_counters[direction][label] += 1
 
                 # ---------------------------------------------------------
-                # MOVEMENT TTS ANNOUNCEMENT (entry + exit)
-                # Fires immediately after the counter increments.
-                # Plays a short beep then speaks the phrase.
-                # _beep_and_speak() runs in a daemon thread —
-                # zero impact on the GStreamer pipeline.
+                # EXIT TTS ANNOUNCEMENT
+                # Fires immediately after exit count increments.
+                # speak_async() is non-blocking — zero impact on the pipeline.
                 # ---------------------------------------------------------
-                new_count = user_data.tracking_data.class_counters[direction][label]
-                product_movement_announcer.on_count_updated(label, direction, new_count)
+                if direction == "exit":
+                    new_exit_count = user_data.tracking_data.class_counters["exit"][label]
+                    product_exit_announcer.on_exit_count_updated(label, new_exit_count)
                 # ---------------------------------------------------------
 
                 if direction not in user_data.tracking_data.counted_tracks:
@@ -2225,8 +2144,8 @@ async def run_tracking(websocket: WebSocket):
                 transaction_memory_manager.start_transaction(transaction_id)
                 print(f"[Memory] Transaction {transaction_id} started")
 
-            # Reset movement announcer for this transaction
-            product_movement_announcer.reset()
+            # Reset exit announcer for this transaction
+            product_exit_announcer.reset()
 
             door_monitor_active = True
             done                = True
@@ -3308,9 +3227,6 @@ def main():
     print("Setting up audio alerts…")
     setup_cover_alert_sound()
     print("Camera cover alerts ready")
-
-    generate_beep_file()
-    print("Beep sound ready")
 
     setup_product_upload_alerts()
     print("Product upload alerts ready")
