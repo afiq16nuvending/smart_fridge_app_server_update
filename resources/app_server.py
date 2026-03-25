@@ -1765,15 +1765,18 @@ class ProductMovementAnnouncer:
 
     def speak_closing_summary(self, class_counters: dict):
         """
-        Speak the end-of-transaction summary.
+        Speak the end-of-transaction summary synchronously.
 
-        This method is BLOCKING — it waits for any currently-playing
-        audio (i.e. the door-close TTS) to finish before generating and
-        playing the closing message. This guarantees the two announcements
-        never overlap regardless of how long the door-close TTS takes.
+        This method BLOCKS until the closing message has fully played.
+        It must be called after speak_door_close() has returned so the
+        two announcements never overlap.
 
-        Call this from the websocket_endpoint finally block AFTER
-        tts_manager.speak_door_close() has returned.
+        How it works:
+        1. Builds the closing message text.
+        2. Generates a gTTS MP3 into a temp file.
+        3. Plays it with play_mp3_sync (blocking) so the finally block
+           in websocket_endpoint does not continue, and the process
+           does not tear down, until the audio is fully done.
 
         Net > 0:
             "Thank you for shopping with us. The item(s) you have taken
@@ -1785,55 +1788,78 @@ class ProductMovementAnnouncer:
             class_counters (dict): tracking_data.class_counters with
                                    'entry' and 'exit' sub-dicts.
         """
-        # Build net counts per product
-        all_labels = (set(class_counters["exit"].keys()) |
-                      set(class_counters["entry"].keys()))
-        net_items  = {}
-
-        for lbl in all_labels:
-            exit_count  = class_counters["exit"].get(lbl, 0)
-            entry_count = class_counters["entry"].get(lbl, 0)
-            net         = max(0, exit_count - entry_count)
-            if net > 0:
-                net_items[lbl] = net
-
-        if not net_items:
-            message = "Thank you for visiting. Have a great day!"
-        else:
-            item_phrases = []
-            for lbl, count in net_items.items():
-                spoken_name = SPEECH_NAMES.get(lbl, lbl)
-                count_word  = number_to_words(count)
-                item_phrases.append(f"{count_word} {spoken_name}")
-
-            if len(item_phrases) == 1:
-                items_text = item_phrases[0]
-            elif len(item_phrases) == 2:
-                items_text = f"{item_phrases[0]} and {item_phrases[1]}"
-            else:
-                items_text = (", ".join(item_phrases[:-1]) +
-                              f", and {item_phrases[-1]}")
-
-            plural  = len(item_phrases) > 1
-            message = (
-                f"Thank you for shopping with us. "
-                f"The item{'s' if plural else ''} you have taken "
-                f"{'are' if plural else 'is'} {items_text}. "
-                f"Your refund will be processed shortly."
-            )
-
-        print(f"[MovementTTS] CLOSING — '{message}'")
-
-        # Wait for any currently-playing audio to finish (door-close TTS),
-        # then speak the closing message synchronously so the caller can
-        # be sure it is fully done before continuing.
         try:
-            while tts_manager.is_audio_playing():
-                time.sleep(0.1)
-        except Exception:
-            pass
+            # ----------------------------------------------------------
+            # STEP 1: Build net counts per product
+            # ----------------------------------------------------------
+            all_labels = (set(class_counters["exit"].keys()) |
+                          set(class_counters["entry"].keys()))
+            net_items  = {}
 
-        tts_manager.speak_async(message, lang='en')
+            for lbl in all_labels:
+                exit_count  = class_counters["exit"].get(lbl, 0)
+                entry_count = class_counters["entry"].get(lbl, 0)
+                net         = max(0, exit_count - entry_count)
+                if net > 0:
+                    net_items[lbl] = net
+
+            # ----------------------------------------------------------
+            # STEP 2: Compose message
+            # ----------------------------------------------------------
+            if not net_items:
+                message = "Thank you for visiting. Have a great day!"
+            else:
+                item_phrases = []
+                for lbl, count in net_items.items():
+                    spoken_name = SPEECH_NAMES.get(lbl, lbl)
+                    count_word  = number_to_words(count)
+                    item_phrases.append(f"{count_word} {spoken_name}")
+
+                if len(item_phrases) == 1:
+                    items_text = item_phrases[0]
+                elif len(item_phrases) == 2:
+                    items_text = f"{item_phrases[0]} and {item_phrases[1]}"
+                else:
+                    items_text = (", ".join(item_phrases[:-1]) +
+                                  f", and {item_phrases[-1]}")
+
+                plural  = len(item_phrases) > 1
+                message = (
+                    f"Thank you for shopping with us. "
+                    f"The item{'s' if plural else ''} you have taken "
+                    f"{'are' if plural else 'is'} {items_text}. "
+                    f"Your refund will be processed shortly."
+                )
+
+            print(f"[MovementTTS] CLOSING — '{message}'")
+
+            # ----------------------------------------------------------
+            # STEP 3: Generate to temp file and play synchronously.
+            # Using play_mp3_sync means this call blocks until the audio
+            # is fully done — no risk of the process tearing down the
+            # daemon thread mid-sentence.
+            # ----------------------------------------------------------
+            os.makedirs("sounds/closing", exist_ok=True)
+            closing_path = "sounds/closing/closing_summary.mp3"
+
+            tts = gTTS(text=message, lang='en', slow=False)
+            tts.save(closing_path)
+
+            self.play_mp3_sync(closing_path, volume=0.8)
+
+        except Exception as e:
+            print(f"[MovementTTS] Error in closing summary: {e}")
+
+    def play_mp3_sync(self, file_path, volume=0.8):
+        """Play an audio file synchronously through pygame (blocking)."""
+        try:
+            pygame.mixer.music.load(file_path)
+            pygame.mixer.music.set_volume(volume)
+            pygame.mixer.music.play()
+            while pygame.mixer.music.get_busy():
+                time.sleep(0.1)
+        except Exception as e:
+            print(f"[MovementTTS] play_mp3_sync error: {e}")
 
 
 # Global instance — shared across all detection_callback invocations
@@ -3051,6 +3077,7 @@ def main():
     os.makedirs('camera_images',   exist_ok=True)
     os.makedirs('sounds',          exist_ok=True)
     os.makedirs('sounds/deposits', exist_ok=True)
+    os.makedirs('sounds/closing',  exist_ok=True)
     print("Directories ready")
 
     print("Setting up audio alerts…")
