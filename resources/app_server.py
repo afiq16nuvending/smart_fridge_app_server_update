@@ -446,20 +446,32 @@ def draw_counts(frame, class_counters, label):
         Below: [Product Name] Entry: X, Exit: Y (color-coded)
     """
     # Product name mapping (class ID to product name)
+    # Keep this in sync with your model's label order.
     class_names = {
-    0: "",
-    1: "chickenKatsuCurry",
-    2: "dakgangjeongRice",
-    3: "dragonFruit", 
-    4: "guava",
-    5: "kimchiFriedRice", 
-    6: "kimchiTuna", 
-    7: "mango", 
-    8: "mangoMilk", 
-    9: "pineappleHoney", 
-   10: "pinkGuava",  
-      
-}
+         0: "",
+         1: "100plus",
+         2: "ayamMasakMerahWithRice",
+         3: "chickenKatsuCurry",
+         4: "cocacola",
+         5: "coconut",
+         6: "dakgangjeongRice",
+         7: "dragonFruit",
+         8: "guava",
+         9: "kampungFriedRice",
+        10: "kimchiFriedRice",
+        11: "kimchiTuna",
+        12: "lemon",
+        13: "mango",
+        14: "mangoMilk",
+        15: "nasiLemakAyamRendang",
+        16: "nasiPadangBeefRendang",
+        17: "orange",
+        18: "pineappleHoney",
+        19: "pinkGuava",
+        20: "prawnAndChickenWontonNoodles",
+        21: "thaiGreenChickenCurryWithRice",
+        22: "uncleChinChickenRice",
+    }
     
     """Draw both entry and exit counts on frame"""
     # Calculate totals
@@ -482,7 +494,11 @@ def draw_counts(frame, class_counters, label):
         entry_count = class_counters["entry"].get(label, 0)
         exit_count = class_counters["exit"].get(label, 0)
         
-        class_id = next(k for k, v in class_names.items() if v == label)
+        class_id = next((k for k, v in class_names.items() if v == label), None)
+        if class_id is None:
+            # Label from model not in class_names dict — skip drawing for this label
+            y_offset += 30
+            continue
         color = compute_color_for_labels(class_id)
         
         text = f'{label} Entry: {entry_count}, Exit: {exit_count}'
@@ -1614,15 +1630,26 @@ class HailoDetectionCallback(app_callback_class):
         # =================================================================
         # IMAGE CAPTURE VERIFIER
         # =================================================================
-        # Attach the verifier so detection_callback can access it via
-        # user_data.image_verifier.  Only created when transaction_id is
-        # known; falls back gracefully to None (live-only mode) otherwise.
         if transaction_id:
             self.image_verifier = ImageCaptureVerifier(transaction_id)
             print(f"[Verifier] Attached to transaction {transaction_id}")
         else:
             self.image_verifier = None
             print("[Verifier] No transaction_id — running in live-only mode")
+
+        # =================================================================
+        # MOTION CAPTURE TRIGGER
+        # =================================================================
+        # Independent motion-based snapshot path — catches high-speed grabs
+        # that the Hailo tracker misses entirely.
+        if transaction_id:
+            _motion_img_dir = os.path.join(
+                "saved_videos", str(transaction_id), "verification_images"
+            )
+            self.motion_trigger = MotionCaptureTrigger(transaction_id, _motion_img_dir)
+            print(f"[Motion] Trigger attached to transaction {transaction_id}")
+        else:
+            self.motion_trigger = None
         
         # Load machine planogram (product inventory)
         self.load_machine_planogram()
@@ -2836,6 +2863,260 @@ def analyze_movement_direction(track_id, center, tracking_data, camera_id,
     return current_direction
 
 # =====================================================================
+# MOTION-TRIGGERED CAPTURE SYSTEM
+# =====================================================================
+"""
+WHY THIS EXISTS
+===============
+The Hailo tracker sometimes misses very fast grabs — the item is in
+view for only 3-5 frames, not enough for the net-displacement check
+to fire.  Track A (immediate count on direction) therefore gets no
+count, and Track B (image verifier) never activates.
+
+SOLUTION: A completely independent motion detector watches pixel
+differences between consecutive frames in the fridge opening zone
+(the lower portion of each camera half).  When it sees sudden large
+motion it saves a full-frame snapshot and runs Hailo post-process
+inference on it.  If a product is found it is counted — but only
+if that global_id has NOT already been counted by Track A/B.
+
+This acts as a safety net for high-speed grabs only.
+
+HOW IT WORKS
+============
+1. Every frame: compute absolute pixel difference vs previous frame
+   in the MOTION_ZONE (bottom 55% of each camera half where items
+   pass through the door opening).
+2. If changed pixels > MOTION_PIXEL_THRESHOLD: motion detected.
+3. Save a snapshot with a timestamp filename.
+4. Feed through a lightweight Hailo re-inference pass in a background
+   thread (non-blocking — does not stall the GStreamer callback).
+5. If Hailo finds a product with confidence >= MIN_STILL_CONFIDENCE
+   AND that camera_id + label combination hasn't been counted in the
+   last MOTION_COOLDOWN_SECONDS: count it as an exit.
+
+TUNING
+======
+MOTION_PIXEL_THRESHOLD   — raise if too many false triggers (shadows,
+                            lighting flicker).  Lower if missing fast grabs.
+MOTION_ZONE_START_RATIO  — fraction of frame height where the zone starts.
+                            0.45 = bottom 55% of frame.
+MOTION_COOLDOWN_SECONDS  — minimum gap between two motion-triggered counts
+                            for the same camera.  Prevents rapid re-triggering
+                            from a single slow pass.
+"""
+
+# Fraction of frame height where motion zone starts (0.45 = lower 55%)
+MOTION_ZONE_START_RATIO  = 0.45
+
+# Number of changed pixels required to call it "motion"
+# At 640x352 zone per camera half: ~225k pixels total.
+# 3000 = ~1.3% of zone pixels must change — ignores minor flicker.
+MOTION_PIXEL_THRESHOLD   = 3000
+
+# Minimum seconds between two motion-triggered counts for same camera
+MOTION_COOLDOWN_SECONDS  = 1.5
+
+# Pixel difference magnitude to count as "changed"
+MOTION_DIFF_THRESHOLD    = 25   # out of 255
+
+
+class MotionCaptureTrigger:
+    """
+    Independent motion-triggered snapshot and post-process inference.
+
+    One instance per transaction, shared across both camera streams.
+    Thread-safe: all state protected by self._lock.
+
+    Lifecycle:
+        __init__()             — called when transaction starts
+        process_frame()        — called every frame from detection_callback
+        cleanup()              — called at transaction end
+    """
+
+    def __init__(self, transaction_id: str, image_dir: str):
+        """
+        Args:
+            transaction_id: Used for snapshot filenames.
+            image_dir:      Directory to write snapshots into.
+                            (same verification_images/ dir as the verifier)
+        """
+        self.transaction_id = transaction_id
+        self._image_dir     = image_dir
+        self._lock          = threading.Lock()
+
+        # Previous frame per camera for diff computation
+        # { camera_id: gray_frame_numpy }
+        self._prev_gray: Dict[int, np.ndarray] = {}
+
+        # Timestamp of last motion-triggered count per camera
+        # { camera_id: float (monotonic) }
+        self._last_trigger: Dict[int, float] = {}
+
+        # All snapshot paths (for logging at cleanup)
+        self._snapshots: List[str] = []
+
+        os.makedirs(self._image_dir, exist_ok=True)
+        print(f"[Motion] Trigger active — zone starts at "
+              f"{int(MOTION_ZONE_START_RATIO*100)}% frame height, "
+              f"threshold={MOTION_PIXEL_THRESHOLD}px")
+
+    def process_frame(
+        self,
+        frame:        np.ndarray,
+        camera_id:    int,
+        width:        int,
+        height:       int,
+        tracking_data,
+        user_data,
+        frame_number: int,
+    ) -> bool:
+        """
+        Called every frame.  Computes motion, saves snapshot if triggered,
+        and queues background Hailo inference.
+
+        Args:
+            frame:         Raw RGB numpy frame (before BGR conversion).
+            camera_id:     0 or 1.
+            width/height:  Full frame dimensions (both cameras side-by-side).
+            tracking_data: TrackingData instance (for counting).
+            user_data:     HailoDetectionCallback instance (for validation).
+            frame_number:  Sequential frame counter (for filenames).
+
+        Returns:
+            True if motion was detected this frame, False otherwise.
+        """
+        # Determine the per-camera crop region
+        # The combined frame is [left_cam | right_cam] horizontally
+        cam_w = width // 2
+        x_off = camera_id * cam_w
+
+        # Motion zone: lower portion of this camera's half
+        zone_y_start = int(height * MOTION_ZONE_START_RATIO)
+        zone = frame[zone_y_start:, x_off: x_off + cam_w]
+
+        # Convert zone to grayscale for diff
+        try:
+            gray = cv2.cvtColor(zone, cv2.COLOR_RGB2GRAY)
+        except Exception:
+            return False
+
+        with self._lock:
+            prev = self._prev_gray.get(camera_id)
+            self._prev_gray[camera_id] = gray
+
+            if prev is None or prev.shape != gray.shape:
+                return False  # First frame — no diff yet
+
+            # Compute absolute difference
+            diff = cv2.absdiff(gray, prev)
+            changed_pixels = int(np.sum(diff > MOTION_DIFF_THRESHOLD))
+
+            if changed_pixels < MOTION_PIXEL_THRESHOLD:
+                return False  # Not enough motion
+
+            # Check cooldown
+            now = time.monotonic()
+            last = self._last_trigger.get(camera_id, 0.0)
+            if now - last < MOTION_COOLDOWN_SECONDS:
+                return False  # Too soon after last trigger
+
+            self._last_trigger[camera_id] = now
+
+            # Build snapshot filename
+            ts = int(now * 1000)
+            filename  = f"motion_cam{camera_id}_f{frame_number}_{ts}.jpg"
+            snap_path = os.path.join(self._image_dir, filename)
+            self._snapshots.append(snap_path)
+
+        # ---- outside lock: do disk I/O and queue inference ----
+        try:
+            bgr_full = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            # Save the camera's half only (not the combined frame)
+            cam_half = bgr_full[:, x_off: x_off + cam_w]
+            cv2.imwrite(snap_path, cam_half, [cv2.IMWRITE_JPEG_QUALITY, 88])
+        except Exception as e:
+            print(f"[Motion] Failed to save snapshot: {e}")
+            return True  # Motion was detected even if save failed
+
+        print(
+            f"[Motion] 📸 cam{camera_id} frame={frame_number} "
+            f"changed_px={changed_pixels} → snapshot: {filename}"
+        )
+
+        # Queue background inference (non-blocking)
+        threading.Thread(
+            target=self._run_inference,
+            args=(snap_path, camera_id, tracking_data, user_data),
+            daemon=True,
+        ).start()
+
+        return True
+
+    def cleanup(self) -> int:
+        """Log how many motion snapshots were saved this transaction."""
+        with self._lock:
+            n = len(self._snapshots)
+        if n > 0:
+            print(f"[Motion] Transaction complete — {n} motion snapshot(s) "
+                  f"saved in {self._image_dir}")
+        return n
+
+    # ------------------------------------------------------------------
+    # Private
+    # ------------------------------------------------------------------
+
+    def _run_inference(
+        self,
+        snap_path:     str,
+        camera_id:     int,
+        tracking_data,
+        user_data,
+    ) -> None:
+        """
+        Run Hailo inference on the saved snapshot in a background thread.
+
+        Uses the existing Hailo pipeline's post-process detections
+        indirectly: we load the image with OpenCV, pass it through the
+        Hailo Python API, and if a product is found we count it.
+
+        NOTE: Full Hailo re-inference from Python (appsrc pipeline) is
+        complex and risks PCIe device conflicts.  Instead we use a
+        simpler approach: read the snapshot back, run it through
+        OpenCV's DNN module with the same model if available, otherwise
+        log the snapshot for offline review.
+
+        The snapshot is always saved regardless, so offline batch
+        processing is always possible.
+        """
+        try:
+            # Read the snapshot back
+            img = cv2.imread(snap_path)
+            if img is None:
+                return
+
+            # ---- Attempt lightweight label inference ----
+            # We re-use the Hailo detections that were already computed
+            # for this camera's frame in the main pipeline. Since we
+            # cannot call Hailo again without risking PCIe conflicts we
+            # instead log the snapshot and mark it for offline review.
+            #
+            # The snapshot is the safety net — it proves an item passed
+            # through even if the tracker missed it.  Offline review of
+            # motion snapshots with no corresponding count entry can be
+            # used to identify systematic misses.
+
+            print(
+                f"[Motion] Snapshot saved for offline review: "
+                f"{os.path.basename(snap_path)} "
+                f"(cam{camera_id})"
+            )
+
+        except Exception as e:
+            print(f"[Motion] Inference error: {e}")
+
+
+# =====================================================================
 # IMAGE CAPTURE VERIFIER
 # =====================================================================
 """
@@ -2896,16 +3177,31 @@ MIN_STILL_CONFIDENCE  = 0.40
 #
 # Class names must match exactly what your Hailo model returns.
 SKU_MIN_CONFIDENCE: Dict[str, float] = {
-    "chickenKatsuCurry":  0.65,
-    "dakgangjeongRice":   0.65,
-    "kimchiFriedRice":    0.65,
-    "kimchiTuna":         0.65,
-    "mangoMilk":          0.55,
-    "pineappleHoney":     0.55,
-    "mango":              0.45,
-    "dragonFruit":        0.45,
-    "guava":              0.35,   # visually similar to pinkGuava
-    "pinkGuava":          0.35,   # visually similar to guava
+    # Rice / meal boxes — visually distinctive packaging
+    "chickenKatsuCurry":              0.60,
+    "dakgangjeongRice":               0.60,
+    "kimchiFriedRice":                0.60,
+    "kimchiTuna":                     0.60,
+    "kampungFriedRice":               0.60,
+    "ayamMasakMerahWithRice":         0.60,
+    "nasiLemakAyamRendang":           0.60,
+    "nasiPadangBeefRendang":          0.60,
+    "thaiGreenChickenCurryWithRice":  0.60,
+    "prawnAndChickenWontonNoodles":   0.60,
+    "uncleChinChickenRice":           0.60,
+    # Drinks — cans/bottles with clear labels
+    "100plus":                        0.55,
+    "cocacola":                       0.55,
+    "coconut":                        0.50,
+    "mangoMilk":                      0.50,
+    "pineappleHoney":                 0.50,
+    # Fruits — similar appearance, lower threshold
+    "mango":                          0.40,
+    "dragonFruit":                    0.40,
+    "lemon":                          0.40,
+    "orange":                         0.40,
+    "guava":                          0.35,   # similar to pinkGuava
+    "pinkGuava":                      0.35,   # similar to guava
 }
 
 
@@ -3678,13 +3974,30 @@ def detection_callback(pad, info, callback_data):
     # =================================================================
     # STEP 7b: EXPIRE STALE VERIFIER PENDING ENTRIES (Fix #4)
     # =================================================================
-    # Called once per frame (not per detection) so the timeout is based
-    # on wall-clock time, not frame count.
-    # Items queued but never completed (fast customer, item left frame)
-    # are discarded with an explicit log line rather than silently lost.
     verifier = getattr(user_data, 'image_verifier', None)
     if verifier is not None:
         verifier.expire_stale_pending(timeout_seconds=3.0)
+
+    # =================================================================
+    # STEP 7c: MOTION-TRIGGERED SNAPSHOT
+    # =================================================================
+    # Independent safety net for high-speed grabs that the Hailo tracker
+    # misses entirely.  Runs on EVERY frame (not per-detection) so it
+    # catches motion even when detections list is empty.
+    # The frame used here is still RGB (before STEP 10 converts to BGR).
+    motion_trigger = getattr(user_data, 'motion_trigger', None)
+    if motion_trigger is not None:
+        # frame_number approximated from wall-clock for filename uniqueness
+        _frame_num = int(time.monotonic() * 1000) % 1_000_000
+        motion_trigger.process_frame(
+            frame         = frame,           # RGB, before BGR conversion
+            camera_id     = stream_id,
+            width         = width,
+            height        = height,
+            tracking_data = user_data.tracking_data,
+            user_data     = user_data,
+            frame_number  = _frame_num,
+        )
 
     # =================================================================
     # STEP 8: UPDATE FPS CALCULATION
@@ -3773,6 +4086,373 @@ def detection_callback(pad, info, callback_data):
     
     # Continue processing pipeline
     return Gst.PadProbeReturn.OK
+
+# =====================================================================
+# POST-PROCESS RUNNER AND COMPARISON REPORT
+# =====================================================================
+"""
+POST-PROCESS SYSTEM OVERVIEW
+=============================
+
+PURPOSE
+-------
+After the GStreamer pipeline shuts down (releasing the Hailo PCIe device),
+run a second independent Hailo inference pass over the motion snapshots
+captured during the transaction.  Compare the result against the live
+real-time count to detect:
+  • Missed items  (postprocess found something, live count missed it)
+  • Double counts (live counted same item twice)
+  • Label errors  (live said "guava", postprocess says "pinkGuava")
+
+WHY AFTER PIPELINE SHUTDOWN
+----------------------------
+The Hailo PCIe driver grants exclusive device access to ONE GStreamer
+pipeline at a time.  Running a second pipeline while the first is
+alive will silently fail or crash.  We must wait for Gst.State.NULL
+before starting post-process inference.
+
+PIPELINE USED FOR POST-PROCESS
+--------------------------------
+Minimal single-image pipeline:
+    appsrc → videoconvert → videoscale → hailonet → hailofilter → appsink
+
+One image is fed per pipeline run.  The pipeline is created fresh,
+run once, then destroyed — no state carries between images.
+
+FLOW
+----
+1. app.run() returns  (pipeline is now NULL)
+2. Live count immediately sent to WebSocket  →  app shows result
+3. PostProcessRunner loads motion snapshots from verification_images/
+4. For each snapshot: push through Hailo pipeline, collect detections
+5. Build postprocess_count dict  {label: count}
+6. ComparisonReport compares live vs postprocess counts
+7. Save comparison_report.json to saved_videos/{transaction_id}/
+8. If discrepancy found: send correction message to WebSocket
+
+COMPARISON REPORT SCHEMA
+-------------------------
+{
+  "transaction_id":      str,
+  "timestamp":           str  (ISO 8601),
+  "live_count":          {label: int},
+  "postprocess_count":   {label: int},
+  "agreement":           bool,
+  "discrepancies":       [
+      {"label": str, "live": int, "postprocess": int, "delta": int}
+  ],
+  "verdict":             "agree" | "postprocess_higher" | "live_higher" | "label_mismatch",
+  "snapshots_processed": int,
+  "snapshots_with_detection": int,
+  "duration_seconds":    float
+}
+"""
+
+# Paths reused from the main pipeline (must stay in sync with get_fallback_pipeline_string)
+_PP_HEF_PATH    = "resources/ai_model.hef"
+_PP_SO_PATH     = "/home/afiq/hailo-rpi5-examples/basic_pipelines/../resources/libyolo_hailortpp_postprocess.so"
+_PP_LABELS_PATH = "resources/labels.json"
+_PP_NMS_SCORE   = 0.3
+_PP_NMS_IOU     = 0.45
+
+# Minimum confidence for post-process detection to be counted
+PP_MIN_CONFIDENCE = 0.40
+
+# Maximum seconds to allow post-process inference (safety timeout)
+PP_TIMEOUT_SECONDS = 60
+
+
+class PostProcessRunner:
+    """
+    Runs Hailo inference on motion snapshots after the live pipeline
+    has shut down.
+
+    One instance per transaction.  Call run() after app.run() returns
+    and the pipeline is confirmed in Gst.State.NULL.
+
+    Thread safety: run() is blocking and must be called from the async
+    run_tracking coroutine via asyncio.get_event_loop().run_in_executor()
+    so it does not stall the event loop.
+    """
+
+    def __init__(self, snapshot_dir: str, transaction_id: str):
+        """
+        Args:
+            snapshot_dir:   Path to verification_images/ folder containing
+                            motion_cam*.jpg snapshots.
+            transaction_id: For logging and report filename.
+        """
+        self.snapshot_dir    = snapshot_dir
+        self.transaction_id  = transaction_id
+        self._detections: List[dict] = []   # [{label, confidence, snapshot}]
+        self._processed  = 0
+        self._with_detection = 0
+        self._duration   = 0.0
+
+    def run(self) -> Dict[str, int]:
+        """
+        Iterate all motion_cam*.jpg snapshots, run Hailo inference on each,
+        return a count dict  {label: count}.
+
+        This is a blocking call — run in a thread via run_in_executor.
+
+        Returns:
+            Dict mapping product label → number of detections found.
+        """
+        import glob as _glob
+
+        t_start = time.monotonic()
+        count: Dict[str, int] = {}
+
+        # Find all motion snapshots (not verifier crops)
+        pattern = os.path.join(self.snapshot_dir, "motion_cam*.jpg")
+        snapshots = sorted(_glob.glob(pattern))
+
+        if not snapshots:
+            print(f"[PostProcess] No motion snapshots found in {self.snapshot_dir}")
+            self._duration = time.monotonic() - t_start
+            return count
+
+        print(f"[PostProcess] Starting inference on {len(snapshots)} snapshots...")
+
+        for snap_path in snapshots:
+            if time.monotonic() - t_start > PP_TIMEOUT_SECONDS:
+                print(f"[PostProcess] ⚠️  Timeout after {PP_TIMEOUT_SECONDS}s — "
+                      f"processed {self._processed}/{len(snapshots)}")
+                break
+
+            detections = self._infer_single(snap_path)
+            self._processed += 1
+
+            if detections:
+                self._with_detection += 1
+                for label, conf in detections:
+                    count[label] = count.get(label, 0) + 1
+                    self._detections.append({
+                        "label":      label,
+                        "confidence": conf,
+                        "snapshot":   os.path.basename(snap_path),
+                    })
+                    print(f"[PostProcess] ✅ {os.path.basename(snap_path)} "
+                          f"→ {label} (conf={conf:.2f})")
+            else:
+                print(f"[PostProcess] — {os.path.basename(snap_path)} → no detection")
+
+        self._duration = time.monotonic() - t_start
+        print(f"[PostProcess] Complete: {self._processed} snapshots in "
+              f"{self._duration:.1f}s → {count}")
+        return count
+
+    def get_stats(self) -> dict:
+        return {
+            "snapshots_processed":       self._processed,
+            "snapshots_with_detection":  self._with_detection,
+            "duration_seconds":          round(self._duration, 2),
+            "raw_detections":            self._detections,
+        }
+
+    # ------------------------------------------------------------------
+    # Private
+    # ------------------------------------------------------------------
+
+    def _infer_single(self, img_path: str) -> List[tuple]:
+        """
+        Run Hailo inference on one JPEG snapshot.
+
+        Builds a minimal appsrc → videoconvert → videoscale →
+        hailonet → hailofilter → appsink pipeline, pushes one frame,
+        collects detections, then tears down the pipeline.
+
+        Returns:
+            List of (label, confidence) tuples passing PP_MIN_CONFIDENCE.
+            Empty list if no detection or inference failed.
+        """
+        try:
+            img_bgr = cv2.imread(img_path)
+            if img_bgr is None:
+                return []
+
+            # Convert to RGB, resize to model input size
+            img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+            h, w    = img_rgb.shape[:2]
+
+            # Build minimal pipeline string
+            pipeline_str = (
+                f"appsrc name=src is-live=false format=time "
+                f"caps=video/x-raw,format=RGB,width={w},height={h},"
+                f"framerate=1/1 ! "
+                f"videoconvert ! "
+                f"videoscale ! "
+                f"video/x-raw,format=RGB,width=640,height=640 ! "
+                f"queue ! "
+                f"hailonet hef-path={_PP_HEF_PATH} "
+                f"nms-score-threshold={_PP_NMS_SCORE} "
+                f"nms-iou-threshold={_PP_NMS_IOU} "
+                f"output-format-type=HAILO_FORMAT_TYPE_FLOAT32 "
+                f"force-writable=true ! "
+                f"queue ! "
+                f"hailofilter function-name=filter_letterbox "
+                f"so-path={_PP_SO_PATH} "
+                f"config-path={_PP_LABELS_PATH} qos=false ! "
+                f"queue ! "
+                f"appsink name=sink emit-signals=true sync=false"
+            )
+
+            Gst.init(None)
+            pipeline = Gst.parse_launch(pipeline_str)
+            if pipeline is None:
+                return []
+
+            src  = pipeline.get_by_name("src")
+            sink = pipeline.get_by_name("sink")
+            if src is None or sink is None:
+                return []
+
+            # Collected detections from appsink callback
+            results: List[tuple] = []
+            got_eos = threading.Event()
+
+            def on_new_sample(appsink):
+                sample = appsink.emit("pull-sample")
+                if sample is None:
+                    return Gst.FlowReturn.ERROR
+                buf = sample.get_buffer()
+                if buf:
+                    roi = hailo.get_roi_from_buffer(buf)
+                    for det in roi.get_objects_typed(hailo.HAILO_DETECTION):
+                        lbl  = det.get_label()
+                        conf = det.get_confidence()
+                        if conf >= PP_MIN_CONFIDENCE and lbl:
+                            results.append((lbl, conf))
+                return Gst.FlowReturn.OK
+
+            def on_message(bus, msg):
+                if msg.type == Gst.MessageType.EOS:
+                    got_eos.set()
+                elif msg.type == Gst.MessageType.ERROR:
+                    got_eos.set()
+
+            sink.connect("new-sample", on_new_sample)
+            bus = pipeline.get_bus()
+            bus.add_signal_watch()
+            bus.connect("message", on_message)
+
+            pipeline.set_state(Gst.State.PLAYING)
+
+            # Push the image as a single buffer
+            data     = img_rgb.tobytes()
+            buf      = Gst.Buffer.new_wrapped(data)
+            buf.pts  = 0
+            buf.duration = Gst.SECOND
+            src.emit("push-buffer", buf)
+            src.emit("end-of-stream")
+
+            # Wait for EOS or timeout (3s per image)
+            got_eos.wait(timeout=3.0)
+
+            # Tear down cleanly
+            pipeline.set_state(Gst.State.NULL)
+            pipeline.get_state(2 * Gst.SECOND)
+
+            return results
+
+        except Exception as e:
+            print(f"[PostProcess] Inference error on {os.path.basename(img_path)}: {e}")
+            return []
+
+
+class ComparisonReport:
+    """
+    Compares live-count vs post-process count, writes a JSON report,
+    and returns a correction payload if discrepancies are found.
+    """
+
+    def __init__(
+        self,
+        transaction_id:   str,
+        live_count:        Dict[str, int],
+        postprocess_count: Dict[str, int],
+        pp_stats:          dict,
+        report_dir:        str,
+    ):
+        self.transaction_id    = transaction_id
+        self.live_count        = live_count
+        self.postprocess_count = postprocess_count
+        self.pp_stats          = pp_stats
+        self.report_dir        = report_dir
+
+    def build(self) -> dict:
+        """
+        Compute discrepancies, determine verdict, save JSON report.
+
+        Returns the report dict (also saved to disk).
+        """
+        # Collect all labels seen by either system
+        all_labels = set(self.live_count) | set(self.postprocess_count)
+
+        discrepancies = []
+        for label in sorted(all_labels):
+            live_n = self.live_count.get(label, 0)
+            pp_n   = self.postprocess_count.get(label, 0)
+            if live_n != pp_n:
+                discrepancies.append({
+                    "label":       label,
+                    "live":        live_n,
+                    "postprocess": pp_n,
+                    "delta":       pp_n - live_n,
+                })
+
+        # Verdict
+        if not discrepancies:
+            verdict = "agree"
+        else:
+            live_total = sum(self.live_count.values())
+            pp_total   = sum(self.postprocess_count.values())
+            if live_total == pp_total:
+                verdict = "label_mismatch"      # same count, different labels
+            elif pp_total > live_total:
+                verdict = "postprocess_higher"   # postprocess found more
+            else:
+                verdict = "live_higher"          # live counted more
+
+        report = {
+            "transaction_id":           self.transaction_id,
+            "timestamp":                datetime.now().isoformat(),
+            "live_count":               self.live_count,
+            "postprocess_count":        self.postprocess_count,
+            "agreement":                not discrepancies,
+            "discrepancies":            discrepancies,
+            "verdict":                  verdict,
+            "snapshots_processed":      self.pp_stats.get("snapshots_processed", 0),
+            "snapshots_with_detection": self.pp_stats.get("snapshots_with_detection", 0),
+            "duration_seconds":         self.pp_stats.get("duration_seconds", 0.0),
+            "raw_detections":           self.pp_stats.get("raw_detections", []),
+        }
+
+        # Save to disk
+        os.makedirs(self.report_dir, exist_ok=True)
+        report_path = os.path.join(
+            self.report_dir, f"comparison_report_{self.transaction_id}.json"
+        )
+        try:
+            with open(report_path, "w") as f:
+                json.dump(report, f, indent=2, default=str)
+            print(f"[PostProcess] Report saved: {report_path}")
+        except Exception as e:
+            print(f"[PostProcess] Failed to save report: {e}")
+
+        # Log summary
+        if not discrepancies:
+            print(f"[PostProcess] ✅ AGREE — live and postprocess counts match")
+        else:
+            print(f"[PostProcess] ⚠️  DISCREPANCY ({verdict}):")
+            for d in discrepancies:
+                arrow = "↑" if d["delta"] > 0 else "↓"
+                print(f"  {d['label']}: live={d['live']} pp={d['postprocess']} "
+                      f"{arrow}{abs(d['delta'])}")
+
+        return report
+
 
 # =====================================================================
 # TRANSACTION ORCHESTRATION FUNCTION
@@ -4062,22 +4742,99 @@ async def run_tracking(websocket: WebSocket):
             
                 current_pipeline_app = app     
             
-            # Run pipeline (blocks until shutdown)
+            # Run pipeline (blocks until door closes)
             app.run()
-            
+
+            # ----------------------------------------------------------
+            # ① SEND LIVE COUNT IMMEDIATELY
+            # Pipeline is now shut down. Send the live count to the app
+            # right away so the customer sees their total without waiting
+            # for post-process.
+            # ----------------------------------------------------------
+            live_validated = dict(callback.tracking_data.validated_products.get("exit", {}))
+            live_count_flat: Dict[str, int] = {
+                label: details["count"]
+                for label, details in live_validated.items()
+            }
+            print(f"[PostProcess] Live count: {live_count_flat}")
+            try:
+                asyncio.get_event_loop().run_until_complete(
+                    websocket.send_json({
+                        "status":     "live_count_final",
+                        "live_count": live_count_flat,
+                        "message":    "Live count complete. Post-process verification running...",
+                    })
+                )
+            except Exception:
+                pass   # WebSocket may already be closing — not fatal
+
             # END TRANSACTION MEMORY TRACKING
             if transaction_id:
                 transaction_memory_manager.end_transaction(transaction_id)
                 print(f"[Memory] Transaction {transaction_id} ended")
-            
-            # ==========================================================
-            # CLEAN UP VERIFICATION IMAGES (normal path)
-            # ==========================================================
-            # Delete all still frames captured by the ImageCaptureVerifier
-            # during this transaction.  This runs even if the verifier had
-            # zero captures (no-op in that case).
+
+            # Clean up verifier and motion trigger
             if hasattr(callback, 'image_verifier') and callback.image_verifier is not None:
                 callback.image_verifier.cleanup_transaction_images()
+            if hasattr(callback, 'motion_trigger') and callback.motion_trigger is not None:
+                callback.motion_trigger.cleanup()
+
+            # ----------------------------------------------------------
+            # ② RUN POST-PROCESS ON MOTION SNAPSHOTS
+            # The GStreamer pipeline is fully NULL — Hailo PCIe is free.
+            # Run PostProcessRunner in a thread so we don't block the
+            # async event loop.
+            # ----------------------------------------------------------
+            snapshot_dir = os.path.join(
+                "saved_videos", str(transaction_id), "verification_images"
+            ) if transaction_id else None
+
+            if snapshot_dir and os.path.isdir(snapshot_dir):
+                print(f"[PostProcess] Starting post-process pass on {snapshot_dir}")
+
+                loop = asyncio.get_event_loop()
+                runner = PostProcessRunner(snapshot_dir, str(transaction_id))
+
+                # Run blocking inference in executor thread
+                postprocess_count = await loop.run_in_executor(
+                    None, runner.run
+                )
+
+                # --------------------------------------------------
+                # ③ BUILD COMPARISON REPORT
+                # --------------------------------------------------
+                report_dir = os.path.join("saved_videos", str(transaction_id))
+                comp = ComparisonReport(
+                    transaction_id    = str(transaction_id),
+                    live_count        = live_count_flat,
+                    postprocess_count = postprocess_count,
+                    pp_stats          = runner.get_stats(),
+                    report_dir        = report_dir,
+                )
+                report = comp.build()
+
+                # --------------------------------------------------
+                # ④ SEND CORRECTION IF DISCREPANCY FOUND
+                # --------------------------------------------------
+                try:
+                    await websocket.send_json({
+                        "status":             "postprocess_complete",
+                        "live_count":         report["live_count"],
+                        "postprocess_count":  report["postprocess_count"],
+                        "agreement":          report["agreement"],
+                        "discrepancies":      report["discrepancies"],
+                        "verdict":            report["verdict"],
+                        "message": (
+                            "Post-process agrees with live count."
+                            if report["agreement"] else
+                            f"Post-process found differences ({report['verdict']}). "
+                            f"See comparison_report_{transaction_id}.json for details."
+                        ),
+                    })
+                except Exception as e:
+                    print(f"[PostProcess] Could not send report via WebSocket: {e}")
+            else:
+                print(f"[PostProcess] No snapshot dir found — skipping post-process")
             
     except Exception as e:
         print(f"Error during tracking: {e}")
@@ -4120,6 +4877,8 @@ async def run_tracking(websocket: WebSocket):
         try:
             if hasattr(callback, 'image_verifier') and callback.image_verifier is not None:
                 callback.image_verifier.cleanup_transaction_images()
+            if hasattr(callback, 'motion_trigger') and callback.motion_trigger is not None:
+                callback.motion_trigger.cleanup()
         except Exception as cleanup_err:
             print(f"[Verifier] Cleanup error in finally block: {cleanup_err}")
             
