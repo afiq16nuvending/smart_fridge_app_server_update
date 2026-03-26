@@ -2836,7 +2836,7 @@ class TTSManager:
     def generate_door_audio_files(self):
         try:
             gTTS(text="Open the door",   lang='en', slow=False).save("sounds/door_open.mp3")
-            gTTS(text="Door is closing", lang='en', slow=False).save("sounds/door_close.mp3")
+            gTTS(text="Door has been closed", lang='en', slow=False).save("sounds/door_close.mp3")
             print("Door audio files generated")
         except Exception as e:
             print(f"Error generating door audio: {e}")
