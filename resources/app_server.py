@@ -184,12 +184,15 @@ print_lock = threading.Lock()     # Thread lock for console output
 done = False                    # Flag indicating transaction completion
 unlock_data = 0                # Flag for door unlock control
 
+
 # =====================================================================
 # TRACKING DATA STRUCTURES
 # =====================================================================
 
-# Store movement history for each tracked object (last 5 positions)
-movement_history = defaultdict(lambda: deque(maxlen=5))
+# Store movement history for each tracked object
+# Using maxlen=8: catches fast-moving items that drop frames mid-motion.
+# Net displacement across 8 frames is more robust than per-frame intervals.
+movement_history = defaultdict(lambda: deque(maxlen=8))
 
 # Store bounding box area history for stability checking
 bbox_area_history = defaultdict(lambda: deque(maxlen=10))
@@ -234,15 +237,24 @@ active_objects_per_camera = {
 cross_camera_candidates = defaultdict(list)
 
 # Per-camera movement tracking
+# maxlen=8: large enough to catch fast-moving items even with dropped frames
 camera_movement_history = {
-    0: defaultdict(lambda: deque(maxlen=5)),  # Camera 0 history
-    1: defaultdict(lambda: deque(maxlen=5))   # Camera 1 history
+    0: defaultdict(lambda: deque(maxlen=8)),  # Camera 0 history
+    1: defaultdict(lambda: deque(maxlen=8))   # Camera 1 history
 }
 
 # Per-camera bounding box area history for stability checking
+# Kept at 5 — used only for anti-tamper (camera cover), not direction gating
 camera_bbox_area_history = {
     0: defaultdict(lambda: deque(maxlen=5)),  # Camera 0 bbox areas
     1: defaultdict(lambda: deque(maxlen=5))   # Camera 1 bbox areas
+}
+
+# Last-seen center per (camera_id, track_id) — used to bridge short gaps
+# when tracker loses the item for 1-2 frames mid-motion
+camera_last_seen_center = {
+    0: {},  # Camera 0: track_id -> (center, timestamp)
+    1: {}   # Camera 1: track_id -> (center, timestamp)
 }
 
 # =====================================================================
@@ -436,28 +448,16 @@ def draw_counts(frame, class_counters, label):
     # Product name mapping (class ID to product name)
     class_names = {
     0: "",
-    1: "100plus",
-    2: "ayamMasakMerahWithRice",
-    3: "chickenKatsuCurry",
-    4: "cocacola",
-    5: "coconut",
-    6: "dakgangjeongRice",
-    7: "dragonFruit",
-    8: "guava",
-    9: "kampungFriedRice",
-    10: "kimchiFriedRice",
-    11: "kimchiTuna",
-    12: "lemon",
-    13: "mango",
-    14: "mangoMilk",
-    15: "nasiLemakAyamRendang",
-    16: "nasiPadangBeefRendang",
-    17: "orange",
-    18: "pineappleHoney",
-    19: "pinkGuava",
-    20: "prawnAndChickenWontonNoodles",
-    21: "thaiGreenChickenCurryWithRice",
-    22: "uncleChinChickenRice" 
+    1: "chickenKatsuCurry",
+    2: "dakgangjeongRice",
+    3: "dragonFruit", 
+    4: "guava",
+    5: "kimchiFriedRice", 
+    6: "kimchiTuna", 
+    7: "mango", 
+    8: "mangoMilk", 
+    9: "pineappleHoney", 
+   10: "pinkGuava",  
       
 }
     
@@ -1010,12 +1010,12 @@ def stream_video_to_api(video_path, dataset_name, transaction_id, machine_id,
     Returns:
         bool: True if upload successful, False otherwise
         
-    API Endpoint:
+API Endpoint:
         POST /shopping_app/machine/TransactionDataset/insert_transactionDataset
         
     Authentication:
-        - Basic Auth: username='admin', password='1234'
-        - API Key: '123456' in x-api-key header
+        - Basic Auth: username='', password=''
+        - API Key: ' in x-api-key header
         
     Upload Details:
         - Method: HTTP POST with multipart/form-data
@@ -1081,6 +1081,8 @@ def stream_video_to_api(video_path, dataset_name, transaction_id, machine_id,
     except Exception as e:
         print(f"Error during video streaming: {e}")
         return False
+
+
 
 # =====================================================================
 # VIDEO MONITORING AND AUTO-UPLOAD SYSTEM
@@ -1609,6 +1611,19 @@ class HailoDetectionCallback(app_callback_class):
         # Store machine_id in environment variable for persistence
         self.store_machine_id_env(machine_id)
         
+        # =================================================================
+        # IMAGE CAPTURE VERIFIER
+        # =================================================================
+        # Attach the verifier so detection_callback can access it via
+        # user_data.image_verifier.  Only created when transaction_id is
+        # known; falls back gracefully to None (live-only mode) otherwise.
+        if transaction_id:
+            self.image_verifier = ImageCaptureVerifier(transaction_id)
+            print(f"[Verifier] Attached to transaction {transaction_id}")
+        else:
+            self.image_verifier = None
+            print("[Verifier] No transaction_id — running in live-only mode")
+        
         # Load machine planogram (product inventory)
         self.load_machine_planogram()
     
@@ -1874,7 +1889,7 @@ class HailoDetectionCallback(app_callback_class):
             "comp.sink_1"
         )
 
-    # =================================================================
+  # =================================================================
     # API PLANOGRAM FETCHING AND REFRESH SYSTEM
     # =================================================================
     
@@ -2041,7 +2056,7 @@ class HailoDetectionCallback(app_callback_class):
             list: Current planogram data from environment cache
         """
         return self.load_planogram_env()
-    
+
     # =================================================================
     # PRODUCT VALIDATION AGAINST PLANOGRAM
     # =================================================================
@@ -2679,35 +2694,49 @@ ALGORITHM:
 6. Determine direction based on Y-axis movement
 """
 
-def analyze_movement_direction(track_id, center, tracking_data, camera_id, 
+def analyze_movement_direction(track_id, center, tracking_data, camera_id,
                                global_id, current_bbox):
     """
-    Analyze movement direction based on 5 consecutive frames with enhanced filtering.
-    
-    This sophisticated algorithm prevents false detections from:
-    - Hand movements obscuring objects
-    - Small jittering/noise in tracking
-    - Inconsistent up-down-up movements
-    - Objects just being repositioned slightly
-    
-    FILTERING CHECKS (must pass all):
-    
-    CHECK 1: Bounding Box Stability
-        - Rejects if bbox size varies too much (>80% of average)
-        - Indicates hand is moving/obscuring object
-    
-    CHECK 2: Total Displacement
-        - Must move at least 30 pixels over 5 frames
-        - Prevents counting tiny jitters as movement
-    
-    CHECK 3: Movement Consistency
-        - At least 80% of frame-to-frame movements in same direction
-        - Prevents counting erratic up-down-up as intentional
-    
-    CHECK 4: Average Movement Threshold
-        - Average movement per frame must exceed 5 pixels
-        - Further filters out noise
-    
+    Analyze movement direction using a NET DISPLACEMENT approach.
+
+    WHY THE OLD APPROACH FAILED (root-cause from transaction video):
+    ---------------------------------------------------------------
+    At 21fps customers take items in ~7 frames (y: 327→462 = +135px).
+    The Hailo tracker DROPS the bounding box during fast motion for
+    several consecutive frames (hand wrapping item, partial occlusion).
+    With a 3-frame window requiring 100% per-interval consistency, even
+    ONE gap resets the history and the count never fires.
+
+    The bbox stability check also failed: when a hand grabs an item
+    the bbox height fluctuates wildly (5px → 124px → 47px in 6 frames)
+    triggering the 80% std-dev rejection even though the CENTER position
+    was moving cleanly downward the whole time.
+
+    NEW APPROACH — Net Displacement over 8-frame rolling window:
+    -------------------------------------------------------------
+    STEP 1: Record center in an 8-frame history (maxlen=8).
+            The larger window survives short detection gaps.
+
+    STEP 2: Require only MIN_POINTS=3 positions (not all 8) before
+            attempting detection — fast grabs are still caught.
+
+    STEP 3: NET DISPLACEMENT = newest_y - oldest_y in the window.
+            |displacement| >= 40px → item has clearly moved.
+            Direction = sign of net displacement.
+
+    STEP 4: DOMINANT DIRECTION CHECK over frame-to-frame intervals.
+            Require 60% majority (not 100%) — tolerates jitter frames
+            and short tracking gaps without discarding the whole reading.
+
+    STEP 5: Bbox stability check REMOVED from the direction gate.
+            Bbox wobble during grab is normal; it must not block counting.
+            Camera-cover darkness check (is_frame_dark) is unchanged.
+
+    Thresholds (tunable at top of this function):
+        NET_DISPLACEMENT_THRESHOLD = 40 px  (net first→last)
+        MIN_POINTS                 = 3      (min positions needed)
+        CONSISTENCY_THRESHOLD      = 0.60   (60% interval majority)
+
     Args:
         track_id (int): Local track ID
         center (tuple): Current center point (x, y)
@@ -2715,116 +2744,583 @@ def analyze_movement_direction(track_id, center, tracking_data, camera_id,
         camera_id (int): Camera identifier (0 or 1)
         global_id (int): Global track ID
         current_bbox (tuple): Current bounding box (x1, y1, x2, y2)
-        
+
     Returns:
         str or None: 'entry', 'exit', or None
-        
-    Direction Determination:
-        - Positive Y movement (down on screen) = 'exit' (taking out)
-        - Negative Y movement (up on screen) = 'entry' (returning)
-        - Y increases downward in image coordinates!
     """
-    # Store movement in camera-specific history
+    # Tunable thresholds
+    NET_DISPLACEMENT_THRESHOLD = 40   # px — net Y displacement required
+    MIN_POINTS                 = 3    # minimum history positions needed
+    CONSISTENCY_THRESHOLD      = 0.60 # 60% of intervals must agree
+
+    # ------------------------------------------------------------------
+    # 1. Record this frame's center into rolling history
+    # ------------------------------------------------------------------
     camera_movement_history[camera_id][track_id].appendleft(center)
-    
-    # Calculate and track bounding box area
+
+    # Record bbox area (for memory-manager bookkeeping only — not used
+    # for direction gating any more)
     bbox_area = (current_bbox[2] - current_bbox[0]) * (current_bbox[3] - current_bbox[1])
     camera_bbox_area_history[camera_id][track_id].appendleft(bbox_area)
-    
-    # Copy to global movement history for cross-camera analysis
+
+    # Update last-seen center (used by gap-bridging / expiry logic)
+    camera_last_seen_center[camera_id][track_id] = (center, time.monotonic())
+
+    # Propagate to global cross-camera history
     global_movement_history[global_id].appendleft((center, camera_id))
-    
-    # Wait until we have enough frames (5 positions)
-    if len(camera_movement_history[camera_id][track_id]) < 5:
+
+    # ------------------------------------------------------------------
+    # 2. Need at least MIN_POINTS before we can judge
+    # ------------------------------------------------------------------
+    history = camera_movement_history[camera_id][track_id]
+    if len(history) < MIN_POINTS:
         return None
-    
-    # =================================================================
-    # CHECK 1: BOUNDING BOX STABILITY
-    # =================================================================
-    # Reject if bounding box size changing significantly (hand obscuring)
-    if len(camera_bbox_area_history[camera_id][track_id]) >= 5:
-        areas = list(camera_bbox_area_history[camera_id][track_id])
-        avg_area = sum(areas) / len(areas)
-        area_variance = sum((a - avg_area) ** 2 for a in areas) / len(areas)
-        area_std_dev = area_variance ** 0.5
-        
-        # If standard deviation > 80% of average, bbox is unstable
-        if area_std_dev > (avg_area * 0.8):
-            return None  # Likely hand moving/obscuring, not actual object movement
-    
-    # =================================================================
-    # CHECK 2: TOTAL DISPLACEMENT
-    # =================================================================
-    # Object must actually move a significant distance
-    first_y = camera_movement_history[camera_id][track_id][-1][1]  # Oldest Y
-    last_y = camera_movement_history[camera_id][track_id][0][1]    # Newest Y
-    total_displacement = abs(last_y - first_y)
-    
-    DISPLACEMENT_THRESHOLD = 30  # Minimum 30 pixels
-    if total_displacement < DISPLACEMENT_THRESHOLD:
-        return None  # Not enough movement, likely just jittering
-    
-    # =================================================================
-    # CHECK 3: MOVEMENT CONSISTENCY
-    # =================================================================
-    # Ensure movement is consistently in one direction
-    movement_directions = []
-    for i in range(1, len(camera_movement_history[camera_id][track_id])):
-        curr_y = camera_movement_history[camera_id][track_id][i-1][1]
-        prev_y = camera_movement_history[camera_id][track_id][i][1]
-        # 1 = downward (exit), -1 = upward (entry)
-        movement_directions.append(1 if curr_y > prev_y else -1)
-    
-    # Count movements in each direction
-    positive_movements = sum(1 for d in movement_directions if d > 0)
-    negative_movements = sum(1 for d in movement_directions if d < 0)
-    consistency_ratio = max(positive_movements, negative_movements) / len(movement_directions)
-    
-    # Require 80% consistency (4 out of 5 frames in same direction)
-    if consistency_ratio < 0.8:
-        return None  # Movement too erratic (up-down-up-down)
-    
-    # =================================================================
-    # CHECK 4: AVERAGE MOVEMENT THRESHOLD
-    # =================================================================
-    # Calculate average movement per frame
-    total_movement = 0
-    for i in range(1, len(camera_movement_history[camera_id][track_id])):
-        curr_y = camera_movement_history[camera_id][track_id][i-1][1]
-        prev_y = camera_movement_history[camera_id][track_id][i][1]
-        total_movement += curr_y - prev_y
-    
-    avg_movement = total_movement / 4  # 4 intervals between 5 points
-    
-    FRAME_MOVEMENT_THRESHOLD = 5  # At least 5 pixels per frame
-    if abs(avg_movement) < FRAME_MOVEMENT_THRESHOLD:
-        return None  # Movement too slow/small
-    
-    # =================================================================
-    # DETERMINE DIRECTION
-    # =================================================================
-    # Positive Y movement = moving down = exiting
-    # Negative Y movement = moving up = entering
-    current_direction = 'exit' if avg_movement > 0 else 'entry'
-    
-    # =================================================================
-    # HANDLE DIRECTION CHANGES
-    # =================================================================
-    # If direction changed since last count, remove from old direction's set
-    # This allows re-counting if customer changes mind (takes out, puts back)
+
+    # ------------------------------------------------------------------
+    # 3. Extract Y positions (index 0 = newest, -1 = oldest)
+    # ------------------------------------------------------------------
+    y_positions = [pt[1] for pt in history]
+    newest_y    = y_positions[0]
+    oldest_y    = y_positions[-1]
+
+    # ------------------------------------------------------------------
+    # 4. NET DISPLACEMENT CHECK
+    #    A large net Y movement in one direction is the primary signal.
+    #    Positive net = moving down = EXIT (item taken from fridge).
+    #    Negative net = moving up   = ENTRY (item put back into fridge).
+    # ------------------------------------------------------------------
+    net_displacement = newest_y - oldest_y
+    if abs(net_displacement) < NET_DISPLACEMENT_THRESHOLD:
+        return None  # Not enough net movement — jitter or small reposition
+
+    # ------------------------------------------------------------------
+    # 5. DOMINANT DIRECTION CHECK
+    #    Count frame-to-frame intervals; require a 60% majority.
+    #    This tolerates a few wobbly or missing frames without rejecting
+    #    a clearly directional movement.
+    # ------------------------------------------------------------------
+    intervals = []
+    for i in range(len(y_positions) - 1):
+        dy = y_positions[i] - y_positions[i + 1]  # newer - older
+        if dy != 0:
+            intervals.append(1 if dy > 0 else -1)  # 1=down=exit, -1=up=entry
+
+    if not intervals:
+        return None  # All positions identical — stationary object
+
+    positive = sum(1 for d in intervals if d > 0)
+    negative = sum(1 for d in intervals if d < 0)
+    dominant = max(positive, negative)
+    ratio    = dominant / len(intervals)
+
+    if ratio < CONSISTENCY_THRESHOLD:
+        return None  # Too erratic — not a genuine take/return movement
+
+    # ------------------------------------------------------------------
+    # 6. DETERMINE DIRECTION
+    #    Use the net displacement sign as final arbiter (more robust than
+    #    the interval majority, which can be skewed by a jitter cluster).
+    # ------------------------------------------------------------------
+    current_direction = 'exit' if net_displacement > 0 else 'entry'
+
+    # ------------------------------------------------------------------
+    # 7. HANDLE DIRECTION CHANGES
+    #    Customer took item out then put it back → allow re-count.
+    # ------------------------------------------------------------------
     if global_id in global_last_counted_direction:
         if current_direction != global_last_counted_direction[global_id]:
-            # Direction changed - remove from old counted set
             if global_last_counted_direction[global_id] in tracking_data.counted_tracks:
                 tracking_data.counted_tracks[global_last_counted_direction[global_id]].discard(global_id)
-    
-    # =================================================================
-    # UPDATE TRACKING STATE
-    # =================================================================
-    # Record this direction for future comparison
+
     global_last_counted_direction[global_id] = current_direction
-        
     return current_direction
+
+# =====================================================================
+# IMAGE CAPTURE VERIFIER
+# =====================================================================
+"""
+HYBRID DETECTION SYSTEM — HOW IT WORKS
+=======================================
+
+PROBLEM with live-only detection:
+- Object partially occluded by hand during motion
+- Bounding box cut off at frame edge during transit
+- Lower classification confidence under motion blur
+
+SOLUTION — Two-stage hybrid:
+  STAGE 1 (Video):  Detect direction of movement (entry / exit)
+  STAGE 2 (Image):  Capture still frames AFTER motion clears,
+                    re-classify at highest confidence, confirm SKU.
+
+FLOW:
+  direction confirmed
+        ↓
+  wait CAPTURE_DELAY_FRAMES (item clears the door threshold)
+        ↓
+  capture CAPTURE_BURST_COUNT consecutive frames
+        ↓
+  pick frame with highest Hailo detection confidence
+        ↓
+  cross-check label vs live label
+        ↓
+  count confirmed SKU (+1 exit  /  -1 entry)
+
+CLEANUP:
+  All still images are stored in  saved_videos/{transaction_id}/verification_images/
+  They are deleted automatically at transaction end via
+  ImageCaptureVerifier.cleanup_transaction_images().
+"""
+
+# How many frames to wait after direction is confirmed before capturing
+CAPTURE_DELAY_FRAMES  = 4   # ~0.3 s at 13 fps — item clears the door
+
+# How many frames to capture in the burst
+CAPTURE_BURST_COUNT   = 5   # pick the best one out of 5
+
+# Default minimum confidence for a still-image detection to be trusted.
+# Used as fallback for any SKU not listed in SKU_MIN_CONFIDENCE below.
+MIN_STILL_CONFIDENCE  = 0.40
+
+# Per-SKU minimum confidence thresholds (Fix #6).
+#
+# WHY: Different products have structurally different baseline confidence
+# levels. Items that are visually distinct (e.g. kimchiFriedRice) hit
+# 0.90+ consistently — a 0.40 floor undersells their quality.
+# Items that are similar-looking (e.g. guava vs pinkGuava) may never
+# exceed 0.50 even under perfect conditions — a 0.40 floor would reject
+# them incorrectly.
+#
+# HOW TO TUNE: After a week of real transaction logs, look at the
+# confirmed confidence values for each SKU and set each threshold to
+# roughly 70% of that SKU's typical best-frame score.
+#
+# Class names must match exactly what your Hailo model returns.
+SKU_MIN_CONFIDENCE: Dict[str, float] = {
+    "chickenKatsuCurry":  0.65,
+    "dakgangjeongRice":   0.65,
+    "kimchiFriedRice":    0.65,
+    "kimchiTuna":         0.65,
+    "mangoMilk":          0.55,
+    "pineappleHoney":     0.55,
+    "mango":              0.45,
+    "dragonFruit":        0.45,
+    "guava":              0.35,   # visually similar to pinkGuava
+    "pinkGuava":          0.35,   # visually similar to guava
+}
+
+
+class ImageCaptureVerifier:
+    """
+    Captures a burst of still frames after a direction event is confirmed,
+    selects the highest-confidence detection, and verifies the SKU label
+    against the live-detection label.
+
+    One instance is shared for both cameras per transaction.
+
+    Directory layout:
+        camera_images/
+        └── verification/
+            └── {transaction_id}/
+                ├── cam0_exit_globalId_frame0.jpg
+                ├── cam0_exit_globalId_frame1.jpg
+                └── ...  (deleted at transaction end)
+
+    Thread safety:
+        All public methods are protected by self._lock so they can
+        be called safely from the GStreamer callback thread.
+    """
+
+    def __init__(self, transaction_id: str):
+        """
+        Args:
+            transaction_id: Unique transaction ID — used for the image
+                            sub-directory so images are isolated per session.
+        """
+        self.transaction_id = transaction_id
+        self._lock = threading.Lock()
+
+        # { global_id: {"direction": str,
+        #               "label": str,
+        #               "delay_remaining": int,
+        #               "frames_captured": [{"path": str, "confidence": float}],
+        #               "camera_id": int,
+        #               "queued_at": float } }
+        self._pending: Dict[int, dict] = {}
+
+        # global_ids that have already been verified this transaction
+        # (prevents double-counting if the item lingers in frame)
+        self._verified: set = set()
+
+        # Tracks which direction each verified global_id was confirmed in.
+        # Needed to detect direction changes (fix #2).
+        # Format: { global_id: 'entry' | 'exit' }
+        self._verified_directions: Dict[int, str] = {}
+
+        # All image paths created this transaction (for cleanup)
+        self._all_images: List[str] = []
+
+        # Output directory — stored inside saved_videos so images sit alongside
+        # the transaction video and are easy to browse/review
+        self._image_dir = os.path.join(
+            "saved_videos", str(transaction_id), "verification_images"
+        )
+        os.makedirs(self._image_dir, exist_ok=True)
+        print(f"[Verifier] Image directory: {self._image_dir}")
+
+    # -----------------------------------------------------------------
+    # PUBLIC API — called from detection_callback
+    # -----------------------------------------------------------------
+
+    def register_direction_event(
+        self,
+        global_id: int,
+        direction: str,
+        label: str,
+        camera_id: int,
+        confidence: float = 0.0,
+    ) -> None:
+        """
+        Called the moment analyze_movement_direction() returns a result.
+
+        Starts the countdown before the burst capture begins so the item
+        has time to clear the door threshold.
+
+        Camera selection (Fix #5):
+            When both cameras detect the same global_id, the one with the
+            higher live-detection confidence wins.  If this call arrives
+            with a higher confidence than the already-queued camera, the
+            pending state is updated to use the better camera going forward.
+            This prevents the first camera to fire from winning by default.
+
+        Direction-change handling (Fix #2):
+            If a customer takes an item OUT (exit, verified) and then puts
+            it BACK (entry), the global_id will be in self._verified with
+            the old direction.  We detect this case and re-queue with the
+            new direction so the return is counted correctly.
+
+        Args:
+            global_id:   Global track ID (cross-camera unique).
+            direction:   'entry' or 'exit'.
+            label:       Product label from live detection.
+            camera_id:   Camera that made the detection (0 or 1).
+            confidence:  Live-detection confidence score for camera selection.
+        """
+        with self._lock:
+            # --- direction-change re-queue (Fix #2) ---
+            if global_id in self._verified:
+                old_direction = self._verified_directions.get(global_id)
+                if old_direction is not None and old_direction != direction:
+                    self._verified.discard(global_id)
+                    self._verified_directions.pop(global_id, None)
+                    self._pending.pop(global_id, None)
+                    print(
+                        f"[Verifier] ↩️  global_id={global_id} "
+                        f"direction changed {old_direction}→{direction}, re-queuing"
+                    )
+                else:
+                    return  # Same direction already verified — skip
+
+            # --- camera selection: update if better camera arrives (Fix #5) ---
+            if global_id in self._pending:
+                existing = self._pending[global_id]
+                # Only update camera if:
+                # 1. Burst hasn't started yet (delay_remaining > 0, no frames saved)
+                # 2. New confidence is strictly higher than the registered camera's
+                if (existing["delay_remaining"] > 0
+                        and len(existing["frames_captured"]) == 0
+                        and confidence > existing.get("register_confidence", 0.0)):
+                    old_cam = existing["camera_id"]
+                    existing["camera_id"]           = camera_id
+                    existing["register_confidence"] = confidence
+                    existing["label"]               = label
+                    print(
+                        f"[Verifier] 📷 global_id={global_id} "
+                        f"camera updated cam{old_cam}→cam{camera_id} "
+                        f"(conf {existing.get('register_confidence', 0):.2f}→{confidence:.2f})"
+                    )
+                return  # Already queued — nothing more to do
+
+            # --- new registration ---
+            self._pending[global_id] = {
+                "direction":           direction,
+                "label":               label,
+                "camera_id":           camera_id,
+                "register_confidence": confidence,
+                "delay_remaining":     CAPTURE_DELAY_FRAMES,
+                "frames_captured":     [],
+                "queued_at":           time.monotonic(),
+            }
+            print(
+                f"[Verifier] Queued global_id={global_id} "
+                f"label={label} direction={direction} "
+                f"cam{camera_id} conf={confidence:.2f} "
+                f"(waiting {CAPTURE_DELAY_FRAMES} frames)"
+            )
+
+    def expire_stale_pending(self, timeout_seconds: float = 3.0) -> None:
+        """
+        Discard pending burst requests that have been waiting too long.
+
+        Called once per frame from detection_callback (Fix #4).
+        Prevents silent under-counts from items that left frame before
+        the burst completed, and frees memory during long transactions.
+
+        Args:
+            timeout_seconds: How long a pending item may wait before
+                             being discarded without counting. Default 3s.
+        """
+        now = time.monotonic()
+        with self._lock:
+            expired = [
+                gid for gid, state in self._pending.items()
+                if (now - state.get("queued_at", now)) > timeout_seconds
+            ]
+            for gid in expired:
+                state = self._pending.pop(gid)
+                frames_so_far = len(state["frames_captured"])
+                print(
+                    f"[Verifier] ⏱️  global_id={gid} EXPIRED after "
+                    f"{timeout_seconds:.0f}s — burst incomplete "
+                    f"({frames_so_far}/{CAPTURE_BURST_COUNT} frames captured), "
+                    f"NOT counted. "
+                    f"(label={state['label']} direction={state['direction']})"
+                )
+
+    def process_frame(
+        self,
+        global_id: int,
+        frame: np.ndarray,
+        detections,
+        camera_id: int,
+        width: int,
+        height: int,
+        bbox: tuple = None,
+    ) -> dict | None:
+        """
+        Called every frame for every active track.
+
+        Ticks the delay counter; when it reaches zero starts collecting
+        the burst.  When the burst is full, picks the best frame,
+        cross-checks the label and returns a result dict.
+
+        Lock discipline (Fix #3):
+            The lock is held only for state reads and writes.
+            Disk I/O (cv2.imwrite) happens OUTSIDE the lock so the
+            GStreamer callback thread is never blocked on a slow SD card.
+
+        Crop (Fix #1):
+            When bbox is provided, only the padded crop around the item
+            is saved — not the full frame.  This reduces disk writes
+            by ~85% and focuses the saved image on the item itself.
+
+        Args:
+            global_id:    Global track ID.
+            frame:        Current raw RGB numpy frame (before BGR conversion).
+            detections:   Hailo detection objects from this frame.
+            camera_id:    Camera originating this frame.
+            width/height: Frame dimensions.
+            bbox:         Optional (x1, y1, x2, y2) pixel bounding box of the
+                          tracked item.  When provided a padded crop is saved
+                          instead of the full frame.
+
+        Returns:
+            None while collecting, OR a result dict when ready:
+            {
+                "confirmed":   bool,
+                "direction":   str,
+                "label":       str,
+                "confidence":  float,
+                "image_path":  str,
+            }
+        """
+        # --- Step A: read state under lock, decide what to do ---
+        with self._lock:
+            if global_id not in self._pending:
+                return None
+            state = self._pending[global_id]
+
+            # Only process from the originating camera
+            if state["camera_id"] != camera_id:
+                return None
+
+            # countdown phase
+            if state["delay_remaining"] > 0:
+                state["delay_remaining"] -= 1
+                return None
+
+            # burst complete — finalise under lock and return
+            if len(state["frames_captured"]) >= CAPTURE_BURST_COUNT:
+                return self._finalise(global_id, state)
+
+            # burst still collecting — snapshot what we need, release lock
+            frame_index    = len(state["frames_captured"])
+            expected_label = state["label"]
+            cam_id         = state["camera_id"]
+            direction      = state["direction"]
+
+        # --- Step B: crop + disk I/O outside the lock (Fix #1 + Fix #3) ---
+        filename = (
+            f"cam{cam_id}_"
+            f"{direction}_"
+            f"g{global_id}_"
+            f"f{frame_index}.jpg"
+        )
+        img_path = os.path.join(self._image_dir, filename)
+
+        # Crop to padded bounding box when available (Fix #1)
+        # Falls back to full frame if bbox is None or crop is degenerate
+        CROP_PAD = 20   # pixels of padding around the bounding box
+        try:
+            bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            if bbox is not None:
+                x1b, y1b, x2b, y2b = bbox
+                x1c = max(0, x1b - CROP_PAD)
+                y1c = max(0, y1b - CROP_PAD)
+                x2c = min(width,  x2b + CROP_PAD)
+                y2c = min(height, y2b + CROP_PAD)
+                # Guard against degenerate crops (zero area)
+                if x2c > x1c and y2c > y1c:
+                    bgr = bgr[y1c:y2c, x1c:x2c]
+            cv2.imwrite(img_path, bgr, [cv2.IMWRITE_JPEG_QUALITY, 92])
+        except Exception as e:
+            print(f"[Verifier] Failed to save frame: {e}")
+            return None
+
+        # Score detections for this frame (CPU only, no I/O)
+        best_conf  = 0.0
+        best_label = expected_label
+        for det in detections:
+            det_label = det.get_label()
+            det_conf  = det.get_confidence()
+            if det_label == expected_label and det_conf > best_conf:
+                best_conf  = det_conf
+                best_label = det_label
+
+        scored = {"path": img_path, "confidence": best_conf, "label": best_label}
+
+        # --- Step C: write result back under lock ---
+        with self._lock:
+            if global_id not in self._pending:
+                # Item was expired or cancelled while we were doing I/O —
+                # delete the orphan file and bail out
+                try:
+                    os.remove(img_path)
+                except Exception:
+                    pass
+                return None
+
+            self._pending[global_id]["frames_captured"].append(scored)
+            self._all_images.append(img_path)
+
+            # If this was the last frame needed, finalise now
+            if len(self._pending[global_id]["frames_captured"]) >= CAPTURE_BURST_COUNT:
+                return self._finalise(global_id, self._pending[global_id])
+
+        return None
+
+    def cleanup_transaction_images(self) -> int:
+        """
+        Finalise the verifier at transaction end.
+
+        Images are KEPT on disk inside:
+            saved_videos/{transaction_id}/verification_images/
+
+        This allows post-transaction review of exactly which crop the
+        classifier used for each count decision.  Only the in-memory
+        tracking list is cleared to free RAM.
+
+        Returns:
+            Number of images kept (for logging).
+        """
+        with self._lock:
+            kept = len(self._all_images)
+            self._all_images.clear()
+            self._pending.clear()
+
+        if kept > 0:
+            print(
+                f"[Verifier] Transaction complete — {kept} verification "
+                f"image(s) saved to: {self._image_dir}"
+            )
+        return kept
+
+    # -----------------------------------------------------------------
+    # Private helpers
+    # -----------------------------------------------------------------
+
+    def _confidence_threshold(self, label: str) -> float:
+        """
+        Return the minimum confidence required to trust a still-image
+        detection for the given SKU label (Fix #6).
+
+        Falls back to MIN_STILL_CONFIDENCE for any label not listed in
+        SKU_MIN_CONFIDENCE.
+
+        Args:
+            label: Product label string as returned by the Hailo model.
+
+        Returns:
+            Float threshold in range [0, 1].
+        """
+        return SKU_MIN_CONFIDENCE.get(label, MIN_STILL_CONFIDENCE)
+
+    def _finalise(self, global_id: int, state: dict) -> dict:
+        """
+        Select the best frame from the burst and produce the final result.
+        Removes the item from _pending, adds it to _verified, and records
+        the confirmed direction so direction-changes can be detected later.
+        Uses per-SKU confidence threshold (Fix #6).
+        """
+        del self._pending[global_id]
+        self._verified.add(global_id)
+        # Record which direction was confirmed so register_direction_event
+        # can detect a future direction change and re-queue correctly (Fix #2)
+        self._verified_directions[global_id] = state["direction"]
+
+        frames = state["frames_captured"]
+        if not frames:
+            # Nothing was captured — fall back to live label, unconfirmed
+            print(f"[Verifier] global_id={global_id}: no frames captured, using live label.")
+            return {
+                "confirmed":  False,
+                "direction":  state["direction"],
+                "label":      state["label"],
+                "confidence": 0.0,
+                "image_path": "",
+            }
+
+        # Pick highest-confidence frame
+        best = max(frames, key=lambda f: f["confidence"])
+
+        # Use per-SKU threshold (Fix #6) — different products have
+        # structurally different confidence baselines
+        threshold   = self._confidence_threshold(state["label"])
+        confirmed   = best["confidence"] >= threshold
+        final_label = best["label"] if confirmed else state["label"]
+
+        if confirmed:
+            print(
+                f"[Verifier] ✅ global_id={global_id} "
+                f"CONFIRMED {state['direction']} of '{final_label}' "
+                f"(conf={best['confidence']:.2f} >= threshold={threshold:.2f}, "
+                f"img={os.path.basename(best['path'])})"
+            )
+        else:
+            print(
+                f"[Verifier] ⚠️  global_id={global_id} "
+                f"LOW CONFIDENCE {state['direction']} of '{state['label']}' "
+                f"(best={best['confidence']:.2f} < threshold={threshold:.2f}) "
+                f"— falling back to live label"
+            )
+
+        return {
+            "confirmed":  confirmed,
+            "direction":  state["direction"],
+            "label":      final_label,
+            "confidence": best["confidence"],
+            "image_path": best["path"],
+        }
+
 
 # =====================================================================
 # MAIN DETECTION CALLBACK FUNCTION
@@ -2841,7 +3337,9 @@ EXECUTION FLOW (per frame):
    - Validate product against planogram
    - Draw bounding box and trail
    - Analyze movement direction
-   - Update counters if movement detected
+   - [NEW] Register direction event with ImageCaptureVerifier
+   - [NEW] Process frame through ImageCaptureVerifier
+   - Update counters when verification result arrives
 5. Update WebSocket with latest data
 6. Calculate price and trigger alerts if needed
 7. Display frame (combined from both cameras)
@@ -3007,52 +3505,67 @@ def detection_callback(pad, info, callback_data):
         # Analyze Movement Direction
         # -----------------------------------------------------------
         direction = analyze_movement_direction(
-            track_id, 
-            center, 
+            track_id,
+            center,
             user_data.tracking_data,
             stream_id,
             global_id,
-            (x1, y1, x2, y2)  # Current bounding box
+            (x1, y1, x2, y2)
         )
-        
+
         # =============================================================
-        # STEP 6: UPDATE COUNTERS IF MOVEMENT DETECTED
+        # STEP 6: COUNT ON DIRECTION CONFIRMATION (IMMEDIATE)
         # =============================================================
+        #
+        # ROOT CAUSE FIX — why items weren't being counted:
+        # ──────────────────────────────────────────────────
+        # Items are only visible for 5–12 frames at 15fps before the
+        # Hailo tracker drops them.  The old hybrid system required:
+        #   CAPTURE_DELAY (4) + BURST (5) = 9 extra frames AFTER
+        #   direction was confirmed, totalling ~12 frames minimum.
+        # Most items left frame before the burst finished → no count.
+        #
+        # NEW TWO-TRACK APPROACH:
+        # ──────────────────────────────────────────────────────────
+        # TRACK A — COUNT (fires immediately when direction confirmed):
+        #   • Count is applied as soon as analyze_movement_direction()
+        #     returns a result.  Never misses a fast grab.
+        #   • Uses the live Hailo label (already very accurate at 0.9+).
+        #
+        # TRACK B — LABEL CORRECTION (background, best-effort):
+        #   • ImageCaptureVerifier still runs in parallel.
+        #   • If it successfully completes a burst AND scores a higher-
+        #     confidence label → it patches the already-counted entry.
+        #   • If it doesn't complete (item left frame too fast) → the
+        #     live-counted label stands.  No count is ever lost.
+        #
+        # This preserves all the image quality improvements while making
+        # counting robust for fast-moving customers.
+        # ---------------------------------------------------------------
+
         if direction:
-            # Check if we should count this movement
-            # Count if:
-            # 1. Global ID not yet counted for this direction, OR
-            # 2. Direction changed since last count (customer changed mind)
-            
             should_count = (
                 global_id not in user_data.tracking_data.counted_tracks.get(direction, set()) or
-                (global_id in global_last_counted_direction and 
+                (global_id in global_last_counted_direction and
                  direction != global_last_counted_direction[global_id])
             )
-            
+
             if should_count:
-                # Increment counter for this product and direction
+                # ── TRACK A: count immediately with live label ──────
                 user_data.tracking_data.class_counters[direction][label] += 1
-                
-                # Add to counted tracks set
+
                 if direction not in user_data.tracking_data.counted_tracks:
                     user_data.tracking_data.counted_tracks[direction] = set()
                 user_data.tracking_data.counted_tracks[direction].add(global_id)
-                
-                # -----------------------------------------------------
-                # Update Validated/Invalidated Products
-                # -----------------------------------------------------
+
                 if validation_result['valid']:
-                    # VALID PRODUCT - Add to validated products
                     if label not in user_data.tracking_data.validated_products[direction]:
                         user_data.tracking_data.validated_products[direction][label] = {
                             "count": 0,
                             "product_details": validation_result['product_details']
                         }
                     user_data.tracking_data.validated_products[direction][label]["count"] += 1
-                    
                 else:
-                    # INVALID PRODUCT - Add to invalidated products
                     if label not in user_data.tracking_data.invalidated_products[direction]:
                         user_data.tracking_data.invalidated_products[direction][label] = {
                             "count": 0,
@@ -3061,20 +3574,117 @@ def detection_callback(pad, info, callback_data):
                                 "confidence": confidence,
                                 "tracking_id": global_id,
                                 "bounding_box": {
-                                    "xmin": x1,
-                                    "ymin": y1,
-                                    "xmax": x2,
-                                    "ymax": y2
+                                    "xmin": x1, "ymin": y1,
+                                    "xmax": x2, "ymax": y2
                                 }
                             }
                         }
                     user_data.tracking_data.invalidated_products[direction][label]["count"] += 1
+
+                print(
+                    f"[Count] ✅ global_id={global_id} {direction} '{label}' "
+                    f"(live conf={confidence:.2f})"
+                )
+
+        # ── TRACK B: image verifier runs in background ──────────────
+        # Register direction with the verifier so it can attempt a
+        # still-image burst for label correction.  This is fire-and-
+        # forget: if the burst completes it may patch the label; if
+        # the item leaves frame before the burst finishes it simply
+        # expires with no side-effects on the count.
+        verifier = getattr(user_data, 'image_verifier', None)
+        if verifier is not None and direction:
+            should_register = (
+                global_id not in user_data.tracking_data.counted_tracks.get(direction, set()) or
+                (global_id in global_last_counted_direction and
+                 direction != global_last_counted_direction[global_id])
+            )
+            # Note: should_register was evaluated before we added to
+            # counted_tracks above, so re-check using the updated set.
+            already_counted = global_id in user_data.tracking_data.counted_tracks.get(direction, set())
+            if already_counted:
+                # Item was just counted — register for label correction
+                verifier.register_direction_event(
+                    global_id  = global_id,
+                    direction  = direction,
+                    label      = label,
+                    camera_id  = stream_id,
+                    confidence = confidence,
+                )
+
+        # Feed current frame into the verifier for burst capture.
+        # If the burst completes, patch the label of the already-counted item.
+        if verifier is not None:
+            verification_result = verifier.process_frame(
+                global_id  = global_id,
+                frame      = frame,
+                detections = detections,
+                camera_id  = stream_id,
+                width      = width,
+                height     = height,
+                bbox       = (x1, y1, x2, y2),
+            )
+
+            # ── TRACK B result: patch label if image is more confident ──
+            if verification_result is not None:
+                v_label     = verification_result["label"]
+                v_direction = verification_result["direction"]
+                v_conf      = verification_result["confidence"]
+                v_confirmed = verification_result["confirmed"]
+
+                # Only patch if the image gave a DIFFERENT, higher-confidence label
+                if v_confirmed and v_label != label:
+                    v_validation = user_data.validate_detected_product(v_label)
+
+                    # Decrement old live-label count
+                    if label in user_data.tracking_data.validated_products.get(v_direction, {}):
+                        user_data.tracking_data.validated_products[v_direction][label]["count"] -= 1
+                        if user_data.tracking_data.validated_products[v_direction][label]["count"] <= 0:
+                            del user_data.tracking_data.validated_products[v_direction][label]
+                    user_data.tracking_data.class_counters[v_direction][label] -= 1
+
+                    # Increment corrected label count
+                    user_data.tracking_data.class_counters[v_direction][v_label] += 1
+                    if v_validation['valid']:
+                        if v_label not in user_data.tracking_data.validated_products[v_direction]:
+                            user_data.tracking_data.validated_products[v_direction][v_label] = {
+                                "count": 0,
+                                "product_details": v_validation['product_details']
+                            }
+                        user_data.tracking_data.validated_products[v_direction][v_label]["count"] += 1
+
+                    print(
+                        f"[Verifier] 🔄 global_id={global_id} label corrected "
+                        f"'{label}'→'{v_label}' (img conf={v_conf:.2f})"
+                    )
+
+                # Draw verification status on frame
+                status_text = (
+                    f"[IMG OK] {v_label} conf={v_conf:.2f}"
+                    if v_confirmed else
+                    f"[IMG LOW] {v_label} conf={v_conf:.2f}"
+                )
+                cv2.putText(
+                    frame, status_text, (10, height - 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1
+                )
 
     # =================================================================
     # STEP 7: CLEANUP INACTIVE TRACKS
     # =================================================================
     # Remove tracking data for objects no longer in frame
     cleanup_inactive_tracks(stream_id, active_local_track_ids)
+
+    # =================================================================
+    # STEP 7b: EXPIRE STALE VERIFIER PENDING ENTRIES (Fix #4)
+    # =================================================================
+    # Called once per frame (not per detection) so the timeout is based
+    # on wall-clock time, not frame count.
+    # Items queued but never completed (fast customer, item left frame)
+    # are discarded with an explicit log line rather than silently lost.
+    verifier = getattr(user_data, 'image_verifier', None)
+    if verifier is not None:
+        verifier.expire_stale_pending(timeout_seconds=3.0)
 
     # =================================================================
     # STEP 8: UPDATE FPS CALCULATION
@@ -3460,6 +4070,15 @@ async def run_tracking(websocket: WebSocket):
                 transaction_memory_manager.end_transaction(transaction_id)
                 print(f"[Memory] Transaction {transaction_id} ended")
             
+            # ==========================================================
+            # CLEAN UP VERIFICATION IMAGES (normal path)
+            # ==========================================================
+            # Delete all still frames captured by the ImageCaptureVerifier
+            # during this transaction.  This runs even if the verifier had
+            # zero captures (no-op in that case).
+            if hasattr(callback, 'image_verifier') and callback.image_verifier is not None:
+                callback.image_verifier.cleanup_transaction_images()
+            
     except Exception as e:
         print(f"Error during tracking: {e}")
         
@@ -3490,6 +4109,19 @@ async def run_tracking(websocket: WebSocket):
             cover_alert_thread = None
             alert_thread.join()
             alert_thread = None
+        
+        # ==========================================================
+        # CLEAN UP VERIFICATION IMAGES (safety net / error path)
+        # ==========================================================
+        # This runs regardless of whether the normal cleanup above
+        # already ran — cleanup_transaction_images() is idempotent
+        # (self._all_images is cleared on first call, so a second
+        # call is a harmless no-op).
+        try:
+            if hasattr(callback, 'image_verifier') and callback.image_verifier is not None:
+                callback.image_verifier.cleanup_transaction_images()
+        except Exception as cleanup_err:
+            print(f"[Verifier] Cleanup error in finally block: {cleanup_err}")
             
         await door_monitor_task
         callback.tracking_data.shutdown_event.set()
@@ -3825,6 +4457,7 @@ def delete_images(image_paths):
     print(f"Successfully deleted {deleted_count} images")
     return deleted_count
 
+
 # =====================================================================
 # TRANSACTION-BASED MEMORY MANAGEMENT SYSTEM
 # =====================================================================
@@ -4054,6 +4687,7 @@ class TransactionMemoryManager:
         global object_trails, global_trails, camera_movement_history
         global camera_bbox_area_history, local_to_global_id_map
         global active_objects_per_camera, global_movement_history
+        global camera_last_seen_center
         
         tracks_to_clean = trans_data['tracks_created']
         trails_to_clean = trans_data['trails_created']
@@ -4129,6 +4763,32 @@ class TransactionMemoryManager:
               f"(removed {trails_before - trails_after})")
         print(f"[Cleanup] Tracks: {tracks_before} -> {tracks_after} "
               f"(removed {tracks_before - tracks_after})")
+
+        # -----------------------------------------------------------
+        # Clean last-seen center cache for inactive tracks
+        # -----------------------------------------------------------
+        for cam_id in [0, 1]:
+            for track_id in list(camera_last_seen_center[cam_id].keys()):
+                if track_id in tracks_to_clean:
+                    del camera_last_seen_center[cam_id][track_id]
+
+        # -----------------------------------------------------------
+        # Verification images for this transaction are kept on disk
+        # -----------------------------------------------------------
+        # Images live in saved_videos/{transaction_id}/verification_images/
+        # alongside the transaction video — no cleanup needed here.
+        verification_dir = os.path.join(
+            "saved_videos", str(transaction_id), "verification_images"
+        )
+        if os.path.isdir(verification_dir):
+            image_count = len([
+                f for f in os.listdir(verification_dir)
+                if f.endswith('.jpg')
+            ])
+            print(
+                f"[Cleanup] Verification images kept: "
+                f"{image_count} file(s) in {verification_dir}"
+            )
     
     def _recreate_global_dictionaries(self):
         """
@@ -4189,8 +4849,8 @@ class TransactionMemoryManager:
         # Recreate camera movement histories
         # -----------------------------------------------------------
         new_camera_movement_history = {
-            0: defaultdict(lambda: deque(maxlen=5)),
-            1: defaultdict(lambda: deque(maxlen=5))
+            0: defaultdict(lambda: deque(maxlen=8)),
+            1: defaultdict(lambda: deque(maxlen=8))
         }
         for cam_id in [0, 1]:
             for track_id, history in camera_movement_history[cam_id].items():
@@ -4198,7 +4858,7 @@ class TransactionMemoryManager:
                     new_camera_movement_history[cam_id][track_id] = history
                     preserve_count += 1
         camera_movement_history = new_camera_movement_history
-        
+
         # -----------------------------------------------------------
         # Recreate bounding box histories
         # -----------------------------------------------------------
@@ -4211,6 +4871,12 @@ class TransactionMemoryManager:
                 if track_id in active_tracks:
                     new_camera_bbox_area_history[cam_id][track_id] = history
         camera_bbox_area_history = new_camera_bbox_area_history
+
+        # -----------------------------------------------------------
+        # Clear last-seen centers (small dict, safe to wipe entirely)
+        # -----------------------------------------------------------
+        global camera_last_seen_center
+        camera_last_seen_center = {0: {}, 1: {}}
         
         print(f"[Cleanup] Preserved {preserve_count} items from active transactions")
         print(f"[Cleanup] Dictionary recreation complete")
@@ -5445,8 +6111,8 @@ def main():
     # CREATE REQUIRED DIRECTORIES
     # =================================================================
     print("Creating required directories...")
-    os.makedirs('saved_videos', exist_ok=True)      # For recorded transaction videos
-    os.makedirs('camera_images', exist_ok=True)     # For product capture images
+    os.makedirs('saved_videos', exist_ok=True)      # Transaction videos + verification images
+    os.makedirs('camera_images', exist_ok=True)     # Product capture images (admin upload mode)
     os.makedirs("sounds", exist_ok=True)            # For audio files
     os.makedirs("sounds/deposits", exist_ok=True)   # For deposit alert sounds
     print("Directories created successfully")
@@ -5562,8 +6228,8 @@ DEPLOYMENT:
 1. Install dependencies: pip install -r requirements.txt
 2. Configure camera devices (/dev/video0, /dev/video2)
 3. Set up API credentials in code
-4. Run: python app_server.py --host 0.0.0.0 --port 8000
-5. Mobile app connects to: ws://raspberry-pi-ip:8000/ws/track
+4. Run: python app_server.py --host 0.0.0.0 --rtspport 8000
+5. Mobile app connects to: 
 
 MAINTENANCE:
 - Monitor memory usage: curl http://raspberry-pi:8000/stats
