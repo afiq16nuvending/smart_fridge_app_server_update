@@ -15,6 +15,7 @@ MAIN COMPONENTS:
 4. GPIO control for door locks, LEDs, and buzzer
 5. Transaction memory management
 6. Text-to-speech alerts (beep + spoken announcement for every entry and exit)
+7. MQTT publishing for connection status (online/offline via LWT) and door status
 
 HARDWARE REQUIREMENTS:
 - Raspberry Pi 5 with Hailo-8L AI accelerator
@@ -26,15 +27,15 @@ HARDWARE REQUIREMENTS:
 - Buzzer (GPIO 20)
 
 WORKFLOW:
-1. Customer opens app → WebSocket connects
+1. Customer opens app → WebSocket connects → MQTT publishes online + door status
 2. Deposit deducted → Door unlocks → Cameras start
 3. Customer takes/returns items → AI tracks movements
 4. Price calculated in real-time → beep + TTS announces every entry and exit
-5. Door closes → Closing TTS summary plays → Video saved → Refund processed
-6. System cleans up memory → Ready for next customer
+5. Door closes → MQTT publishes door closed → Closing TTS summary plays
+6. Video saved → Refund processed → System cleans up → Ready for next customer
 
 AUTHOR: Afiq
-VERSION: 2.0
+VERSION: 2.1
 LAST UPDATED: 2025
 =====================================================================
 """
@@ -121,6 +122,9 @@ from scipy.spatial import distance
 import weakref
 import setproctitle
 
+# MQTT Client
+from mqtt_client import MQTTClient
+
 # =====================================================================
 # FASTAPI APP INSTANCE
 # =====================================================================
@@ -129,6 +133,18 @@ app = FastAPI()
 
 # Data queue for multi-stream processing
 data_deque: Dict[int, deque] = {}
+
+# =====================================================================
+# MQTT CONFIGURATION
+# =====================================================================
+# Set the machine ID for this Pi manually for testing.
+# In production, this is read automatically from the WebSocket
+# start_preview message via os.environ['MACHINE_ID'].
+
+MQTT_MACHINE_ID = "168"    # ← change this to your test machine ID
+
+# Global MQTT client instance — initialised in main(), used everywhere
+mqtt_client: MQTTClient = None
 
 # =====================================================================
 # GPIO PIN CONFIGURATION
@@ -335,17 +351,30 @@ def draw_counts(frame, class_counters, label):
         label          (str):        Current product label.
     """
     class_names = {
-        0:  "",
-        1:  "chickenKatsuCurry",
-        2:  "dakgangjeongRice",
-        3:  "dragonFruit",
-        4:  "guava",
-        5:  "kimchiFriedRice",
-        6:  "kimchiTuna",
-        7:  "mango",
-        8:  "mangoMilk",
-        9:  "pineappleHoney",
-        10: "pinkGuava",
+         0: "",
+         1: "100plus",
+         2: "ayamMasakMerahWithRice",
+         3: "chickenKatsuCurry",
+         4: "cocacola",
+         5: "coconut",
+         6: "dakgangjeongRice",
+         7: "dragonFruit",
+         8: "guava",
+         9: "kampungFriedRice",
+        10: "kimchiFriedRice",
+        11: "kimchiTuna",
+        12: "lemon",
+        13: "mango",
+        14: "mangoMilk",
+        15: "nasiLemakAyamRendang",
+        16: "nasiPadangBeefRendang",
+        17: "orange",
+        18: "pineappleHoney",
+        19: "pinkGuava",
+        20: "prawnAndChickenWontonNoodles",
+        21: "thaiGreenChickenCurryWithRice",
+        22: "uncleChinChickenRice",
+        
     }
 
     total_entry = sum(class_counters["entry"].values())
@@ -1628,8 +1657,6 @@ def number_to_words(n):
     """
     Convert an integer (1-20) to its spoken word equivalent.
 
-    Used so TTS says "two 100plus removed" instead of "2 100plus removed".
-
     Args:
         n (int): Number to convert.
 
@@ -1648,29 +1675,6 @@ def number_to_words(n):
 # =====================================================================
 # PRODUCT MOVEMENT TTS ANNOUNCER
 # =====================================================================
-# Behaviour summary:
-#
-# EXIT  (item taken out):
-#   Always announces "one X removed" for every single exit event.
-#   No cumulative count — same as entry behaviour.
-#
-# ENTRY (item returned):
-#   Always announces "one X returned" for every single entry event.
-#   No running total.
-#
-# CLOSING SUMMARY (after door closes):
-#   Called once via speak_closing_summary() from the websocket finally
-#   block, AFTER speak_door_close() has fully finished playing.
-#   This guarantees the closing TTS never overlaps the door-close TTS.
-#   Lists net exit items (exit minus entry).
-#   If net = 0: "Thank you for visiting. Have a great day!"
-#   If net > 0: "Thank you for shopping... items taken are X and Y...
-#                Your refund will be processed shortly."
-#
-# All audio is non-blocking — zero impact on the GStreamer pipeline.
-#
-# Add entries to SPEECH_NAMES to make label names sound more natural.
-# =====================================================================
 
 SPEECH_NAMES: Dict[str, str] = {
     # Add friendlier spoken names for product labels here if needed.
@@ -1688,24 +1692,6 @@ SPEECH_NAMES: Dict[str, str] = {
 class ProductMovementAnnouncer:
     """
     Real-time TTS announcer for product entry and exit events.
-
-    EXIT behaviour — always one per event:
-        Every exit event → "one 100plus removed"
-        (no cumulative count — mirrors entry behaviour)
-
-    ENTRY behaviour — always one per event:
-        Every entry event → "one 100plus returned"
-
-    CLOSING SUMMARY — called once from websocket_endpoint finally block,
-    after speak_door_close() has fully finished so the two never overlap:
-        Net items taken > 0:
-            "Thank you for shopping with us. The items you have taken
-             are two 100plus and one mangoMilk. Your refund will be
-             processed shortly."
-        Net items taken = 0:
-            "Thank you for visiting. Have a great day!"
-
-    Thread-safe. All audio is non-blocking.
     """
 
     def __init__(self):
@@ -1716,13 +1702,6 @@ class ProductMovementAnnouncer:
         print("[MovementTTS] Announcer reset for new transaction")
 
     def _beep_and_speak(self, text: str):
-        """
-        Play the beep WAV then speak the TTS phrase, both through pygame.
-        Runs in a background daemon thread — never blocks the caller.
-
-        Args:
-            text (str): The phrase to speak after the beep.
-        """
         def _run():
             try:
                 beep_path = "sounds/beep.wav"
@@ -1735,63 +1714,23 @@ class ProductMovementAnnouncer:
         threading.Thread(target=_run, daemon=True).start()
 
     def on_exit(self, label: str):
-        """
-        Called every time a product is taken out (exit event).
-        Always announces "one X removed" regardless of how many
-        have been taken — mirrors the entry behaviour exactly.
-
-        Args:
-            label (str): Product label.
-        """
         spoken_name = SPEECH_NAMES.get(label, label)
         text        = f"one {spoken_name} removed"
-
         self._beep_and_speak(text)
         print(f"[MovementTTS] EXIT — '{text}'")
 
     def on_entry(self, label: str):
-        """
-        Called every time a product is returned (entry event).
-        Always announces "one X returned" regardless of total returns.
-
-        Args:
-            label (str): Product label.
-        """
         spoken_name = SPEECH_NAMES.get(label, label)
         text        = f"one {spoken_name} returned"
-
         self._beep_and_speak(text)
         print(f"[MovementTTS] ENTRY — '{text}'")
 
     def speak_closing_summary(self, class_counters: dict):
         """
-        Speak the end-of-transaction summary synchronously.
-
-        This method BLOCKS until the closing message has fully played.
-        Called from run_tracking() after speak_door_close(), so the
-        two announcements play in sequence and stop_all_audio() in
-        the websocket finally block cannot cut them off.
-
-        How it works:
-        1. Builds the closing message text.
-        2. Generates a gTTS MP3 to sounds/closing/closing_summary.mp3.
-        3. Plays it with play_mp3_sync (blocking) — fully done before
-           run_tracking returns.
-
-        Net > 0:
-            "Thank you for shopping with us. The item(s) you have taken
-             are/is X. Your refund will be processed shortly."
-        Net = 0:
-            "Thank you for visiting. Have a great day!"
-
-        Args:
-            class_counters (dict): tracking_data.class_counters with
-                                   'entry' and 'exit' sub-dicts.
+        Speak end-of-transaction summary synchronously (blocks until done).
+        Called from run_tracking() after speak_door_close().
         """
         try:
-            # ----------------------------------------------------------
-            # STEP 1: Build net counts per product
-            # ----------------------------------------------------------
             all_labels = (set(class_counters["exit"].keys()) |
                           set(class_counters["entry"].keys()))
             net_items  = {}
@@ -1803,9 +1742,6 @@ class ProductMovementAnnouncer:
                 if net > 0:
                     net_items[lbl] = net
 
-            # ----------------------------------------------------------
-            # STEP 2: Compose message
-            # ----------------------------------------------------------
             if not net_items:
                 message = "Thank you for visiting. Have a great day!"
             else:
@@ -1833,12 +1769,6 @@ class ProductMovementAnnouncer:
 
             print(f"[MovementTTS] CLOSING — '{message}'")
 
-            # ----------------------------------------------------------
-            # STEP 3: Generate to temp file and play synchronously.
-            # Using play_mp3_sync means this call blocks until the audio
-            # is fully done — no risk of the process tearing down the
-            # daemon thread mid-sentence.
-            # ----------------------------------------------------------
             os.makedirs("sounds/closing", exist_ok=True)
             closing_path = "sounds/closing/closing_summary.mp3"
 
@@ -1862,17 +1792,11 @@ class ProductMovementAnnouncer:
             print(f"[MovementTTS] play_mp3_sync error: {e}")
 
 
-# Global instance — shared across all detection_callback invocations
+# Global instance
 product_movement_announcer = ProductMovementAnnouncer()
 
 # =====================================================================
 # MAIN DETECTION CALLBACK FUNCTION
-# =====================================================================
-# Called by GStreamer for EVERY frame from BOTH cameras via a buffer
-# probe on identity_callback_0 and identity_callback_1.
-# Frequency: ~13-15 fps per camera.
-# Thread: GStreamer pipeline thread.
-# PIPELINE IS NEVER MODIFIED. All logic is injected here.
 # =====================================================================
 
 def detection_callback(pad, info, callback_data):
@@ -1977,19 +1901,10 @@ def detection_callback(pad, info, callback_data):
             if should_count:
                 user_data.tracking_data.class_counters[direction][label] += 1
 
-                # ---------------------------------------------------------
-                # MOVEMENT TTS ANNOUNCEMENT
-                #
-                # EXIT  → cumulative: "one X removed", "two X removed" ...
-                # ENTRY → always one: "one X returned" every time
-                #
-                # Both fire in a daemon thread — zero pipeline impact.
-                # ---------------------------------------------------------
                 if direction == "exit":
                     product_movement_announcer.on_exit(label)
                 else:
                     product_movement_announcer.on_entry(label)
-                # ---------------------------------------------------------
 
                 if direction not in user_data.tracking_data.counted_tracks:
                     user_data.tracking_data.counted_tracks[direction] = set()
@@ -2111,6 +2026,20 @@ async def run_tracking(websocket: WebSocket):
                     print(f"Transaction started — deposit: ${deposit}, "
                           f"machine: {machine_id}, user: {user_id}, "
                           f"tx: {transaction_id}")
+
+                    # --------------------------------------------------
+                    # MQTT: connect now that machine_id is confirmed.
+                    # store_machine_id_env() will be called inside
+                    # HailoDetectionCallback, so os.environ['MACHINE_ID']
+                    # is set before mqtt_client.connect() resolves topics.
+                    # We set it here explicitly for the MQTT LWT topic.
+                    # --------------------------------------------------
+                    if machine_id:
+                        os.environ['MACHINE_ID'] = str(machine_id)
+                    if mqtt_client is not None:
+                        mqtt_client.connect()
+                    # --------------------------------------------------
+
                     break
                 else:
                     break
@@ -2280,6 +2209,14 @@ async def run_tracking(websocket: WebSocket):
         if 'detection_app' in locals():
             detection_app.pipeline.set_state(Gst.State.NULL)
 
+        # --------------------------------------------------------------
+        # MQTT: disconnect cleanly after tracking ends.
+        # This publishes "offline" explicitly before the LWT fires.
+        # --------------------------------------------------------------
+        if mqtt_client is not None:
+            mqtt_client.disconnect()
+        # --------------------------------------------------------------
+
         cv2.destroyAllWindows()
 
 # =====================================================================
@@ -2367,7 +2304,6 @@ def upload_images_to_api(camera1_images, machine_id, machine_identifier,
                          user_id, product_name, image_count):
     api_url = "https://stg-sfapi.nuboxtech.com/index.php/mobile_app/product/Product/upload_product_images"
 
-    # Authentication credentials
     username = 'admin'
     password = '1234'
     api_key  = '123456'
@@ -2835,8 +2771,8 @@ class TTSManager:
 
     def generate_door_audio_files(self):
         try:
-            gTTS(text="Open the door",   lang='en', slow=False).save("sounds/door_open.mp3")
-            gTTS(text="Door has been closed", lang='en', slow=False).save("sounds/door_close.mp3")
+            gTTS(text="Open the door",        lang='en', slow=False).save("sounds/door_open.mp3")
+            gTTS(text="Door has been closed",  lang='en', slow=False).save("sounds/door_close.mp3")
             print("Door audio files generated")
         except Exception as e:
             print(f"Error generating door audio: {e}")
@@ -2848,10 +2784,6 @@ class TTSManager:
         self.play_mp3_sync("sounds/door_close.mp3", volume=0.8)
 
     def speak_async(self, text, lang='en'):
-        """
-        Speak text asynchronously using gTTS.
-        Generates audio in memory and plays in a background thread.
-        """
         def _speak():
             with self.tts_lock:
                 try:
@@ -3062,6 +2994,8 @@ async def get_stats():
 # =====================================================================
 
 def main():
+    global mqtt_client
+
     parser = argparse.ArgumentParser(
         description='Smart Fridge Object Detection and Tracking System'
     )
@@ -3101,8 +3035,20 @@ def main():
 
     print("[Memory] Transaction memory management initialised")
 
+    # ------------------------------------------------------------------
+    # MQTT SETUP
+    # Set machine ID in environment so mqtt_client topics resolve
+    # correctly from the moment connect() is called.
+    # ------------------------------------------------------------------
+    os.environ['MACHINE_ID'] = str(MQTT_MACHINE_ID)
+    mqtt_client = MQTTClient(machine_id=MQTT_MACHINE_ID)
+    print(f"[MQTT] Client created for machine_id={MQTT_MACHINE_ID}")
+    print("[MQTT] Will connect when first WebSocket transaction starts")
+    # ------------------------------------------------------------------
+
     atexit.register(GPIO.cleanup)
-    print("GPIO cleanup handler registered")
+    atexit.register(lambda: mqtt_client.disconnect() if mqtt_client else None)
+    print("GPIO and MQTT cleanup handlers registered")
 
     print("\n" + "="*60)
     print("SMART FRIDGE SYSTEM STARTED")
@@ -3112,6 +3058,9 @@ def main():
     print(f"WebSocket:         ws://{args.host}:{args.port}/ws/track")
     print(f"Health check:      http://{args.host}:{args.port}/health")
     print(f"Statistics:        http://{args.host}:{args.port}/stats")
+    print(f"MQTT machine ID:   {MQTT_MACHINE_ID}")
+    print(f"MQTT topics:       AIfridge/{MQTT_MACHINE_ID}/rpi/connectionStatus")
+    print(f"                   AIfridge/{MQTT_MACHINE_ID}/rpi/doorStatus")
     print("\nPress Ctrl+C to stop")
     print("="*60 + "\n")
 
@@ -3127,5 +3076,5 @@ if __name__ == "__main__":
     main()
 
 # =====================================================================
-# END OF SMART FRIDGE DETECTION SYSTEM v2.0
+# END OF SMART FRIDGE DETECTION SYSTEM v2.1
 # =====================================================================
