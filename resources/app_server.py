@@ -3041,7 +3041,7 @@ def main():
     # correctly from the moment connect() is called.
     # ------------------------------------------------------------------
     os.environ['MACHINE_ID'] = str(MQTT_MACHINE_ID)
-    mqtt_client = MQTTClient(machine_id=MQTT_MACHINE_ID)
+    mqtt_client = MQTTClient()
     print(f"[MQTT] Client created for machine_id={MQTT_MACHINE_ID}")
     print("[MQTT] Will connect when first WebSocket transaction starts")
     # ------------------------------------------------------------------
