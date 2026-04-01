@@ -351,30 +351,17 @@ def draw_counts(frame, class_counters, label):
         label          (str):        Current product label.
     """
     class_names = {
-         0: "",
-         1: "100plus",
-         2: "ayamMasakMerahWithRice",
-         3: "chickenKatsuCurry",
-         4: "cocacola",
-         5: "coconut",
-         6: "dakgangjeongRice",
-         7: "dragonFruit",
-         8: "guava",
-         9: "kampungFriedRice",
-        10: "kimchiFriedRice",
-        11: "kimchiTuna",
-        12: "lemon",
-        13: "mango",
-        14: "mangoMilk",
-        15: "nasiLemakAyamRendang",
-        16: "nasiPadangBeefRendang",
-        17: "orange",
-        18: "pineappleHoney",
-        19: "pinkGuava",
-        20: "prawnAndChickenWontonNoodles",
-        21: "thaiGreenChickenCurryWithRice",
-        22: "uncleChinChickenRice",
-        
+        0:  "",
+        1:  "chickenKatsuCurry",
+        2:  "dakgangjeongRice",
+        3:  "dragonFruit",
+        4:  "guava",
+        5:  "kimchiFriedRice",
+        6:  "kimchiTuna",
+        7:  "mango",
+        8:  "mangoMilk",
+        9:  "pineappleHoney",
+        10: "pinkGuava",
     }
 
     total_entry = sum(class_counters["entry"].values())
@@ -3042,8 +3029,8 @@ def main():
     # ------------------------------------------------------------------
     os.environ['MACHINE_ID'] = str(MQTT_MACHINE_ID)
     mqtt_client = MQTTClient()
-    print(f"[MQTT] Client created for machine_id={MQTT_MACHINE_ID}")
-    print("[MQTT] Will connect when first WebSocket transaction starts")
+    mqtt_client.connect()
+    print(f"[MQTT] Client created and connected for machine_id={MQTT_MACHINE_ID}")
     # ------------------------------------------------------------------
 
     atexit.register(GPIO.cleanup)
