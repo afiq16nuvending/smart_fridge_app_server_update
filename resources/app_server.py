@@ -141,7 +141,7 @@ data_deque: Dict[int, deque] = {}
 # In production, this is read automatically from the WebSocket
 # start_preview message via os.environ['MACHINE_ID'].
 
-MQTT_MACHINE_ID = "171"    # ← change this to your test machine ID
+MQTT_MACHINE_ID = "170"    # ← change this to your test machine ID
 
 # Global MQTT client instance — initialised in main(), used everywhere
 mqtt_client: MQTTClient = None
