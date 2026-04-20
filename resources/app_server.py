@@ -2063,7 +2063,7 @@ async def run_tracking(websocket: WebSocket):
             tts_manager.play_mp3_sync(f"{alert_dir}/start_capture.mp3", volume=0.8)
             time.sleep(2)
 
-            camera1_images = capture_images(2, image_count)
+            camera1_images = capture_images(0, image_count)
 
             if camera1_images:
                 tts_manager.play_mp3_sync(f"{alert_dir}/all_complete.mp3", volume=0.8)
