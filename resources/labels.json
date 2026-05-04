@@ -1,4 +1,3 @@
-
 {
   "iou_threshold": 0.45,
   "detection_threshold": 0.7,
@@ -11,29 +10,10 @@
   ],
   "labels": [
     "",
-    "100plus",
-    "ayamMasakMerahWithRice",
-    "chickenKatsuCurry",
-    "cocacola",
-    "coconut",
-    "dakgangjeongRice",
-    "dragonFruit",
-    "guava",
-    "kampungFriedRice",
-    "kimchiFriedRice",
-    "kimchiTuna",
-    "lemon",
-    "mango",
-    "mangoMilk",
-    "nasiLemakAyamRendang",
-    "nasiPadangBeefRendang",
-    "orange",
-    "pineappleHoney",
-    "pinkGuava",
-    "prawnAndChickenWontonNoodles",
-    "thaiGreenChickenCurryWithRice",
-    "uncleChinChickenRice"
-
+    "chickenAndMushroom",
+    "malatang",
+    "seafoodAndPrawn",
+    "tehTarik"
 
   ]
 }
