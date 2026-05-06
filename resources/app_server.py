@@ -11,7 +11,7 @@ products against inventory, manages door access, and handles payments.
 MAIN COMPONENTS:
 1. FastAPI WebSocket server for real-time communication
 2. Hailo AI accelerator for object detection
-3. Multi-camera tracking system
+3. Multi-camera tracking system (camera 0 authoritative for counting)
 4. GPIO control for door locks, LEDs, and buzzer
 5. Transaction memory management
 6. Text-to-speech alerts (beep + spoken announcement for every entry and exit)
@@ -27,16 +27,24 @@ HARDWARE REQUIREMENTS:
 - Buzzer (GPIO 20)
 
 WORKFLOW:
-1. Customer opens app → WebSocket connects → MQTT publishes online + door status
-2. Deposit deducted → Door unlocks → Cameras start
-3. Customer takes/returns items → AI tracks movements
-4. Price calculated in real-time → beep + TTS announces every entry and exit
-5. Door closes → MQTT publishes door closed → Closing TTS summary plays
-6. Video saved → Refund processed → System cleans up → Ready for next customer
+1. Customer opens app -> WebSocket connects -> MQTT publishes online + door status
+2. Deposit deducted -> Door unlocks -> Cameras start
+3. Customer takes/returns items -> AI tracks movements
+4. Price calculated in real-time -> beep + TTS announces every entry and exit
+5. Door closes -> MQTT publishes door closed -> Closing TTS summary plays
+6. Video saved -> Refund processed -> System cleans up -> Ready for next customer
+
+TRACKING CHANGES IN v2.2:
+- Class smoothing: per-track label histogram suppresses single-frame
+  class flips that previously created spurious second global IDs.
+- Single authoritative counting camera: only camera 0 increments
+  counters and fires TTS. Camera 1 still tracks and draws boxes.
+- Time-window dedupe: 1.5s suppression window prevents same-class
+  back-to-back count events from leaking through despite the above.
 
 AUTHOR: Mike
-VERSION: 2.1
-LAST UPDATED: 2025
+VERSION: 2.2
+LAST UPDATED: 2026
 =====================================================================
 """
 
@@ -75,7 +83,7 @@ import multiprocessing
 import signal
 
 # Data Structures
-from collections import deque, defaultdict
+from collections import deque, defaultdict, Counter
 from typing import List, Dict, Tuple
 import random
 
@@ -141,9 +149,9 @@ data_deque: Dict[int, deque] = {}
 # In production, this is read automatically from the WebSocket
 # start_preview message via os.environ['MACHINE_ID'].
 
-MQTT_MACHINE_ID = "166"    # ← change this to your test machine ID
+MQTT_MACHINE_ID = "166"    # change this to your test machine ID
 
-# Global MQTT client instance — initialised in main(), used everywhere
+# Global MQTT client instance - initialised in main(), used everywhere
 mqtt_client: MQTTClient = None
 
 # =====================================================================
@@ -229,6 +237,44 @@ camera_bbox_area_history = {
     0: defaultdict(lambda: deque(maxlen=5)),
     1: defaultdict(lambda: deque(maxlen=5))
 }
+
+# =====================================================================
+# v2.2 TRACKING ROBUSTNESS STRUCTURES
+# =====================================================================
+#
+# These structures support the three v2.2 tracking fixes:
+#   1. Class smoothing (track_label_history)
+#   2. Authoritative-camera counting (COUNTING_CAMERA_ID)
+#   3. Time-window dedupe (recent_count_events)
+# =====================================================================
+
+# Per-(camera_id, local_track_id) label history.
+# Used by get_smoothed_label() to return the dominant label over
+# the last LABEL_HISTORY_LEN frames instead of the raw per-frame label.
+# This prevents single-frame class flickers (e.g. coke -> sprite -> coke)
+# from causing the global ID system to register a second product
+# or increment the wrong counter.
+LABEL_HISTORY_LEN  = 15
+LABEL_SMOOTH_MIN   = 5     # need >= this many samples before smoothing kicks in
+track_label_history = defaultdict(lambda: deque(maxlen=LABEL_HISTORY_LEN))
+
+# Authoritative camera for counting and TTS announcements.
+# Camera 1 (the lower camera) was empirically the source of cross-camera
+# duplicate exits because items leave its FOV last, after camera 0 has
+# already lost the track. Demoting it to display-only kills that path.
+# Both cameras still run detection, tracking, and overlay drawing.
+COUNTING_CAMERA_ID = 0
+
+# Recent count events for cross-camera + cross-track duplicate suppression.
+# Each entry is (timestamp, smoothed_label, direction). Any new count event
+# matching an entry within DEDUPE_WINDOW_SEC seconds is suppressed.
+# This is a belt-and-suspenders backstop: in the normal case the
+# authoritative-camera rule alone prevents duplicates, but if a track
+# splits (same physical object getting two global IDs in quick succession
+# on the same camera), this catches it.
+DEDUPE_WINDOW_SEC   = 1.5
+recent_count_events = deque(maxlen=200)
+recent_count_lock   = threading.Lock()
 
 # =====================================================================
 # HARDWARE CONTROL FUNCTIONS
@@ -576,7 +622,7 @@ def generate_beep_file(path="sounds/beep.wav", freq=880, duration=0.12, volume=0
     Played through pygame before each TTS announcement so the beep and
     voice both come from the same speaker output.
 
-    Only generated once — skipped if the file already exists.
+    Only generated once - skipped if the file already exists.
 
     Args:
         path     (str):   Output file path.
@@ -1130,7 +1176,7 @@ class HailoDetectionCallback(app_callback_class):
                     print(f"Loaded planogram from env cache: {len(existing)} products")
                 else:
                     self.tracking_data.machine_planogram = []
-                    print("No planogram available — no machine ID set")
+                    print("No planogram available - no machine ID set")
                 return
 
             existing = self.load_planogram_env()
@@ -1148,7 +1194,7 @@ class HailoDetectionCallback(app_callback_class):
                 video_monitor_thread.start()
                 return
 
-            print(f"No valid cache for machine {current_machine_id} — fetching from API")
+            print(f"No valid cache for machine {current_machine_id} - fetching from API")
             self.fetch_and_store_initial_planogram(current_machine_id)
 
         except Exception as e:
@@ -1280,7 +1326,7 @@ class HailoDetectionCallback(app_callback_class):
                 try:
                     refresh_machine_id = self.load_machine_id_env()
                     if not refresh_machine_id:
-                        print("No machine ID for refresh — skipping")
+                        print("No machine ID for refresh - skipping")
                         time.sleep(1000)
                         continue
 
@@ -1339,7 +1385,7 @@ class HailoDetectionCallback(app_callback_class):
             return {
                 "valid":           True,
                 "product_details": matches[0],
-                "message":         f"{detected_product} validated — found in planogram"
+                "message":         f"{detected_product} validated - found in planogram"
             }
         else:
             return {
@@ -1430,7 +1476,7 @@ class HailoDetectionApp:
         while self.door_monitor_active:
             door_sw = GPIO.input(DOOR_SWITCH_PIN)
             if door_sw == 0 and time.time() - start_time > 5:
-                print("Door closed — initiating shutdown")
+                print("Door closed - initiating shutdown")
                 self.shutdown()
                 break
             time.sleep(0.1)
@@ -1441,7 +1487,7 @@ class HailoDetectionApp:
                 return
             self.shutdown_called = True
 
-        print("Shutting down pipeline…")
+        print("Shutting down pipeline...")
 
         self.door_monitor_active = False
         self.user_data.tracking_data.shutdown_event.set()
@@ -1487,7 +1533,7 @@ class HailoDetectionApp:
                 if msg:
                     err, debug = msg.parse_error()
                     print(f"Pipeline failed: {err.message} | {debug}")
-                raise Exception("Pipeline failed to start — camera may be busy")
+                raise Exception("Pipeline failed to start - camera may be busy")
 
             print("Pipeline started successfully")
             self.loop.run()
@@ -1497,7 +1543,7 @@ class HailoDetectionApp:
             raise
 
         finally:
-            print("Pipeline run() cleanup…")
+            print("Pipeline run() cleanup...")
             self.user_data.tracking_data.shutdown_event.set()
             self.user_data.shutdown_event.set()
 
@@ -1517,10 +1563,141 @@ class HailoDetectionApp:
                     display_process.join(timeout=2)
 
 # =====================================================================
+# v2.2 LABEL SMOOTHING
+# =====================================================================
+
+def get_smoothed_label(camera_id, local_track_id, raw_label):
+    """
+    Return the dominant label observed for this (camera, local_track_id)
+    over the last LABEL_HISTORY_LEN frames. This kills single-frame class
+    flickers that would otherwise cause spurious second global IDs or
+    increment the wrong product counter.
+
+    Behavior:
+    - If raw_label is empty/None: return it unchanged (nothing to smooth).
+    - For the first LABEL_SMOOTH_MIN frames: return raw_label
+      (not enough samples yet to trust the histogram).
+    - After that: return the most common label in the rolling window.
+
+    Args:
+        camera_id      (int): Camera ID (0 or 1).
+        local_track_id (int): Local track ID assigned by hailotracker.
+        raw_label      (str): Per-frame label from the current detection.
+
+    Returns:
+        str: Smoothed label.
+    """
+    if not raw_label:
+        return raw_label
+
+    key = (camera_id, local_track_id)
+    track_label_history[key].append(raw_label)
+
+    history = track_label_history[key]
+    if len(history) < LABEL_SMOOTH_MIN:
+        return raw_label
+
+    # Counter.most_common ties go to insertion order; that's fine here -
+    # if two labels are exactly tied we just keep whichever appeared first.
+    dominant_label, _ = Counter(history).most_common(1)[0]
+    return dominant_label
+
+
+def cleanup_label_history(camera_id, active_local_track_ids):
+    """
+    Drop label-history entries for tracks that are no longer active.
+    Called from the same place as cleanup_inactive_tracks() so that
+    the new structure is garbage-collected on the same cadence.
+
+    Args:
+        camera_id              (int): Camera ID (0 or 1).
+        active_local_track_ids (set): Currently active local track IDs.
+    """
+    stale = [
+        key for key in track_label_history.keys()
+        if key[0] == camera_id and key[1] not in active_local_track_ids
+    ]
+    for key in stale:
+        del track_label_history[key]
+
+# =====================================================================
+# v2.2 TIME-WINDOW DEDUPE
+# =====================================================================
+
+def is_duplicate_count(label, direction, now=None):
+    """
+    Return True if a count event for (label, direction) has occurred
+    within the last DEDUPE_WINDOW_SEC seconds.
+
+    This is the third defense-in-depth layer:
+      1. Label smoothing prevents flicker-driven duplicates.
+      2. COUNTING_CAMERA_ID prevents cross-camera duplicates.
+      3. This function catches anything that survives both - typically a
+         track that the hailotracker drops and then re-acquires with a new
+         local_track_id within a short window (which produces a new global
+         ID and would otherwise count again).
+
+    Note: This is per (label, direction) - NOT per global_id. That's
+    deliberate. The whole point is to catch the case where the same
+    physical object gets two different global IDs and we want to suppress
+    the second count even though its global_id has never been counted before.
+
+    Side effect: if the event is NOT a duplicate, it is recorded.
+
+    Args:
+        label     (str): Smoothed product label.
+        direction (str): 'entry' or 'exit'.
+        now       (float, optional): Override timestamp (for testing).
+
+    Returns:
+        bool: True if this is a duplicate event that should be suppressed.
+    """
+    if now is None:
+        now = time.time()
+
+    with recent_count_lock:
+        # Drop expired events from the front of the deque.
+        while recent_count_events and now - recent_count_events[0][0] > DEDUPE_WINDOW_SEC:
+            recent_count_events.popleft()
+
+        # Check for any matching event still inside the window.
+        for ts, lbl, direc in recent_count_events:
+            if lbl == label and direc == direction:
+                return True
+
+        # Not a duplicate - record this event so the NEXT call sees it.
+        recent_count_events.append((now, label, direction))
+        return False
+
+
+def reset_dedupe_state():
+    """
+    Clear the dedupe deque between transactions so that count events
+    from a previous customer cannot suppress events for a new one.
+    Called from product_movement_announcer.reset() chain - see
+    run_tracking() PHASE 2 transaction setup.
+    """
+    with recent_count_lock:
+        recent_count_events.clear()
+
+# =====================================================================
 # CROSS-CAMERA TRACKING
 # =====================================================================
 
 def get_global_track_id(camera_id, local_track_id, features=None, label=None):
+    """
+    Get or create a global track ID for cross-camera tracking.
+
+    v2.2 NOTE: This function is now called with the SMOOTHED label
+    (see get_smoothed_label() above). Feeding the smoothed label here
+    means the (camera_id, local_track_id) -> global_id mapping is
+    stable across single-frame class flickers.
+
+    The label-matching cross-camera fallback is preserved but in v2.2
+    practice the authoritative-counting-camera rule means cross-camera
+    matches no longer affect the count - they only affect on-screen
+    display continuity.
+    """
     global global_track_counter, local_to_global_id_map
     global global_track_labels, active_objects_per_camera
 
@@ -1577,6 +1754,9 @@ def cleanup_inactive_tracks(camera_id, active_local_track_ids):
                 del active_objects_per_camera[cam_id][label][local_id]
                 if not active_objects_per_camera[cam_id][label]:
                     del active_objects_per_camera[cam_id][label]
+
+    # v2.2: also drop label history for inactive tracks
+    cleanup_label_history(camera_id, active_local_track_ids)
 
 # =====================================================================
 # MOVEMENT DIRECTION ANALYSIS
@@ -1686,6 +1866,9 @@ class ProductMovementAnnouncer:
 
     def reset(self):
         """Clear state. Call at the start of each new transaction."""
+        # v2.2: also clear the time-window dedupe deque so events
+        # from a previous customer can't poison the new transaction.
+        reset_dedupe_state()
         print("[MovementTTS] Announcer reset for new transaction")
 
     def _beep_and_speak(self, text: str):
@@ -1704,13 +1887,13 @@ class ProductMovementAnnouncer:
         spoken_name = SPEECH_NAMES.get(label, label)
         text        = f"one {spoken_name} removed"
         self._beep_and_speak(text)
-        print(f"[MovementTTS] EXIT — '{text}'")
+        print(f"[MovementTTS] EXIT - '{text}'")
 
     def on_entry(self, label: str):
         spoken_name = SPEECH_NAMES.get(label, label)
         text        = f"one {spoken_name} returned"
         self._beep_and_speak(text)
-        print(f"[MovementTTS] ENTRY — '{text}'")
+        print(f"[MovementTTS] ENTRY - '{text}'")
 
     def speak_closing_summary(self, class_counters: dict):
         """
@@ -1754,7 +1937,7 @@ class ProductMovementAnnouncer:
                     f"Your refund will be processed shortly."
                 )
 
-            print(f"[MovementTTS] CLOSING — '{message}'")
+            print(f"[MovementTTS] CLOSING - '{message}'")
 
             os.makedirs("sounds/closing", exist_ok=True)
             closing_path = "sounds/closing/closing_summary.mp3"
@@ -1790,6 +1973,17 @@ def detection_callback(pad, info, callback_data):
     """
     Process each video frame: detect, track, validate, count, announce,
     and push data to the WebSocket.
+
+    v2.2 CHANGES (counting logic only):
+      - Per-detection label is smoothed via get_smoothed_label() before
+        being used for global ID lookup, counter increments, validation,
+        TTS, and websocket payload.
+      - Counter increments and TTS calls are gated by
+        stream_id == COUNTING_CAMERA_ID. Camera 1 still tracks and draws.
+      - A final time-window dedupe (is_duplicate_count) suppresses any
+        same-(label, direction) events that fire within DEDUPE_WINDOW_SEC.
+      - The Hailo pipeline, the Gst probe wiring, and frame compositing
+        are unchanged.
 
     Returns:
         Gst.PadProbeReturn.OK: Always continue pipeline processing.
@@ -1835,7 +2029,7 @@ def detection_callback(pad, info, callback_data):
 
     # STEP 5: Process each detection
     for detection in detections:
-        label      = detection.get_label()
+        raw_label  = detection.get_label()
         bbox       = detection.get_bbox()
         confidence = detection.get_confidence()
         class_id   = detection.get_class_id()
@@ -1845,6 +2039,14 @@ def detection_callback(pad, info, callback_data):
         if len(track) == 1:
             track_id = track[0].get_id()
             active_local_track_ids.add(track_id)
+
+        # ----- v2.2 LABEL SMOOTHING -----
+        # Replace the per-frame label with the dominant label across the
+        # last LABEL_HISTORY_LEN frames for this (camera, track). Every
+        # downstream use - global-id lookup, counter increment, validation,
+        # TTS, WebSocket payload - uses the smoothed label.
+        label = get_smoothed_label(stream_id, track_id, raw_label)
+        # --------------------------------
 
         x1     = int(bbox.xmin() * width)
         y1     = int(bbox.ymin() * height)
@@ -1864,7 +2066,12 @@ def detection_callback(pad, info, callback_data):
         color = compute_color_for_labels(class_id)
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
-        label_text = (f"{label} L:{track_id} G:{global_id} "
+        # v2.2: overlay shows "*" next to label if it was smoothed (i.e.
+        # raw_label != smoothed label) so the operator can see flicker
+        # being suppressed during testing. Remove the asterisk handling
+        # if you want a cleaner display in production.
+        flicker_marker = "" if raw_label == label else "*"
+        label_text = (f"{label}{flicker_marker} L:{track_id} G:{global_id} "
                       f"{'Valid' if validation_result['valid'] else 'Invalid'}")
         text_color = (0, 255, 0) if validation_result['valid'] else (0, 0, 255)
         cv2.putText(frame, label_text, (x1, y1 - 10),
@@ -1878,14 +2085,25 @@ def detection_callback(pad, info, callback_data):
         )
 
         # STEP 6: Update counters and announce
-        if direction:
-            should_count = (
-                global_id not in user_data.tracking_data.counted_tracks.get(direction, set()) or
-                (global_id in global_last_counted_direction and
-                 direction != global_last_counted_direction[global_id])
+        # v2.2: only the authoritative camera (stream_id == COUNTING_CAMERA_ID)
+        # is allowed to increment counters or fire TTS. Both cameras still
+        # run direction analysis above (so on-screen trails on camera 1 work),
+        # but only camera 0's events become real counts.
+        if direction and stream_id == COUNTING_CAMERA_ID:
+            already_counted = (
+                global_id in user_data.tracking_data.counted_tracks.get(direction, set())
             )
+            direction_just_changed = (
+                global_id in global_last_counted_direction and
+                direction != global_last_counted_direction[global_id]
+            )
+            should_count = (not already_counted) or direction_just_changed
 
-            if should_count:
+            # v2.2: time-window dedupe.
+            # is_duplicate_count records the event when it returns False,
+            # so call it only AFTER the should_count gate to avoid
+            # poisoning the dedupe window with events we never counted.
+            if should_count and not is_duplicate_count(label, direction):
                 user_data.tracking_data.class_counters[direction][label] += 1
 
                 if direction == "exit":
@@ -1918,7 +2136,7 @@ def detection_callback(pad, info, callback_data):
                         }
                     user_data.tracking_data.invalidated_products[direction][label]["count"] += 1
 
-    # STEP 7: Cleanup inactive tracks
+    # STEP 7: Cleanup inactive tracks (also clears v2.2 label history)
     cleanup_inactive_tracks(stream_id, active_local_track_ids)
 
     # STEP 8: Update FPS timestamp
@@ -1928,7 +2146,7 @@ def detection_callback(pad, info, callback_data):
     current_label = next((det.get_label() for det in detections), None)
     draw_counts(frame, user_data.tracking_data.class_counters, current_label)
 
-    # STEP 10: Convert RGB → BGR for OpenCV
+    # STEP 10: Convert RGB -> BGR for OpenCV
     frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
     # STEP 11: Store frame per camera and combine
@@ -2010,7 +2228,7 @@ async def run_tracking(websocket: WebSocket):
                     product_name       = message.get('product_name')
                     image_count        = message.get('image_count')
 
-                    print(f"Transaction started — deposit: ${deposit}, "
+                    print(f"Transaction started - deposit: ${deposit}, "
                           f"machine: {machine_id}, user: {user_id}, "
                           f"tx: {transaction_id}")
 
@@ -2083,6 +2301,9 @@ async def run_tracking(websocket: WebSocket):
                 print(f"[Memory] Transaction {transaction_id} started")
 
             # Reset movement announcer for this transaction
+            # v2.2: announcer.reset() now also clears the time-window
+            # dedupe deque, so a previous customer's events cannot
+            # suppress this customer's first count.
             product_movement_announcer.reset()
 
             door_monitor_active = True
@@ -2093,14 +2314,14 @@ async def run_tracking(websocket: WebSocket):
                 while door_monitor_active:
                     door_sw = 1  # TODO: Replace with GPIO.input(DOOR_SWITCH_PIN)
                     if door_sw == 0:
-                        print("Door closed — stopping tracking")
+                        print("Door closed - stopping tracking")
                         callback.tracking_data.shutdown_event.set()
                         callback.shutdown_event.set()
                         door_monitor_active = False
                         try:
                             await websocket.send_json({
                                 "status":  "stopped",
-                                "message": "Door closed — tracking stopped"
+                                "message": "Door closed - tracking stopped"
                             })
                         except Exception as e:
                             print(f"Error sending door-close message: {e}")
@@ -2127,7 +2348,7 @@ async def run_tracking(websocket: WebSocket):
             websocket_sender.start()
 
             def signal_handler(signum, frame):
-                print("\nCtrl+C detected — initiating shutdown…")
+                print("\nCtrl+C detected - initiating shutdown...")
                 callback.tracking_data.shutdown_event.set()
                 callback.shutdown_event.set()
                 cv2.destroyAllWindows()
@@ -2138,7 +2359,7 @@ async def run_tracking(websocket: WebSocket):
 
             with pipeline_lock:
                 if current_pipeline_app is not None:
-                    print("Stopping previous pipeline app…")
+                    print("Stopping previous pipeline app...")
                     current_pipeline_app.shutdown()
                     time.sleep(2)
                 current_pipeline_app = detection_app
@@ -2289,7 +2510,7 @@ def capture_images(device_id, num_images=3):
 
 def upload_images_to_api(camera1_images, machine_id, machine_identifier,
                          user_id, product_name, image_count):
-    api_url = "https://stg-sfapi.nuboxtech.com/index.php/mobile_app/product/Product/upload_product_images"
+    api_url = "https://stg-sfapi.nuboxtech.com/index.php/mobile_app/product/Product/upload_product_images""
 
     username = 'admin'
     password = '1234'
@@ -2417,6 +2638,7 @@ class TransactionMemoryManager:
         global object_trails, global_trails, camera_movement_history
         global camera_bbox_area_history, local_to_global_id_map
         global active_objects_per_camera, global_movement_history
+        global track_label_history  # v2.2
 
         tracks = trans_data['tracks_created']
         trails = trans_data['trails_created']
@@ -2459,12 +2681,18 @@ class TransactionMemoryManager:
                 global_movement_history[gid].clear()
                 del global_movement_history[gid]
 
+        # v2.2: also clear label-history entries belonging to this txn
+        for key in list(track_label_history.keys()):
+            _, local_id = key
+            if local_id in tracks:
+                del track_label_history[key]
+
     def _recreate_global_dictionaries(self):
         global object_trails, global_trails, camera_movement_history
         global camera_bbox_area_history, active_objects_per_camera
         global global_movement_history, local_to_global_id_map
 
-        print("[Cleanup] Recreating global dictionaries…")
+        print("[Cleanup] Recreating global dictionaries...")
 
         active_tracks     = set()
         active_trails_set = set()
@@ -2759,7 +2987,7 @@ class TTSManager:
     def generate_door_audio_files(self):
         try:
             gTTS(text="Open the door",        lang='en', slow=False).save("sounds/door_open.mp3")
-            gTTS(text="Door has been closed",  lang='en', slow=False).save("sounds/door_close.mp3")
+            gTTS(text="Door has been closed", lang='en', slow=False).save("sounds/door_close.mp3")
             print("Door audio files generated")
         except Exception as e:
             print(f"Error generating door audio: {e}")
@@ -2872,7 +3100,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 readyToProcess = True
 
         if not done:
-            print("No tracking executed — sending initial update")
+            print("No tracking executed - sending initial update")
             callback = HailoDetectionCallback(
                 websocket, deposit, machine_id,
                 machine_identifier, user_id, transaction_id
@@ -2894,7 +3122,7 @@ async def websocket_endpoint(websocket: WebSocket):
         print(f"WebSocket tracking error: {e}")
 
     finally:
-        print("WebSocket cleanup starting…")
+        print("WebSocket cleanup starting...")
 
         try:
             if 'callback' in locals() and hasattr(callback, 'transaction_id') \
@@ -2939,7 +3167,7 @@ async def cleanup_websocket_sounds():
     camera_covered_sound_playing = False
     price_alert_sound_playing    = False
     tts_manager.stop_all_audio()
-    print("WebSocket cleanup — all audio stopped")
+    print("WebSocket cleanup - all audio stopped")
 
 # =====================================================================
 # HEALTH CHECK AND MONITORING ENDPOINTS
@@ -2994,7 +3222,7 @@ def main():
 
     app.start_time = time.time()
 
-    print("Creating required directories…")
+    print("Creating required directories...")
     os.makedirs('saved_videos',    exist_ok=True)
     os.makedirs('camera_images',   exist_ok=True)
     os.makedirs('sounds',          exist_ok=True)
@@ -3002,7 +3230,7 @@ def main():
     os.makedirs('sounds/closing',  exist_ok=True)
     print("Directories ready")
 
-    print("Setting up audio alerts…")
+    print("Setting up audio alerts...")
     setup_cover_alert_sound()
     print("Camera cover alerts ready")
 
@@ -3038,7 +3266,7 @@ def main():
     print("GPIO and MQTT cleanup handlers registered")
 
     print("\n" + "="*60)
-    print("SMART FRIDGE SYSTEM STARTED")
+    print("SMART FRIDGE SYSTEM STARTED (v2.2)")
     print("="*60)
     print(f"Memory at startup: {psutil.Process().memory_info().rss / 1024 / 1024:.1f}MB")
     print(f"Available memory:  {psutil.virtual_memory().available / 1024 / 1024:.1f}MB")
@@ -3048,6 +3276,10 @@ def main():
     print(f"MQTT machine ID:   {MQTT_MACHINE_ID}")
     print(f"MQTT topics:       AIfridge/{MQTT_MACHINE_ID}/rpi/connectionStatus")
     print(f"                   AIfridge/{MQTT_MACHINE_ID}/rpi/doorStatus")
+    print(f"Counting camera:   {COUNTING_CAMERA_ID}  (other cameras: display only)")
+    print(f"Label smoothing:   {LABEL_HISTORY_LEN}-frame window, "
+          f"{LABEL_SMOOTH_MIN}-frame minimum")
+    print(f"Dedupe window:     {DEDUPE_WINDOW_SEC}s per (label, direction)")
     print("\nPress Ctrl+C to stop")
     print("="*60 + "\n")
 
@@ -3063,5 +3295,5 @@ if __name__ == "__main__":
     main()
 
 # =====================================================================
-# END OF SMART FRIDGE DETECTION SYSTEM v2.1
+# END OF SMART FRIDGE DETECTION SYSTEM v2.2
 # =====================================================================
