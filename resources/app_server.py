@@ -2510,7 +2510,7 @@ def capture_images(device_id, num_images=3):
 
 def upload_images_to_api(camera1_images, machine_id, machine_identifier,
                          user_id, product_name, image_count):
-    api_url = "https://stg-sfapi.nuboxtech.com/index.php/mobile_app/product/Product/upload_product_images""
+    api_url = "https://stg-sfapi.nuboxtech.com/index.php/mobile_app/product/Product/upload_product_images"
 
     username = 'admin'
     password = '1234'
