@@ -34,22 +34,16 @@ WORKFLOW:
 5. Door closes -> MQTT publishes door closed -> Closing TTS summary plays
 6. Video saved -> Refund processed -> System cleans up -> Ready for next customer
 
-TRACKING CHANGES IN v2.3:
-- Class smoothing (carried over from v2.2): per-track label histogram
-  suppresses single-frame class flips.
-- Single authoritative counting camera (carried over): only camera 0
-  increments counters and fires TTS. Camera 1 still tracks and draws.
-- Time-window dedupe is now keyed on (global_id, direction) instead of
-  (label, direction). This means two Cokes grabbed in quick succession
-  are BOTH counted (different global_ids) while a single physical object
-  that gets split into two global_ids by tracker glitches is still
-  suppressed. Trades silent miss-counts for recoverable over-counts.
-- Distinct beeps for entry vs exit: high 880 Hz beep for exit (item
-  leaving), low 440 Hz beep for entry (item returning). Lets the
-  operator distinguish events by ear without watching the screen.
+TRACKING CHANGES IN v2.2:
+- Class smoothing: per-track label histogram suppresses single-frame
+  class flips that previously created spurious second global IDs.
+- Single authoritative counting camera: only camera 0 increments
+  counters and fires TTS. Camera 1 still tracks and draws boxes.
+- Time-window dedupe: 1.5s suppression window prevents same-class
+  back-to-back count events from leaking through despite the above.
 
 AUTHOR: Mike
-VERSION: 2.3
+VERSION: 2.2
 LAST UPDATED: 2026
 =====================================================================
 """
@@ -155,7 +149,7 @@ data_deque: Dict[int, deque] = {}
 # In production, this is read automatically from the WebSocket
 # start_preview message via os.environ['MACHINE_ID'].
 
-MQTT_MACHINE_ID = "170"    # change this to your test machine ID
+70TT_MACHINE_ID = "170   # change this to your test machine ID
 
 # Global MQTT client instance - initialised in main(), used everywhere
 mqtt_client: MQTTClient = None
@@ -271,18 +265,13 @@ track_label_history = defaultdict(lambda: deque(maxlen=LABEL_HISTORY_LEN))
 # Both cameras still run detection, tracking, and overlay drawing.
 COUNTING_CAMERA_ID = 0
 
-# Recent count events for tracker-split duplicate suppression.
-# Each entry is (timestamp, global_id, direction). A new count event for
-# the SAME global_id within DEDUPE_WINDOW_SEC seconds is suppressed.
-#
-# v2.3 NOTE: keyed on global_id (not label). This means two Cokes
-# grabbed in quick succession are BOTH counted - they have different
-# global_ids. What still gets suppressed is a single physical object
-# that the tracker briefly loses and re-acquires under a new local
-# track ID, producing a fresh global_id for the same can within the
-# 1.5s window. That re-acquisition path is the only thing this dedupe
-# is for now; cross-camera duplicates are handled by COUNTING_CAMERA_ID
-# above.
+# Recent count events for cross-camera + cross-track duplicate suppression.
+# Each entry is (timestamp, smoothed_label, direction). Any new count event
+# matching an entry within DEDUPE_WINDOW_SEC seconds is suppressed.
+# This is a belt-and-suspenders backstop: in the normal case the
+# authoritative-camera rule alone prevents duplicates, but if a track
+# splits (same physical object getting two global IDs in quick succession
+# on the same camera), this catches it.
 DEDUPE_WINDOW_SEC   = 1.5
 recent_count_events = deque(maxlen=200)
 recent_count_lock   = threading.Lock()
@@ -420,7 +409,6 @@ def draw_counts(frame, class_counters, label):
         9:  "nasiLemakAyamRendang",
         10: "kampungFriedRice",
         11: "ayamMasakMerahWithRice",
-    }
 
     total_entry = sum(class_counters["entry"].values())
     total_exit  = sum(class_counters["exit"].values())
@@ -624,18 +612,22 @@ def setup_cover_alert_sound():
     return alert_file
 
 # =====================================================================
-# BEEP SOUND GENERATORS (entry + exit)
+# BEEP SOUND GENERATOR
 # =====================================================================
 
-def _generate_beep_wav(path, freq, duration, volume):
+def generate_beep_file(path="sounds/beep.wav", freq=880, duration=0.12, volume=0.8):
     """
-    Internal helper: synthesise a single sine-wave beep WAV file.
-    Skipped if the file already exists.
+    Generate a short sine-wave beep WAV file and save it to disk.
+
+    Played through pygame before each TTS announcement so the beep and
+    voice both come from the same speaker output.
+
+    Only generated once - skipped if the file already exists.
 
     Args:
         path     (str):   Output file path.
-        freq     (int):   Tone frequency in Hz.
-        duration (float): Beep length in seconds.
+        freq     (int):   Tone frequency in Hz (880 = high A, crisp and clear).
+        duration (float): Beep length in seconds (0.12 s is short but audible).
         volume   (float): Amplitude scale 0.0-1.0.
     """
     if os.path.exists(path):
@@ -658,45 +650,7 @@ def _generate_beep_wav(path, freq, duration, volume):
         wf.setframerate(sample_rate)
         wf.writeframes(samples.tobytes())
 
-    print(f"Beep generated: {path} (freq={freq}Hz, dur={duration}s)")
-
-
-# Two distinct beep paths - one for each direction. Stored as module
-# constants so the announcer can reference them without hardcoding paths.
-BEEP_EXIT_PATH  = "sounds/beep_exit.wav"   # high tone  - item leaving fridge
-BEEP_ENTRY_PATH = "sounds/beep_entry.wav"  # low tone   - item returning
-
-
-def generate_beep_files():
-    """
-    Generate both entry and exit beep WAV files on disk.
-
-    EXIT  -> 880 Hz (high A, bright/attention-grabbing)
-             "something is leaving the fridge"
-    ENTRY -> 440 Hz (low A, softer pitch)
-             "something came back"
-
-    The one-octave gap between the two is intentional - the human ear
-    distinguishes octave-spaced tones much more reliably than tones a few
-    Hz apart, so the operator can tell entry from exit at a glance even
-    in a noisy retail environment.
-
-    Both files are only generated once - skipped if they already exist.
-    """
-    _generate_beep_wav(BEEP_EXIT_PATH,  freq=880, duration=0.12, volume=0.8)
-    _generate_beep_wav(BEEP_ENTRY_PATH, freq=440, duration=0.18, volume=0.8)
-
-
-# Backwards-compatible shim: older code paths and main() may still call
-# generate_beep_file() with the original signature. Route it to the new
-# pair generator so existing call sites keep working without edits.
-def generate_beep_file(path=None, freq=None, duration=None, volume=None):
-    """
-    Backwards-compatible wrapper. Generates BOTH beep files.
-    Original signature args are ignored - kept only so existing
-    callers don't break.
-    """
-    generate_beep_files()
+    print(f"Beep sound generated: {path}")
 
 # =====================================================================
 # CAMERA COVER ALERT HANDLER
@@ -1670,33 +1624,29 @@ def cleanup_label_history(camera_id, active_local_track_ids):
 # v2.2 TIME-WINDOW DEDUPE
 # =====================================================================
 
-def is_duplicate_count(global_id, direction, now=None):
+def is_duplicate_count(label, direction, now=None):
     """
-    Return True if a count event for (global_id, direction) has occurred
+    Return True if a count event for (label, direction) has occurred
     within the last DEDUPE_WINDOW_SEC seconds.
 
-    v2.3 CHANGE: keyed on global_id, NOT label.
+    This is the third defense-in-depth layer:
+      1. Label smoothing prevents flicker-driven duplicates.
+      2. COUNTING_CAMERA_ID prevents cross-camera duplicates.
+      3. This function catches anything that survives both - typically a
+         track that the hailotracker drops and then re-acquires with a new
+         local_track_id within a short window (which produces a new global
+         ID and would otherwise count again).
 
-    What this catches:
-      - Same physical object gets two different global_ids in quick
-        succession because the tracker briefly lost it and re-acquired
-        it. Without dedupe, both global_ids would count.
-
-    What this deliberately does NOT catch:
-      - Two distinct items of the same product (e.g. two Cokes) grabbed
-        within 1.5s. They have different global_ids and BOTH count
-        correctly. This is the v2.3 fix - v2.2's label-keyed dedupe
-        would have silently dropped the second Coke.
-
-    Cross-camera duplicates are not this function's concern - the
-    COUNTING_CAMERA_ID rule above means camera 1's events never reach
-    this function in the first place.
+    Note: This is per (label, direction) - NOT per global_id. That's
+    deliberate. The whole point is to catch the case where the same
+    physical object gets two different global IDs and we want to suppress
+    the second count even though its global_id has never been counted before.
 
     Side effect: if the event is NOT a duplicate, it is recorded.
 
     Args:
-        global_id (int):           Global track ID for the object.
-        direction (str):           'entry' or 'exit'.
+        label     (str): Smoothed product label.
+        direction (str): 'entry' or 'exit'.
         now       (float, optional): Override timestamp (for testing).
 
     Returns:
@@ -1711,12 +1661,12 @@ def is_duplicate_count(global_id, direction, now=None):
             recent_count_events.popleft()
 
         # Check for any matching event still inside the window.
-        for ts, gid, direc in recent_count_events:
-            if gid == global_id and direc == direction:
+        for ts, lbl, direc in recent_count_events:
+            if lbl == label and direc == direction:
                 return True
 
         # Not a duplicate - record this event so the NEXT call sees it.
-        recent_count_events.append((now, global_id, direction))
+        recent_count_events.append((now, label, direction))
         return False
 
 
@@ -1921,15 +1871,11 @@ class ProductMovementAnnouncer:
         reset_dedupe_state()
         print("[MovementTTS] Announcer reset for new transaction")
 
-    def _beep_and_speak(self, text: str, beep_path: str):
-        """
-        Play a beep then speak text. Beep file is direction-specific:
-        BEEP_EXIT_PATH  for "removed" announcements (high tone)
-        BEEP_ENTRY_PATH for "returned" announcements (low tone)
-        """
+    def _beep_and_speak(self, text: str):
         def _run():
             try:
-                if beep_path and os.path.exists(beep_path):
+                beep_path = "sounds/beep.wav"
+                if os.path.exists(beep_path):
                     tts_manager.play_mp3_sync(beep_path, volume=0.6)
             except Exception as e:
                 print(f"[MovementTTS] Beep error: {e}")
@@ -1940,15 +1886,13 @@ class ProductMovementAnnouncer:
     def on_exit(self, label: str):
         spoken_name = SPEECH_NAMES.get(label, label)
         text        = f"one {spoken_name} removed"
-        # High beep for exit - matches "something is leaving" intuition
-        self._beep_and_speak(text, BEEP_EXIT_PATH)
+        self._beep_and_speak(text)
         print(f"[MovementTTS] EXIT - '{text}'")
 
     def on_entry(self, label: str):
         spoken_name = SPEECH_NAMES.get(label, label)
         text        = f"one {spoken_name} returned"
-        # Low beep for entry - softer, signals "something came back"
-        self._beep_and_speak(text, BEEP_ENTRY_PATH)
+        self._beep_and_speak(text)
         print(f"[MovementTTS] ENTRY - '{text}'")
 
     def speak_closing_summary(self, class_counters: dict):
@@ -2155,13 +2099,11 @@ def detection_callback(pad, info, callback_data):
             )
             should_count = (not already_counted) or direction_just_changed
 
-            # v2.3: time-window dedupe.
+            # v2.2: time-window dedupe.
             # is_duplicate_count records the event when it returns False,
             # so call it only AFTER the should_count gate to avoid
             # poisoning the dedupe window with events we never counted.
-            # v2.3: keyed on global_id (not label) so that two distinct
-            # items of the same product can BOTH count correctly.
-            if should_count and not is_duplicate_count(global_id, direction):
+            if should_count and not is_duplicate_count(label, direction):
                 user_data.tracking_data.class_counters[direction][label] += 1
 
                 if direction == "exit":
@@ -2568,7 +2510,7 @@ def capture_images(device_id, num_images=3):
 
 def upload_images_to_api(camera1_images, machine_id, machine_identifier,
                          user_id, product_name, image_count):
-    api_url = "https://stg-sfapi.nuboxtech.com/index.php/mobile_app/product/Product/upload_product_images"
+    api_url = "https://stg-sfapi.nuboxtech.com/index.php/mobile_app/product/Product/upload_product_images""
 
     username = 'admin'
     password = '1234'
@@ -3292,8 +3234,8 @@ def main():
     setup_cover_alert_sound()
     print("Camera cover alerts ready")
 
-    generate_beep_files()
-    print("Entry/exit beep sounds ready")
+    generate_beep_file()
+    print("Beep sound ready")
 
     setup_product_upload_alerts()
     print("Product upload alerts ready")
@@ -3324,7 +3266,7 @@ def main():
     print("GPIO and MQTT cleanup handlers registered")
 
     print("\n" + "="*60)
-    print("SMART FRIDGE SYSTEM STARTED (v2.3)")
+    print("SMART FRIDGE SYSTEM STARTED (v2.2)")
     print("="*60)
     print(f"Memory at startup: {psutil.Process().memory_info().rss / 1024 / 1024:.1f}MB")
     print(f"Available memory:  {psutil.virtual_memory().available / 1024 / 1024:.1f}MB")
@@ -3337,9 +3279,7 @@ def main():
     print(f"Counting camera:   {COUNTING_CAMERA_ID}  (other cameras: display only)")
     print(f"Label smoothing:   {LABEL_HISTORY_LEN}-frame window, "
           f"{LABEL_SMOOTH_MIN}-frame minimum")
-    print(f"Dedupe key:        (global_id, direction), window={DEDUPE_WINDOW_SEC}s")
-    print(f"Exit beep:         880 Hz  ({BEEP_EXIT_PATH})")
-    print(f"Entry beep:        440 Hz  ({BEEP_ENTRY_PATH})")
+    print(f"Dedupe window:     {DEDUPE_WINDOW_SEC}s per (label, direction)")
     print("\nPress Ctrl+C to stop")
     print("="*60 + "\n")
 
@@ -3355,5 +3295,5 @@ if __name__ == "__main__":
     main()
 
 # =====================================================================
-# END OF SMART FRIDGE DETECTION SYSTEM v2.3
+# END OF SMART FRIDGE DETECTION SYSTEM v2.2
 # =====================================================================
