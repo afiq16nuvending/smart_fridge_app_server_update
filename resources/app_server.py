@@ -269,7 +269,7 @@ track_label_history = defaultdict(lambda: deque(maxlen=LABEL_HISTORY_LEN))
 # duplicate exits because items leave its FOV last, after camera 0 has
 # already lost the track. Demoting it to display-only kills that path.
 # Both cameras still run detection, tracking, and overlay drawing.
-COUNTING_CAMERA_ID = 0
+COUNTING_CAMERA_ID = 1
 
 # Recent count events for tracker-split duplicate suppression.
 # Each entry is (timestamp, global_id, direction). A new count event for
