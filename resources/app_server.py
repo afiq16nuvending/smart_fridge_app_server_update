@@ -14,8 +14,7 @@ MAIN COMPONENTS:
 3. Multi-camera tracking system (camera 0 authoritative for counting)
 4. GPIO control for door locks, LEDs, and buzzer
 5. Transaction memory management
-6. Text-to-speech alerts (beep on every entry and exit; spoken closing
-   thank-you message at end of transaction)
+6. Text-to-speech alerts (beep + spoken announcement for every entry and exit)
 7. MQTT publishing for connection status (online/offline via LWT) and door status
 
 HARDWARE REQUIREMENTS:
@@ -31,26 +30,15 @@ WORKFLOW:
 1. Customer opens app -> WebSocket connects -> MQTT publishes online + door status
 2. Deposit deducted -> Door unlocks -> Cameras start
 3. Customer takes/returns items -> AI tracks movements
-4. Price calculated in real-time -> beep plays on every entry and exit
-5. Door closes -> MQTT publishes door closed -> Closing thank-you TTS plays
+4. Price calculated in real-time -> beep + TTS announces every entry and exit
+5. Door closes -> MQTT publishes door closed -> Closing TTS summary plays
 6. Video saved -> Refund processed -> System cleans up -> Ready for next customer
 
-TRACKING CHANGES IN v2.4:
-- Per-event spoken product readout removed. Entry and exit events now
-  fire ONLY the directional beep - no "one coke removed" voice. The
-  beeps still distinguish direction by pitch (see below).
-- Closing summary no longer names the items taken. Both branches
-  (empty vs items-taken) preserved, just without the item list, so the
-  thank-you cadence stays consistent regardless of what the customer did.
-- All v2.3 changes carried over unchanged: class smoothing, single
-  authoritative counting camera, (global_id, direction) dedupe,
-  distinct entry/exit beep tones.
-
-TRACKING CHANGES IN v2.3 (carried over):
+TRACKING CHANGES IN v2.3:
 - Class smoothing (carried over from v2.2): per-track label histogram
   suppresses single-frame class flips.
 - Single authoritative counting camera (carried over): only camera 0
-  increments counters and fires the beep. Camera 1 still tracks and draws.
+  increments counters and fires TTS. Camera 1 still tracks and draws.
 - Time-window dedupe is now keyed on (global_id, direction) instead of
   (label, direction). This means two Cokes grabbed in quick succession
   are BOTH counted (different global_ids) while a single physical object
@@ -61,7 +49,7 @@ TRACKING CHANGES IN v2.3 (carried over):
   operator distinguish events by ear without watching the screen.
 
 AUTHOR: Mike
-VERSION: 2.4
+VERSION: 2.3
 LAST UPDATED: 2026
 =====================================================================
 """
@@ -276,7 +264,7 @@ LABEL_HISTORY_LEN  = 15
 LABEL_SMOOTH_MIN   = 5     # need >= this many samples before smoothing kicks in
 track_label_history = defaultdict(lambda: deque(maxlen=LABEL_HISTORY_LEN))
 
-# Authoritative camera for counting and beep alerts.
+# Authoritative camera for counting and TTS announcements.
 # Camera 1 (the lower camera) was empirically the source of cross-camera
 # duplicate exits because items leave its FOV last, after camera 0 has
 # already lost the track. Demoting it to display-only kills that path.
@@ -421,11 +409,16 @@ def draw_counts(frame, class_counters, label):
     """
     class_names = {
         0:  "",
-        1:  "chickenAndMushroom",
-        2:  "malatang",
-        3:  "seafoodAndPrawn",
-        4:  "tehTarik",
- 
+        1:  "chickenKatsuCurry",
+        2:  "dakgangjeongRice",
+        3:  "dragonFruit",
+        4:  "guava",
+        5:  "kimchiFriedRice",
+        6:  "kimchiTuna",
+        7:  "mango",
+        8:  "mangoMilk",
+        9:  "pineappleHoney",
+        10: "pinkGuava",
     }
 
     total_entry = sum(class_counters["entry"].values())
@@ -1896,28 +1889,25 @@ def number_to_words(n):
     return words.get(n, str(n))
 
 # =====================================================================
-# PRODUCT MOVEMENT BEEP ANNOUNCER
+# PRODUCT MOVEMENT TTS ANNOUNCER
 # =====================================================================
 
 SPEECH_NAMES: Dict[str, str] = {
-    # Friendlier spoken names for product labels. v2.4 no longer
-    # speaks per-event names so this map is unused at runtime - kept
-    # for the closing summary in case a future version reintroduces
-    # per-item readout.
+    # Add friendlier spoken names for product labels here if needed.
     # Example:
     #   "100plus":          "100 plus",
     #   "mangoMilk":        "mango milk",
     #   "kimchiFriedRice":  "kimchi fried rice",
+    #   "chickenKatsuCurry":"chicken katsu curry",
+    #   "dakgangjeongRice": "dakgangjeong rice",
+    #   "pineappleHoney":   "pineapple honey",
+    #   "pinkGuava":        "pink guava",
 }
 
 
 class ProductMovementAnnouncer:
     """
-    Real-time alerter for product entry and exit events.
-
-    v2.4: beeps only - no per-event TTS readout of product names.
-    The end-of-transaction thank-you message (speak_closing_summary)
-    is preserved but no longer recites the items taken.
+    Real-time TTS announcer for product entry and exit events.
     """
 
     def __init__(self):
@@ -1930,85 +1920,85 @@ class ProductMovementAnnouncer:
         reset_dedupe_state()
         print("[MovementTTS] Announcer reset for new transaction")
 
-    def _beep_only(self, beep_path: str):
+    def _beep_and_speak(self, text: str, beep_path: str):
         """
-        v2.4: play just the directional beep, no TTS.
-        BEEP_EXIT_PATH  -> high 880Hz tone (item leaving)
-        BEEP_ENTRY_PATH -> low  440Hz tone (item returning)
-
-        Async playback so the detection callback never blocks on audio.
-        Previously this was sync because the beep had to finish before
-        the TTS started - that constraint is gone, and async means rapid
-        successive beeps don't queue up and lag behind real events.
+        Play a beep then speak text. Beep file is direction-specific:
+        BEEP_EXIT_PATH  for "removed" announcements (high tone)
+        BEEP_ENTRY_PATH for "returned" announcements (low tone)
         """
         def _run():
             try:
                 if beep_path and os.path.exists(beep_path):
-                    tts_manager.play_mp3_async(beep_path, volume=0.6)
+                    tts_manager.play_mp3_sync(beep_path, volume=0.6)
             except Exception as e:
                 print(f"[MovementTTS] Beep error: {e}")
+            tts_manager.speak_async(text, lang='en')
 
         threading.Thread(target=_run, daemon=True).start()
 
     def on_exit(self, label: str):
-        # v2.4: beep only, no spoken product readout.
-        # High 880Hz beep signals "something is leaving the fridge".
-        self._beep_only(BEEP_EXIT_PATH)
-        print(f"[MovementTTS] EXIT - beep (label={label})")
+        spoken_name = SPEECH_NAMES.get(label, label)
+        text        = f"one {spoken_name} removed"
+        # High beep for exit - matches "something is leaving" intuition
+        self._beep_and_speak(text, BEEP_EXIT_PATH)
+        print(f"[MovementTTS] EXIT - '{text}'")
 
     def on_entry(self, label: str):
-        # v2.4: beep only, no spoken product readout.
-        # Low 440Hz beep signals "something came back".
-        self._beep_only(BEEP_ENTRY_PATH)
-        print(f"[MovementTTS] ENTRY - beep (label={label})")
+        spoken_name = SPEECH_NAMES.get(label, label)
+        text        = f"one {spoken_name} returned"
+        # Low beep for entry - softer, signals "something came back"
+        self._beep_and_speak(text, BEEP_ENTRY_PATH)
+        print(f"[MovementTTS] ENTRY - '{text}'")
 
     def speak_closing_summary(self, class_counters: dict):
         """
-        Speak end-of-transaction thank-you synchronously (blocks until done).
+        Speak end-of-transaction summary synchronously (blocks until done).
         Called from run_tracking() after speak_door_close().
-
-        v2.4: no longer recites the items taken. Two branches preserved
-        so the cadence still adapts to whether the customer took anything:
-          - took nothing  -> "Thank you for visiting..."
-          - took items    -> "Thank you for shopping... refund processed"
-
-        The closing message is computed fresh each transaction but the
-        underlying mp3 is cached on disk per-message (hashed filename)
-        so repeated identical thank-yous skip the gTTS round-trip - same
-        pattern as generate_deposit_audio_file() uses for deposit alerts.
         """
         try:
             all_labels = (set(class_counters["exit"].keys()) |
                           set(class_counters["entry"].keys()))
-            net_items_count = 0
+            net_items  = {}
 
-            # We only need to know IF the customer took anything net,
-            # not what they took. Counting at all here is purely so the
-            # right branch fires; the message itself doesn't name items.
             for lbl in all_labels:
                 exit_count  = class_counters["exit"].get(lbl, 0)
                 entry_count = class_counters["entry"].get(lbl, 0)
-                if max(0, exit_count - entry_count) > 0:
-                    net_items_count += 1
+                net         = max(0, exit_count - entry_count)
+                if net > 0:
+                    net_items[lbl] = net
 
-            if net_items_count == 0:
+            if not net_items:
                 message = "Thank you for visiting. Have a great day!"
             else:
-                message = ("Thank you for shopping with us. "
-                           "Your refund will be processed shortly.")
+                item_phrases = []
+                for lbl, count in net_items.items():
+                    spoken_name = SPEECH_NAMES.get(lbl, lbl)
+                    count_word  = number_to_words(count)
+                    item_phrases.append(f"{count_word} {spoken_name}")
+
+                if len(item_phrases) == 1:
+                    items_text = item_phrases[0]
+                elif len(item_phrases) == 2:
+                    items_text = f"{item_phrases[0]} and {item_phrases[1]}"
+                else:
+                    items_text = (", ".join(item_phrases[:-1]) +
+                                  f", and {item_phrases[-1]}")
+
+                plural  = len(item_phrases) > 1
+                message = (
+                    f"Thank you for shopping with us. "
+                    f"The item{'s' if plural else ''} you have taken "
+                    f"{'are' if plural else 'is'} {items_text}. "
+                    f"Your refund will be processed shortly."
+                )
 
             print(f"[MovementTTS] CLOSING - '{message}'")
 
             os.makedirs("sounds/closing", exist_ok=True)
+            closing_path = "sounds/closing/closing_summary.mp3"
 
-            # Hash the message so the two variants are cached as
-            # separate files and don't overwrite each other.
-            msg_hash     = hashlib.md5(message.encode()).hexdigest()[:12]
-            closing_path = f"sounds/closing/closing_{msg_hash}.mp3"
-
-            if not os.path.exists(closing_path):
-                tts = gTTS(text=message, lang='en', slow=False)
-                tts.save(closing_path)
+            tts = gTTS(text=message, lang='en', slow=False)
+            tts.save(closing_path)
 
             self.play_mp3_sync(closing_path, volume=0.8)
 
@@ -2036,22 +2026,17 @@ product_movement_announcer = ProductMovementAnnouncer()
 
 def detection_callback(pad, info, callback_data):
     """
-    Process each video frame: detect, track, validate, count, beep,
+    Process each video frame: detect, track, validate, count, announce,
     and push data to the WebSocket.
 
-    v2.4 CHANGES:
-      - Per-event entry/exit events now fire ONLY the directional beep
-        (via announcer.on_entry / on_exit). No spoken product readout.
-      - Everything else identical to v2.3.
-
-    v2.3 CHANGES (counting logic, unchanged here):
+    v2.2 CHANGES (counting logic only):
       - Per-detection label is smoothed via get_smoothed_label() before
         being used for global ID lookup, counter increments, validation,
-        beep trigger, and websocket payload.
-      - Counter increments and beep calls are gated by
+        TTS, and websocket payload.
+      - Counter increments and TTS calls are gated by
         stream_id == COUNTING_CAMERA_ID. Camera 1 still tracks and draws.
       - A final time-window dedupe (is_duplicate_count) suppresses any
-        same-(global_id, direction) events that fire within DEDUPE_WINDOW_SEC.
+        same-(label, direction) events that fire within DEDUPE_WINDOW_SEC.
       - The Hailo pipeline, the Gst probe wiring, and frame compositing
         are unchanged.
 
@@ -2114,7 +2099,7 @@ def detection_callback(pad, info, callback_data):
         # Replace the per-frame label with the dominant label across the
         # last LABEL_HISTORY_LEN frames for this (camera, track). Every
         # downstream use - global-id lookup, counter increment, validation,
-        # beep trigger, WebSocket payload - uses the smoothed label.
+        # TTS, WebSocket payload - uses the smoothed label.
         label = get_smoothed_label(stream_id, track_id, raw_label)
         # --------------------------------
 
@@ -2154,11 +2139,11 @@ def detection_callback(pad, info, callback_data):
             stream_id, global_id, (x1, y1, x2, y2)
         )
 
-        # STEP 6: Update counters and beep
-        # v2.3: only the authoritative camera (stream_id == COUNTING_CAMERA_ID)
-        # is allowed to increment counters or fire the beep. Both cameras
-        # still run direction analysis above (so on-screen trails on camera 1
-        # work), but only camera 0's events become real counts.
+        # STEP 6: Update counters and announce
+        # v2.2: only the authoritative camera (stream_id == COUNTING_CAMERA_ID)
+        # is allowed to increment counters or fire TTS. Both cameras still
+        # run direction analysis above (so on-screen trails on camera 1 work),
+        # but only camera 0's events become real counts.
         if direction and stream_id == COUNTING_CAMERA_ID:
             already_counted = (
                 global_id in user_data.tracking_data.counted_tracks.get(direction, set())
@@ -2173,12 +2158,11 @@ def detection_callback(pad, info, callback_data):
             # is_duplicate_count records the event when it returns False,
             # so call it only AFTER the should_count gate to avoid
             # poisoning the dedupe window with events we never counted.
-            # Keyed on global_id (not label) so that two distinct items
-            # of the same product can BOTH count correctly.
+            # v2.3: keyed on global_id (not label) so that two distinct
+            # items of the same product can BOTH count correctly.
             if should_count and not is_duplicate_count(global_id, direction):
                 user_data.tracking_data.class_counters[direction][label] += 1
 
-                # v2.4: announcer now fires beep only - no TTS readout.
                 if direction == "exit":
                     product_movement_announcer.on_exit(label)
                 else:
@@ -2373,7 +2357,7 @@ async def run_tracking(websocket: WebSocket):
                 transaction_memory_manager.start_transaction(transaction_id)
                 print(f"[Memory] Transaction {transaction_id} started")
 
-            # Reset movement announcer for this transaction.
+            # Reset movement announcer for this transaction
             # v2.2: announcer.reset() now also clears the time-window
             # dedupe deque, so a previous customer's events cannot
             # suppress this customer's first count.
@@ -2445,8 +2429,7 @@ async def run_tracking(websocket: WebSocket):
             # finally block, so cleanup_websocket_sounds() cannot
             # call stop_all_audio() and cut off the audio.
             # speak_door_close() blocks until done, then
-            # speak_closing_summary() plays the v2.4 thank-you message
-            # (no item recital).
+            # speak_closing_summary() generates and plays the summary.
             # ---------------------------------------------------------
             tts_manager.speak_door_close()
 
@@ -3340,7 +3323,7 @@ def main():
     print("GPIO and MQTT cleanup handlers registered")
 
     print("\n" + "="*60)
-    print("SMART FRIDGE SYSTEM STARTED (v2.4)")
+    print("SMART FRIDGE SYSTEM STARTED (v2.3)")
     print("="*60)
     print(f"Memory at startup: {psutil.Process().memory_info().rss / 1024 / 1024:.1f}MB")
     print(f"Available memory:  {psutil.virtual_memory().available / 1024 / 1024:.1f}MB")
@@ -3356,8 +3339,6 @@ def main():
     print(f"Dedupe key:        (global_id, direction), window={DEDUPE_WINDOW_SEC}s")
     print(f"Exit beep:         880 Hz  ({BEEP_EXIT_PATH})")
     print(f"Entry beep:        440 Hz  ({BEEP_ENTRY_PATH})")
-    print(f"Per-event TTS:     DISABLED (v2.4 - beeps only)")
-    print(f"Closing summary:   thank-you only, no item recital (v2.4)")
     print("\nPress Ctrl+C to stop")
     print("="*60 + "\n")
 
@@ -3373,5 +3354,5 @@ if __name__ == "__main__":
     main()
 
 # =====================================================================
-# END OF SMART FRIDGE DETECTION SYSTEM v2.4
+# END OF SMART FRIDGE DETECTION SYSTEM v2.3
 # =====================================================================
