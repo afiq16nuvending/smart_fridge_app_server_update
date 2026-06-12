@@ -9,11 +9,17 @@
     [10, 13, 16, 30, 33, 23]
   ],
   "labels": [
-    "",
-    "chickenAndMushroom",
+    
+    "ayamMasakMerahWithRice",
+    "kampungFriedRice",
     "malatang",
-    "seafoodAndPrawn",
-    "tehTarik"
+    "nasiLemakAyamRendang",
+    "nasiPadangBeefRendang",
+    "prawnAndChickenWontonNoodles",
+    "tehTarik",
+    "thaiGreenChickenCurryWithRice",
+    "uncleChinChickenRice"
+
 
   ]
 }
