@@ -155,7 +155,7 @@ data_deque: Dict[int, deque] = {}
 # In production, this is read automatically from the WebSocket
 # start_preview message via os.environ['MACHINE_ID'].
 
-MQTT_MACHINE_ID = "168"    # change this to your test machine ID
+MQTT_MACHINE_ID = "170"    # change this to your test machine ID
 
 # Global MQTT client instance - initialised in main(), used everywhere
 mqtt_client: MQTTClient = None
@@ -1833,15 +1833,18 @@ def analyze_movement_direction(track_id, center, tracking_data,
             return None
 
     # CHECK 2: Total displacement
+    # NOTE: cameras are mounted top-down looking into the fridge, so
+    # in/out (entry/exit) motion is horizontal (X-axis) in-frame, not
+    # vertical (Y-axis). Index 0 = x, index 1 = y in (cx, cy) centers.
     history            = camera_movement_history[camera_id][track_id]
-    first_y            = history[-1][1]
-    last_y             = history[0][1]
-    total_displacement = abs(last_y - first_y)
+    first_x            = history[-1][0]
+    last_x             = history[0][0]
+    total_displacement = abs(last_x - first_x)
     if total_displacement < 30:
         return None
 
     # CHECK 3: Directional consistency
-    deltas      = [history[i-1][1] - history[i][1] for i in range(1, len(history))]
+    deltas      = [history[i-1][0] - history[i][0] for i in range(1, len(history))]
     n_positive  = sum(1 for d in deltas if d > 0)
     n_negative  = sum(1 for d in deltas if d < 0)
     consistency = max(n_positive, n_negative) / len(deltas)
