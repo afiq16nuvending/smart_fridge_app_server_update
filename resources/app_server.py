@@ -173,7 +173,7 @@ data_deque: Dict[int, deque] = {}
 # In production, this is read automatically from the WebSocket
 # start_preview message via os.environ['MACHINE_ID'].
 
-MQTT_MACHINE_ID = "166"    # <- change this to your test machine ID
+MQTT_MACHINE_ID = "209"    # <- change this to your test machine ID
 
 # Global MQTT client instance - initialised in main(), used everywhere
 mqtt_client: MQTTClient = None
@@ -2322,6 +2322,7 @@ async def run_tracking(websocket: WebSocket):
                         time.sleep(1)
                     except Exception as e:
                         print(f"Error sending WebSocket data: {e}")
+                        break  # WebSocket closed - stop trying to send
 
             websocket_sender = threading.Thread(target=send_websocket_data)
             websocket_sender.start()
@@ -2374,10 +2375,13 @@ async def run_tracking(websocket: WebSocket):
                 pass
 
     finally:
-        await websocket.send_json({
-            "status":  "stopped",
-            "message": "Tracking has been fully stopped"
-        })
+        try:
+            await websocket.send_json({
+                "status":  "stopped",
+                "message": "Tracking has been fully stopped"
+            })
+        except Exception:
+            pass  # WebSocket already closed (client disconnected or pipeline crash)
 
         door_monitor_active = False
 
