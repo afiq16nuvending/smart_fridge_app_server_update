@@ -3145,7 +3145,10 @@ async def websocket_endpoint(websocket: WebSocket):
         if transaction_memory_manager.global_stats['total_transactions'] % 10 == 0:
             transaction_memory_manager.print_stats()
 
-        await websocket.close()
+        try:
+            await websocket.close()
+        except Exception:
+            pass
         print("WebSocket connection closed")
 
 # =====================================================================
