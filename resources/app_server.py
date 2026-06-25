@@ -11,7 +11,7 @@ products against inventory, manages door access, and handles payments.
 MAIN COMPONENTS:
 1. FastAPI WebSocket server for real-time communication
 2. Hailo AI accelerator for object detection
-3. Multi-camera tracking system (both cameras count independently)
+3. Multi-camera tracking system (camera 0 authoritative for counting)
 4. GPIO control for door locks, LEDs, and buzzer
 5. Transaction memory management
 6. Text-to-speech alerts (beep + spoken announcement for every entry and exit)
@@ -31,40 +31,22 @@ WORKFLOW:
 2. Deposit deducted -> Door unlocks -> Cameras start
 3. Customer takes/returns items -> AI tracks movements
 4. Price calculated in real-time -> beep + TTS announces every entry and exit
-5. Door closes -> TTS fires immediately; pipeline records RECORD_TAIL_S more seconds
+5. Door closes -> MQTT publishes door closed -> Closing TTS summary plays
 6. Video saved -> Refund processed -> System cleans up -> Ready for next customer
 
-CHANGES IN v2.2 (from v2.3 original):
-- Removed single-camera counting gate (COUNTING_CAMERA_ID). Both cameras
-  count independently again.
-- Removed label smoothing (track_label_history, get_smoothed_label,
-  cleanup_label_history). Raw per-frame labels used directly.
-- Replaced old dedupe system (is_duplicate_count, recent_count_events)
-  with BriefIDLock: 0.3s window keyed on (global_id, direction).
-  Tight enough to absorb inter-stream lag; short enough never to block
-  a genuine second grab.
-- Door-close TTS cancellation: ProductMovementAnnouncer._active flag +
-  set_door_closed() stops in-flight movement TTS before door-close
-  announcement. Three gate checks: before beep, after beep, after
-  gTTS network call.
-- active_check parameter in TTSManager.speak_async allows discarding
-  audio that finished generating but hasn't played yet.
-- X-axis movement fix: analyze_movement_direction was using Y-axis.
-  Fixed to X-axis (horizontal) since cameras are ceiling-mounted and
-  in/out motion is horizontal in-frame.
-- display_process.join timeout increased 2s -> 5s so output_video
-  .release() has time to flush before process is terminated.
-- Reverted to single beep file (sounds/beep.wav) from v2.1.
-
-CHANGES IN v2.3 (from v2.2):
-- Recording tail: pipeline stays in PLAYING state for RECORD_TAIL_S (5s)
-  after door closes. All frames recorded during tail are real camera
-  output - pipeline is in PLAYING state the entire time.
-- Decoupled TTS from tail recording: on_door_close callback on
-  HailoDetectionApp fires TTS immediately in its own thread at door
-  close. Pipeline records the tail in parallel. After detection_app
-  .run() returns, run_tracking() waits on tts_done_event (30s timeout)
-  before cleanup so closing summary always finishes.
+TRACKING CHANGES IN v2.3:
+- Class smoothing (carried over from v2.2): per-track label histogram
+  suppresses single-frame class flips.
+- Single authoritative counting camera (carried over): only camera 0
+  increments counters and fires TTS. Camera 1 still tracks and draws.
+- Time-window dedupe is now keyed on (global_id, direction) instead of
+  (label, direction). This means two Cokes grabbed in quick succession
+  are BOTH counted (different global_ids) while a single physical object
+  that gets split into two global_ids by tracker glitches is still
+  suppressed. Trades silent miss-counts for recoverable over-counts.
+- Distinct beeps for entry vs exit: high 880 Hz beep for exit (item
+  leaving), low 440 Hz beep for entry (item returning). Lets the
+  operator distinguish events by ear without watching the screen.
 
 AUTHOR: Mike
 VERSION: 2.3
@@ -107,7 +89,7 @@ import multiprocessing
 import signal
 
 # Data Structures
-from collections import deque, defaultdict
+from collections import deque, defaultdict, Counter
 from typing import List, Dict, Tuple
 import random
 
@@ -173,7 +155,7 @@ data_deque: Dict[int, deque] = {}
 # In production, this is read automatically from the WebSocket
 # start_preview message via os.environ['MACHINE_ID'].
 
-MQTT_MACHINE_ID = "209"    # <- change this to your test machine ID
+MQTT_MACHINE_ID = "209"    # change this to your test machine ID
 
 # Global MQTT client instance - initialised in main(), used everywhere
 mqtt_client: MQTTClient = None
@@ -263,68 +245,47 @@ camera_bbox_area_history = {
 }
 
 # =====================================================================
-# BRIEF ID LOCK - cross-camera double-count suppression
+# v2.2 TRACKING ROBUSTNESS STRUCTURES
 # =====================================================================
-# Both cameras count independently. The lock is the sole guard against
-# a single physical movement being counted twice (once per camera).
 #
-# Keyed on (global_id, direction):
-#   - Same global_id fired by cam 0 then cam 1 within the window
-#     -> second event suppressed.
-#   - Two DIFFERENT items of the same class (different global_ids)
-#     grabbed within the window -> both count correctly.
+# These structures support the three v2.2 tracking fixes:
+#   1. Class smoothing (track_label_history)
+#   2. Authoritative-camera counting (COUNTING_CAMERA_ID)
+#   3. Time-window dedupe (recent_count_events)
+# =====================================================================
+
+# Per-(camera_id, local_track_id) label history.
+# Used by get_smoothed_label() to return the dominant label over
+# the last LABEL_HISTORY_LEN frames instead of the raw per-frame label.
+# This prevents single-frame class flickers (e.g. coke -> sprite -> coke)
+# from causing the global ID system to register a second product
+# or increment the wrong counter.
+LABEL_HISTORY_LEN  = 15
+LABEL_SMOOTH_MIN   = 5     # need >= this many samples before smoothing kicks in
+track_label_history = defaultdict(lambda: deque(maxlen=LABEL_HISTORY_LEN))
+
+# Authoritative camera for counting and TTS announcements.
+# Camera 1 (the lower camera) was empirically the source of cross-camera
+# duplicate exits because items leave its FOV last, after camera 0 has
+# already lost the track. Demoting it to display-only kills that path.
+# Both cameras still run detection, tracking, and overlay drawing.
+COUNTING_CAMERA_ID = 0
+
+# Recent count events for tracker-split duplicate suppression.
+# Each entry is (timestamp, global_id, direction). A new count event for
+# the SAME global_id within DEDUPE_WINDOW_SEC seconds is suppressed.
 #
-# Window is 0.3s - just wide enough to absorb GStreamer inter-stream
-# processing lag between the two camera callbacks, tight enough that
-# a real second grab immediately after the first is never blocked.
-
-ID_LOCK_WINDOW_SEC = 0.3
-
-# Extra seconds the pipeline keeps recording after the door closes.
-# Pipeline remains in PLAYING state the entire time so all frames are
-# real camera output. TTS fires immediately in a parallel thread so
-# the customer hears the closing announcement without waiting.
-# Adjust between 5 and 10 to taste.
-RECORD_TAIL_S = 5
-
-
-class BriefIDLock:
-    """
-    Thread-safe per-(global_id, direction) count lock with auto-expiry.
-
-    try_acquire() records the event and returns True on the first call
-    for a (global_id, direction) pair. Any subsequent call for the same
-    pair within ID_LOCK_WINDOW_SEC returns False (suppressed). Expired
-    entries are purged lazily on each call.
-    """
-
-    def __init__(self, window_sec: float = 0.3):
-        self.window_sec = window_sec
-        self._events    = deque(maxlen=500)
-        self._lock      = threading.Lock()
-
-    def try_acquire(self, global_id: int, direction: str) -> bool:
-        """Return True and record event if not locked; False to suppress."""
-        now = time.time()
-        with self._lock:
-            # Purge expired entries from the front
-            while self._events and now - self._events[0][0] > self.window_sec:
-                self._events.popleft()
-            # Check for an existing active lock
-            for _, gid, direc in self._events:
-                if gid == global_id and direc == direction:
-                    return False
-            # Grant and record
-            self._events.append((now, global_id, direction))
-            return True
-
-    def reset(self):
-        """Clear all active locks. Call at the start of each transaction."""
-        with self._lock:
-            self._events.clear()
-
-
-id_lock = BriefIDLock(window_sec=ID_LOCK_WINDOW_SEC)
+# v2.3 NOTE: keyed on global_id (not label). This means two Cokes
+# grabbed in quick succession are BOTH counted - they have different
+# global_ids. What still gets suppressed is a single physical object
+# that the tracker briefly loses and re-acquires under a new local
+# track ID, producing a fresh global_id for the same can within the
+# 1.5s window. That re-acquisition path is the only thing this dedupe
+# is for now; cross-camera duplicates are handled by COUNTING_CAMERA_ID
+# above.
+DEDUPE_WINDOW_SEC   = 1.5
+recent_count_events = deque(maxlen=200)
+recent_count_lock   = threading.Lock()
 
 # =====================================================================
 # HARDWARE CONTROL FUNCTIONS
@@ -662,21 +623,17 @@ def setup_cover_alert_sound():
     return alert_file
 
 # =====================================================================
-# BEEP SOUND GENERATOR
+# BEEP SOUND GENERATORS (entry + exit)
 # =====================================================================
 
-def generate_beep_file(path="sounds/beep.wav", freq=880, duration=0.12, volume=0.8):
+def _generate_beep_wav(path, freq, duration, volume):
     """
-    Generate a short sine-wave beep WAV file and save it to disk.
-
-    Played through pygame before each TTS announcement so the beep and
-    voice both come from the same speaker output.
-
-    Only generated once - skipped if the file already exists.
+    Internal helper: synthesise a single sine-wave beep WAV file.
+    Skipped if the file already exists.
 
     Args:
         path     (str):   Output file path.
-        freq     (int):   Tone frequency in Hz (880 = high A).
+        freq     (int):   Tone frequency in Hz.
         duration (float): Beep length in seconds.
         volume   (float): Amplitude scale 0.0-1.0.
     """
@@ -695,12 +652,50 @@ def generate_beep_file(path="sounds/beep.wav", freq=880, duration=0.12, volume=0
     samples  = (sine * fade * volume * 32767).astype(np.int16)
 
     with wave.open(path, 'w') as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
+        wf.setnchannels(1)        # mono
+        wf.setsampwidth(2)        # 16-bit
         wf.setframerate(sample_rate)
         wf.writeframes(samples.tobytes())
 
-    print(f"Beep sound generated: {path}")
+    print(f"Beep generated: {path} (freq={freq}Hz, dur={duration}s)")
+
+
+# Two distinct beep paths - one for each direction. Stored as module
+# constants so the announcer can reference them without hardcoding paths.
+BEEP_EXIT_PATH  = "sounds/beep_exit.wav"   # high tone  - item leaving fridge
+BEEP_ENTRY_PATH = "sounds/beep_entry.wav"  # low tone   - item returning
+
+
+def generate_beep_files():
+    """
+    Generate both entry and exit beep WAV files on disk.
+
+    EXIT  -> 880 Hz (high A, bright/attention-grabbing)
+             "something is leaving the fridge"
+    ENTRY -> 440 Hz (low A, softer pitch)
+             "something came back"
+
+    The one-octave gap between the two is intentional - the human ear
+    distinguishes octave-spaced tones much more reliably than tones a few
+    Hz apart, so the operator can tell entry from exit at a glance even
+    in a noisy retail environment.
+
+    Both files are only generated once - skipped if they already exist.
+    """
+    _generate_beep_wav(BEEP_EXIT_PATH,  freq=880, duration=0.12, volume=0.8)
+    _generate_beep_wav(BEEP_ENTRY_PATH, freq=440, duration=0.18, volume=0.8)
+
+
+# Backwards-compatible shim: older code paths and main() may still call
+# generate_beep_file() with the original signature. Route it to the new
+# pair generator so existing call sites keep working without edits.
+def generate_beep_file(path=None, freq=None, duration=None, volume=None):
+    """
+    Backwards-compatible wrapper. Generates BOTH beep files.
+    Original signature args are ignored - kept only so existing
+    callers don't break.
+    """
+    generate_beep_files()
 
 # =====================================================================
 # CAMERA COVER ALERT HANDLER
@@ -805,8 +800,7 @@ def display_user_data_frame(user_data):
 
         if output_video is not None:
             output_video.release()
-            print(f"[Video] Recording COMPLETE: {filename} ({frame_count} frames)"
-                  f" - upload monitor will pick this up within ~10s")
+            print(f"Video saved: {filename} ({frame_count} frames)")
 
         try:
             GPIO.output(DOOR_LOCK_PIN, GPIO.HIGH)
@@ -1277,7 +1271,7 @@ class HailoDetectionCallback(app_callback_class):
             "queue name=hailo_display_q_0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
             "fpsdisplaysink video-sink=ximagesink name=hailo_display sync=false text-overlay=true "
             "v4l2src device=/dev/video0 name=source_0 ! "
-            "image/jpeg, width=640, height=360, framerate=25/1 ! "
+            "image/jpeg, width=1024, height=576, framerate=25/1 ! "
             "jpegdec ! "
             "queue name=source_scale_q_0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
             "videoscale name=source_videoscale_0 n-threads=2 ! "
@@ -1292,11 +1286,11 @@ class HailoDetectionCallback(app_callback_class):
             "queue name=hailo_draw_0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
             "hailooverlay ! "
             "videoscale n-threads=8 ! "
-            "video/x-raw,width=640,height=360 ! "
+            "video/x-raw,width=1024,height=576 ! "
             "queue name=comp_q_0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
             "comp.sink_0 "
             "v4l2src device=/dev/video2 name=source_2 ! "
-            "image/jpeg, width=640, height=360, framerate=25/1 ! "
+            "image/jpeg, width=1024, height=576, framerate=25/1 ! "
             "jpegdec ! "
             "queue name=source_scale_q_2 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
             "videoscale name=source_videoscale_2 n-threads=2 ! "
@@ -1311,7 +1305,7 @@ class HailoDetectionCallback(app_callback_class):
             "queue name=hailo_draw_1 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
             "hailooverlay ! "
             "videoscale n-threads=8 ! "
-            "video/x-raw,width=640,height=360 ! "
+            "video/x-raw,width=1024,height=576 ! "
             "queue name=comp_q_1 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
             "comp.sink_1"
         )
@@ -1328,10 +1322,8 @@ class HailoDetectionCallback(app_callback_class):
         headers  = {'x-api-key': api_key}
 
         # Construct API endpoint URL
-        api_endpoint = (
-            f'https://stg-sfapi.nuboxtech.com/index.php/'
-            f'mobile_app/machine/Machine_listing/machine_planogram/{machine_id}'
-        )
+        api_endpoint = (f'https://stg-sfapi.nuboxtech.com/index.php/'
+                        f'mobile_app/machine/Machine_listing/machine_planogram/{machine_id}')
 
         video_monitor_thread = threading.Thread(
             target=monitor_and_send_videos,
@@ -1384,11 +1376,9 @@ class HailoDetectionCallback(app_callback_class):
                         continue
 
                     # Construct API endpoint
-                    refresh_endpoint = (
-                        f'https://stg-sfapi.nuboxtech.com/index.php/'
-                        f'mobile_app/machine/Machine_listing/'
-                        f'machine_planogram/{refresh_machine_id}'
-                    )
+                    refresh_endpoint = (f'https://stg-sfapi.nuboxtech.com/index.php/'
+                                        f'mobile_app/machine/Machine_listing/'
+                                        f'machine_planogram/{refresh_machine_id}')
 
                     api_response = requests.get(
                         refresh_endpoint,
@@ -1461,10 +1451,9 @@ class HailoDetectionApp:
     identity elements.
     """
 
-    def __init__(self, app_callback, user_data, on_door_close=None):
-        self.app_callback  = app_callback
-        self.user_data     = user_data
-        self.on_door_close = on_door_close
+    def __init__(self, app_callback, user_data):
+        self.app_callback = app_callback
+        self.user_data    = user_data
 
         self.door_monitor_active = True
         self.door_monitor_thread = threading.Thread(target=self.monitor_door, daemon=True)
@@ -1528,29 +1517,11 @@ class HailoDetectionApp:
         return True
 
     def monitor_door(self):
-        """
-        Poll the door switch. On close:
-          1. Fire on_door_close immediately in its own thread (TTS).
-          2. Sleep RECORD_TAIL_S so the pipeline records extra footage.
-          3. Call shutdown() to tear down the pipeline.
-
-        TTS and tail recording run in parallel - the customer hears the
-        announcement straight away while cameras keep recording.
-        """
         start_time = time.time()
         while self.door_monitor_active:
             door_sw = GPIO.input(DOOR_SWITCH_PIN)
             if door_sw == 0 and time.time() - start_time > 5:
-                # Step 1: fire TTS immediately in background
-                if self.on_door_close is not None:
-                    threading.Thread(
-                        target=self.on_door_close, daemon=True
-                    ).start()
-                # Step 2: keep pipeline alive for tail recording
-                print(f"Door closed - recording {RECORD_TAIL_S}s tail...")
-                time.sleep(RECORD_TAIL_S)
-                # Step 3: shut down pipeline
-                print("Tail recording complete - initiating shutdown")
+                print("Door closed - initiating shutdown")
                 self.shutdown()
                 break
             time.sleep(0.1)
@@ -1632,12 +1603,131 @@ class HailoDetectionApp:
             cv2.destroyAllWindows()
 
             if self.use_frame and 'display_process' in locals():
-                # Wait up to 5s for output_video.release() to flush
-                display_process.join(timeout=5)
                 if display_process.is_alive():
-                    print("[Video] Display process still alive after 5s - terminating")
                     display_process.terminate()
                     display_process.join(timeout=2)
+
+# =====================================================================
+# v2.2 LABEL SMOOTHING
+# =====================================================================
+
+def get_smoothed_label(camera_id, local_track_id, raw_label):
+    """
+    Return the dominant label observed for this (camera, local_track_id)
+    over the last LABEL_HISTORY_LEN frames. This kills single-frame class
+    flickers that would otherwise cause spurious second global IDs or
+    increment the wrong product counter.
+
+    Behavior:
+    - If raw_label is empty/None: return it unchanged (nothing to smooth).
+    - For the first LABEL_SMOOTH_MIN frames: return raw_label
+      (not enough samples yet to trust the histogram).
+    - After that: return the most common label in the rolling window.
+
+    Args:
+        camera_id      (int): Camera ID (0 or 1).
+        local_track_id (int): Local track ID assigned by hailotracker.
+        raw_label      (str): Per-frame label from the current detection.
+
+    Returns:
+        str: Smoothed label.
+    """
+    if not raw_label:
+        return raw_label
+
+    key = (camera_id, local_track_id)
+    track_label_history[key].append(raw_label)
+
+    history = track_label_history[key]
+    if len(history) < LABEL_SMOOTH_MIN:
+        return raw_label
+
+    # Counter.most_common ties go to insertion order; that's fine here -
+    # if two labels are exactly tied we just keep whichever appeared first.
+    dominant_label, _ = Counter(history).most_common(1)[0]
+    return dominant_label
+
+
+def cleanup_label_history(camera_id, active_local_track_ids):
+    """
+    Drop label-history entries for tracks that are no longer active.
+    Called from the same place as cleanup_inactive_tracks() so that
+    the new structure is garbage-collected on the same cadence.
+
+    Args:
+        camera_id              (int): Camera ID (0 or 1).
+        active_local_track_ids (set): Currently active local track IDs.
+    """
+    stale = [
+        key for key in track_label_history.keys()
+        if key[0] == camera_id and key[1] not in active_local_track_ids
+    ]
+    for key in stale:
+        del track_label_history[key]
+
+# =====================================================================
+# v2.2 TIME-WINDOW DEDUPE
+# =====================================================================
+
+def is_duplicate_count(global_id, direction, now=None):
+    """
+    Return True if a count event for (global_id, direction) has occurred
+    within the last DEDUPE_WINDOW_SEC seconds.
+
+    v2.3 CHANGE: keyed on global_id, NOT label.
+
+    What this catches:
+      - Same physical object gets two different global_ids in quick
+        succession because the tracker briefly lost it and re-acquired
+        it. Without dedupe, both global_ids would count.
+
+    What this deliberately does NOT catch:
+      - Two distinct items of the same product (e.g. two Cokes) grabbed
+        within 1.5s. They have different global_ids and BOTH count
+        correctly. This is the v2.3 fix - v2.2's label-keyed dedupe
+        would have silently dropped the second Coke.
+
+    Cross-camera duplicates are not this function's concern - the
+    COUNTING_CAMERA_ID rule above means camera 1's events never reach
+    this function in the first place.
+
+    Side effect: if the event is NOT a duplicate, it is recorded.
+
+    Args:
+        global_id (int):           Global track ID for the object.
+        direction (str):           'entry' or 'exit'.
+        now       (float, optional): Override timestamp (for testing).
+
+    Returns:
+        bool: True if this is a duplicate event that should be suppressed.
+    """
+    if now is None:
+        now = time.time()
+
+    with recent_count_lock:
+        # Drop expired events from the front of the deque.
+        while recent_count_events and now - recent_count_events[0][0] > DEDUPE_WINDOW_SEC:
+            recent_count_events.popleft()
+
+        # Check for any matching event still inside the window.
+        for ts, gid, direc in recent_count_events:
+            if gid == global_id and direc == direction:
+                return True
+
+        # Not a duplicate - record this event so the NEXT call sees it.
+        recent_count_events.append((now, global_id, direction))
+        return False
+
+
+def reset_dedupe_state():
+    """
+    Clear the dedupe deque between transactions so that count events
+    from a previous customer cannot suppress events for a new one.
+    Called from product_movement_announcer.reset() chain - see
+    run_tracking() PHASE 2 transaction setup.
+    """
+    with recent_count_lock:
+        recent_count_events.clear()
 
 # =====================================================================
 # CROSS-CAMERA TRACKING
@@ -1646,9 +1736,16 @@ class HailoDetectionApp:
 def get_global_track_id(camera_id, local_track_id, features=None, label=None):
     """
     Get or create a global track ID for cross-camera tracking.
-    The label-matching fallback assigns the same global_id to the same
-    physical object seen by both cameras, so BriefIDLock can then catch
-    the near-simultaneous second count event.
+
+    v2.2 NOTE: This function is now called with the SMOOTHED label
+    (see get_smoothed_label() above). Feeding the smoothed label here
+    means the (camera_id, local_track_id) -> global_id mapping is
+    stable across single-frame class flickers.
+
+    The label-matching cross-camera fallback is preserved but in v2.2
+    practice the authoritative-counting-camera rule means cross-camera
+    matches no longer affect the count - they only affect on-screen
+    display continuity.
     """
     global global_track_counter, local_to_global_id_map
     global global_track_labels, active_objects_per_camera
@@ -1707,6 +1804,9 @@ def cleanup_inactive_tracks(camera_id, active_local_track_ids):
                 if not active_objects_per_camera[cam_id][label]:
                     del active_objects_per_camera[cam_id][label]
 
+    # v2.2: also drop label history for inactive tracks
+    cleanup_label_history(camera_id, active_local_track_ids)
+
 # =====================================================================
 # MOVEMENT DIRECTION ANALYSIS
 # =====================================================================
@@ -1733,9 +1833,9 @@ def analyze_movement_direction(track_id, center, tracking_data,
             return None
 
     # CHECK 2: Total displacement
-    # Cameras are ceiling-mounted looking down into the fridge.
-    # Entry/exit motion is horizontal (X-axis) in-frame.
-    # Index 0 = x, index 1 = y in (cx, cy) center tuples.
+    # NOTE: cameras are mounted top-down looking into the fridge, so
+    # in/out (entry/exit) motion is horizontal (X-axis) in-frame, not
+    # vertical (Y-axis). Index 0 = x, index 1 = y in (cx, cy) centers.
     history            = camera_movement_history[camera_id][track_id]
     first_x            = history[-1][0]
     last_x             = history[0][0]
@@ -1811,82 +1911,52 @@ SPEECH_NAMES: Dict[str, str] = {
 class ProductMovementAnnouncer:
     """
     Real-time TTS announcer for product entry and exit events.
-
-    Call set_door_closed() as soon as the pipeline shuts down to cancel
-    any in-flight or queued movement announcements before door-close TTS
-    starts. The closing-summary TTS bypasses this gate intentionally.
     """
 
     def __init__(self):
-        self._lock   = threading.Lock()
-        self._active = True   # Cleared by set_door_closed(), restored by reset()
-
-    def set_door_closed(self):
-        """
-        Cancel pending movement TTS immediately on door close.
-
-        Three gate points in _beep_and_speak / speak_async stop audio
-        that was queued during the final seconds of the session:
-          1. Before the beep plays
-          2. After the beep, before gTTS network call
-          3. After the gTTS network call, before playback
-
-        Does NOT affect speak_closing_summary (which calls tts_manager
-        directly and bypasses _active).
-        """
-        self._active = False
-        tts_manager.stop_all_audio()
-        print("[MovementTTS] Door closed - movement TTS cancelled")
+        self._lock = threading.Lock()
 
     def reset(self):
-        """Clear state at the start of each new transaction."""
-        self._active = True
-        id_lock.reset()
+        """Clear state. Call at the start of each new transaction."""
+        # v2.2: also clear the time-window dedupe deque so events
+        # from a previous customer can't poison the new transaction.
+        reset_dedupe_state()
         print("[MovementTTS] Announcer reset for new transaction")
 
-    def _beep_and_speak(self, text: str):
+    def _beep_and_speak(self, text: str, beep_path: str):
+        """
+        Play a beep then speak text. Beep file is direction-specific:
+        BEEP_EXIT_PATH  for "removed" announcements (high tone)
+        BEEP_ENTRY_PATH for "returned" announcements (low tone)
+        """
         def _run():
-            # Gate 1 - before beep starts
-            if not self._active:
-                return
             try:
-                beep_path = "sounds/beep.wav"
-                if os.path.exists(beep_path):
+                if beep_path and os.path.exists(beep_path):
                     tts_manager.play_mp3_sync(beep_path, volume=0.6)
             except Exception as e:
                 print(f"[MovementTTS] Beep error: {e}")
-
-            # Gate 2 - door may have closed during the beep
-            if not self._active:
-                return
-
-            # Gate 3 is inside speak_async via active_check, fires after
-            # the gTTS network call so audio generated just before door
-            # close is discarded rather than played.
-            tts_manager.speak_async(
-                text, lang='en',
-                active_check=lambda: self._active
-            )
+            tts_manager.speak_async(text, lang='en')
 
         threading.Thread(target=_run, daemon=True).start()
 
     def on_exit(self, label: str):
         spoken_name = SPEECH_NAMES.get(label, label)
         text        = f"one {spoken_name} removed"
-        self._beep_and_speak(text)
+        # High beep for exit - matches "something is leaving" intuition
+        self._beep_and_speak(text, BEEP_EXIT_PATH)
         print(f"[MovementTTS] EXIT - '{text}'")
 
     def on_entry(self, label: str):
         spoken_name = SPEECH_NAMES.get(label, label)
         text        = f"one {spoken_name} returned"
-        self._beep_and_speak(text)
+        # Low beep for entry - softer, signals "something came back"
+        self._beep_and_speak(text, BEEP_ENTRY_PATH)
         print(f"[MovementTTS] ENTRY - '{text}'")
 
     def speak_closing_summary(self, class_counters: dict):
         """
         Speak end-of-transaction summary synchronously (blocks until done).
         Called from run_tracking() after speak_door_close().
-        Bypasses _active so it always plays regardless of door state.
         """
         try:
             all_labels = (set(class_counters["exit"].keys()) |
@@ -1962,10 +2032,16 @@ def detection_callback(pad, info, callback_data):
     Process each video frame: detect, track, validate, count, announce,
     and push data to the WebSocket.
 
-    Both cameras count independently. BriefIDLock (0.3s window) is the
-    sole guard against cross-camera double-counts for the same physical
-    item. Two different items of the same class grabbed within the window
-    each have different global_ids and both count correctly.
+    v2.2 CHANGES (counting logic only):
+      - Per-detection label is smoothed via get_smoothed_label() before
+        being used for global ID lookup, counter increments, validation,
+        TTS, and websocket payload.
+      - Counter increments and TTS calls are gated by
+        stream_id == COUNTING_CAMERA_ID. Camera 1 still tracks and draws.
+      - A final time-window dedupe (is_duplicate_count) suppresses any
+        same-(label, direction) events that fire within DEDUPE_WINDOW_SEC.
+      - The Hailo pipeline, the Gst probe wiring, and frame compositing
+        are unchanged.
 
     Returns:
         Gst.PadProbeReturn.OK: Always continue pipeline processing.
@@ -2011,7 +2087,7 @@ def detection_callback(pad, info, callback_data):
 
     # STEP 5: Process each detection
     for detection in detections:
-        label      = detection.get_label()
+        raw_label  = detection.get_label()
         bbox       = detection.get_bbox()
         confidence = detection.get_confidence()
         class_id   = detection.get_class_id()
@@ -2021,6 +2097,14 @@ def detection_callback(pad, info, callback_data):
         if len(track) == 1:
             track_id = track[0].get_id()
             active_local_track_ids.add(track_id)
+
+        # ----- v2.2 LABEL SMOOTHING -----
+        # Replace the per-frame label with the dominant label across the
+        # last LABEL_HISTORY_LEN frames for this (camera, track). Every
+        # downstream use - global-id lookup, counter increment, validation,
+        # TTS, WebSocket payload - uses the smoothed label.
+        label = get_smoothed_label(stream_id, track_id, raw_label)
+        # --------------------------------
 
         x1     = int(bbox.xmin() * width)
         y1     = int(bbox.ymin() * height)
@@ -2040,7 +2124,12 @@ def detection_callback(pad, info, callback_data):
         color = compute_color_for_labels(class_id)
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
-        label_text = (f"{label} L:{track_id} G:{global_id} "
+        # v2.2: overlay shows "*" next to label if it was smoothed (i.e.
+        # raw_label != smoothed label) so the operator can see flicker
+        # being suppressed during testing. Remove the asterisk handling
+        # if you want a cleaner display in production.
+        flicker_marker = "" if raw_label == label else "*"
+        label_text = (f"{label}{flicker_marker} L:{track_id} G:{global_id} "
                       f"{'Valid' if validation_result['valid'] else 'Invalid'}")
         text_color = (0, 255, 0) if validation_result['valid'] else (0, 0, 255)
         cv2.putText(frame, label_text, (x1, y1 - 10),
@@ -2054,19 +2143,27 @@ def detection_callback(pad, info, callback_data):
         )
 
         # STEP 6: Update counters and announce
-        # Both cameras count. id_lock.try_acquire() is called AFTER the
-        # should_count gate so the lock window is not consumed by events
-        # that would have been skipped anyway (already counted, unstable
-        # direction). This means the lock only fires on genuine count
-        # attempts, and the 0.3s window is used accurately.
-        if direction:
-            should_count = (
-                global_id not in user_data.tracking_data.counted_tracks.get(direction, set()) or
-                (global_id in global_last_counted_direction and
-                 direction != global_last_counted_direction[global_id])
+        # v2.2: only the authoritative camera (stream_id == COUNTING_CAMERA_ID)
+        # is allowed to increment counters or fire TTS. Both cameras still
+        # run direction analysis above (so on-screen trails on camera 1 work),
+        # but only camera 0's events become real counts.
+        if direction and stream_id == COUNTING_CAMERA_ID:
+            already_counted = (
+                global_id in user_data.tracking_data.counted_tracks.get(direction, set())
             )
+            direction_just_changed = (
+                global_id in global_last_counted_direction and
+                direction != global_last_counted_direction[global_id]
+            )
+            should_count = (not already_counted) or direction_just_changed
 
-            if should_count and id_lock.try_acquire(global_id, direction):
+            # v2.3: time-window dedupe.
+            # is_duplicate_count records the event when it returns False,
+            # so call it only AFTER the should_count gate to avoid
+            # poisoning the dedupe window with events we never counted.
+            # v2.3: keyed on global_id (not label) so that two distinct
+            # items of the same product can BOTH count correctly.
+            if should_count and not is_duplicate_count(global_id, direction):
                 user_data.tracking_data.class_counters[direction][label] += 1
 
                 if direction == "exit":
@@ -2099,7 +2196,7 @@ def detection_callback(pad, info, callback_data):
                         }
                     user_data.tracking_data.invalidated_products[direction][label]["count"] += 1
 
-    # STEP 7: Cleanup inactive tracks
+    # STEP 7: Cleanup inactive tracks (also clears v2.2 label history)
     cleanup_inactive_tracks(stream_id, active_local_track_ids)
 
     # STEP 8: Update FPS timestamp
@@ -2195,10 +2292,18 @@ async def run_tracking(websocket: WebSocket):
                           f"machine: {machine_id}, user: {user_id}, "
                           f"tx: {transaction_id}")
 
+                    # --------------------------------------------------
+                    # MQTT: connect now that machine_id is confirmed.
+                    # store_machine_id_env() will be called inside
+                    # HailoDetectionCallback, so os.environ['MACHINE_ID']
+                    # is set before mqtt_client.connect() resolves topics.
+                    # We set it here explicitly for the MQTT LWT topic.
+                    # --------------------------------------------------
                     if machine_id:
                         os.environ['MACHINE_ID'] = str(machine_id)
                     if mqtt_client is not None:
                         mqtt_client.connect()
+                    # --------------------------------------------------
 
                     break
                 else:
@@ -2236,7 +2341,7 @@ async def run_tracking(websocket: WebSocket):
             tts_manager.play_mp3_sync(f"{alert_dir}/start_capture.mp3", volume=0.8)
             time.sleep(2)
 
-            camera1_images = capture_images(2, image_count)
+            camera1_images = capture_images(0, image_count)
 
             if camera1_images:
                 tts_manager.play_mp3_sync(f"{alert_dir}/all_complete.mp3", volume=0.8)
@@ -2255,7 +2360,10 @@ async def run_tracking(websocket: WebSocket):
                 transaction_memory_manager.start_transaction(transaction_id)
                 print(f"[Memory] Transaction {transaction_id} started")
 
-            # Reset movement announcer and id_lock for this transaction
+            # Reset movement announcer for this transaction
+            # v2.2: announcer.reset() now also clears the time-window
+            # dedupe deque, so a previous customer's events cannot
+            # suppress this customer's first count.
             product_movement_announcer.reset()
 
             door_monitor_active = True
@@ -2282,37 +2390,10 @@ async def run_tracking(websocket: WebSocket):
 
             door_monitor_task = asyncio.create_task(monitor_door())
 
-            # ----------------------------------------------------------
-            # callback defined BEFORE the TTS closure so the closure can
-            # reference it. Safe because door only closes after pipeline
-            # starts - callback is always defined by then.
-            # ----------------------------------------------------------
             callback = HailoDetectionCallback(
                 websocket, deposit, machine_id, machine_identifier,
                 user_id, transaction_id
             )
-
-            # Event that signals run_tracking() when closing TTS is done
-            tts_done_event = threading.Event()
-
-            def door_close_tts():
-                """
-                Fired immediately when door closes (own thread).
-                Runs in parallel with RECORD_TAIL_S recording window.
-                Sets tts_done_event when finished.
-                """
-                try:
-                    product_movement_announcer.set_door_closed()
-                    tts_manager.speak_door_close()
-                    if hasattr(callback, 'tracking_data'):
-                        product_movement_announcer.speak_closing_summary(
-                            callback.tracking_data.class_counters
-                        )
-                except Exception as e:
-                    print(f"[TTS] Error in door_close_tts: {e}")
-                finally:
-                    tts_done_event.set()
-                    print("[TTS] Closing TTS complete")
 
             def send_websocket_data():
                 while not callback.tracking_data.shutdown_event.is_set():
@@ -2322,7 +2403,6 @@ async def run_tracking(websocket: WebSocket):
                         time.sleep(1)
                     except Exception as e:
                         print(f"Error sending WebSocket data: {e}")
-                        break  # WebSocket closed - stop trying to send
 
             websocket_sender = threading.Thread(target=send_websocket_data)
             websocket_sender.start()
@@ -2335,10 +2415,7 @@ async def run_tracking(websocket: WebSocket):
 
             signal.signal(signal.SIGINT, signal_handler)
 
-            detection_app = HailoDetectionApp(
-                detection_callback, callback,
-                on_door_close=door_close_tts
-            )
+            detection_app = HailoDetectionApp(detection_callback, callback)
 
             with pipeline_lock:
                 if current_pipeline_app is not None:
@@ -2347,20 +2424,23 @@ async def run_tracking(websocket: WebSocket):
                     time.sleep(2)
                 current_pipeline_app = detection_app
 
-            # Blocks until monitor_door fires shutdown() which happens
-            # RECORD_TAIL_S seconds after door close
             detection_app.run()
 
-            # ----------------------------------------------------------
-            # Wait for closing TTS to finish. It started at door close
-            # and may still be playing the closing summary while the
-            # pipeline was recording its tail. 30s timeout is generous -
-            # the summary is rarely more than 10s.
-            # ----------------------------------------------------------
-            print("[TTS] Waiting for closing summary to finish...")
-            tts_done_event.wait(timeout=30)
-            print("[TTS] Ready for cleanup")
-            # ----------------------------------------------------------
+            # ---------------------------------------------------------
+            # DOOR CLOSE TTS + CLOSING SUMMARY
+            # Both called here inside run_tracking, before the websocket
+            # finally block, so cleanup_websocket_sounds() cannot
+            # call stop_all_audio() and cut off the audio.
+            # speak_door_close() blocks until done, then
+            # speak_closing_summary() generates and plays the summary.
+            # ---------------------------------------------------------
+            tts_manager.speak_door_close()
+
+            if 'callback' in locals() and hasattr(callback, 'tracking_data'):
+                product_movement_announcer.speak_closing_summary(
+                    callback.tracking_data.class_counters
+                )
+            # ---------------------------------------------------------
 
             if transaction_id:
                 transaction_memory_manager.end_transaction(transaction_id)
@@ -2375,13 +2455,10 @@ async def run_tracking(websocket: WebSocket):
                 pass
 
     finally:
-        try:
-            await websocket.send_json({
-                "status":  "stopped",
-                "message": "Tracking has been fully stopped"
-            })
-        except Exception:
-            pass  # WebSocket already closed (client disconnected or pipeline crash)
+        await websocket.send_json({
+            "status":  "stopped",
+            "message": "Tracking has been fully stopped"
+        })
 
         door_monitor_active = False
 
@@ -2400,8 +2477,13 @@ async def run_tracking(websocket: WebSocket):
         if 'detection_app' in locals():
             detection_app.pipeline.set_state(Gst.State.NULL)
 
+        # --------------------------------------------------------------
+        # MQTT: disconnect cleanly after tracking ends.
+        # This publishes "offline" explicitly before the LWT fires.
+        # --------------------------------------------------------------
         if mqtt_client is not None:
             mqtt_client.disconnect()
+        # --------------------------------------------------------------
 
         cv2.destroyAllWindows()
 
@@ -2492,7 +2574,7 @@ def upload_images_to_api(camera1_images, machine_id, machine_identifier,
 
     username = 'admin'
     password = '1234'
-    api_key  = '1233456'
+    api_key  = '123456'
 
     headers = {'x-api-key': api_key}
     payload = {
@@ -2616,6 +2698,7 @@ class TransactionMemoryManager:
         global object_trails, global_trails, camera_movement_history
         global camera_bbox_area_history, local_to_global_id_map
         global active_objects_per_camera, global_movement_history
+        global track_label_history  # v2.2
 
         tracks = trans_data['tracks_created']
         trails = trans_data['trails_created']
@@ -2657,6 +2740,12 @@ class TransactionMemoryManager:
             if gid in trails:
                 global_movement_history[gid].clear()
                 del global_movement_history[gid]
+
+        # v2.2: also clear label-history entries belonging to this txn
+        for key in list(track_label_history.keys()):
+            _, local_id = key
+            if local_id in tracks:
+                del track_label_history[key]
 
     def _recreate_global_dictionaries(self):
         global object_trails, global_trails, camera_movement_history
@@ -2958,7 +3047,7 @@ class TTSManager:
     def generate_door_audio_files(self):
         try:
             gTTS(text="Open the door",        lang='en', slow=False).save("sounds/door_open.mp3")
-            gTTS(text="Door has been closed",  lang='en', slow=False).save("sounds/door_close.mp3")
+            gTTS(text="Door has been closed", lang='en', slow=False).save("sounds/door_close.mp3")
             print("Door audio files generated")
         except Exception as e:
             print(f"Error generating door audio: {e}")
@@ -2969,42 +3058,18 @@ class TTSManager:
     def speak_door_close(self):
         self.play_mp3_sync("sounds/door_close.mp3", volume=0.8)
 
-    def speak_async(self, text, lang='en', active_check=None):
-        """
-        Generate and play TTS asynchronously.
-
-        active_check: optional zero-argument callable. If provided it is
-        called (a) before the gTTS network call, (b) after the network
-        call before playback, and (c) in the playback loop. If it
-        returns False at any point the audio is discarded / stopped.
-        Used by ProductMovementAnnouncer to cancel movement TTS when the
-        door closes mid-generate.
-        """
+    def speak_async(self, text, lang='en'):
         def _speak():
             with self.tts_lock:
                 try:
-                    # Gate 1 - before network call
-                    if active_check is not None and not active_check():
-                        return
-
                     tts = gTTS(text=text, lang=lang, slow=False)
                     buf = io.BytesIO()
                     tts.write_to_fp(buf)
                     buf.seek(0)
-
-                    # Gate 2 - door may have closed during network call
-                    if active_check is not None and not active_check():
-                        print(f"[TTS] Discarded after generate: '{text[:50]}'")
-                        return
-
                     pygame.mixer.music.load(buf)
                     pygame.mixer.music.play()
                     while pygame.mixer.music.get_busy():
-                        if active_check is not None and not active_check():
-                            pygame.mixer.music.stop()
-                            break
                         time.sleep(0.1)
-
                 except Exception as e:
                     print(f"gTTS error: {e}")
                     self.fallback_speak(text)
@@ -3149,10 +3214,7 @@ async def websocket_endpoint(websocket: WebSocket):
         if transaction_memory_manager.global_stats['total_transactions'] % 10 == 0:
             transaction_memory_manager.print_stats()
 
-        try:
-            await websocket.close()
-        except Exception:
-            pass
+        await websocket.close()
         print("WebSocket connection closed")
 
 # =====================================================================
@@ -3232,8 +3294,8 @@ def main():
     setup_cover_alert_sound()
     print("Camera cover alerts ready")
 
-    generate_beep_file()
-    print("Beep sound ready")
+    generate_beep_files()
+    print("Entry/exit beep sounds ready")
 
     setup_product_upload_alerts()
     print("Product upload alerts ready")
@@ -3248,10 +3310,16 @@ def main():
 
     print("[Memory] Transaction memory management initialised")
 
+    # ------------------------------------------------------------------
+    # MQTT SETUP
+    # Set machine ID in environment so mqtt_client topics resolve
+    # correctly from the moment connect() is called.
+    # ------------------------------------------------------------------
     os.environ['MACHINE_ID'] = str(MQTT_MACHINE_ID)
     mqtt_client = MQTTClient()
     mqtt_client.connect()
     print(f"[MQTT] Client created and connected for machine_id={MQTT_MACHINE_ID}")
+    # ------------------------------------------------------------------
 
     atexit.register(GPIO.cleanup)
     atexit.register(lambda: mqtt_client.disconnect() if mqtt_client else None)
@@ -3268,11 +3336,12 @@ def main():
     print(f"MQTT machine ID:   {MQTT_MACHINE_ID}")
     print(f"MQTT topics:       AIfridge/{MQTT_MACHINE_ID}/rpi/connectionStatus")
     print(f"                   AIfridge/{MQTT_MACHINE_ID}/rpi/doorStatus")
-    print(f"Counting cameras:  Both (cross-camera dedupe via BriefIDLock)")
-    print(f"ID lock window:    {ID_LOCK_WINDOW_SEC}s")
-    print(f"Recording tail:    {RECORD_TAIL_S}s after door close (real frames)")
-    print(f"TTS at door close: Immediate (parallel with tail recording)")
-    print(f"Movement axis:     X (horizontal, ceiling-mounted cameras)")
+    print(f"Counting camera:   {COUNTING_CAMERA_ID}  (other cameras: display only)")
+    print(f"Label smoothing:   {LABEL_HISTORY_LEN}-frame window, "
+          f"{LABEL_SMOOTH_MIN}-frame minimum")
+    print(f"Dedupe key:        (global_id, direction), window={DEDUPE_WINDOW_SEC}s")
+    print(f"Exit beep:         880 Hz  ({BEEP_EXIT_PATH})")
+    print(f"Entry beep:        440 Hz  ({BEEP_ENTRY_PATH})")
     print("\nPress Ctrl+C to stop")
     print("="*60 + "\n")
 
