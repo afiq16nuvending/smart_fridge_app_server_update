@@ -276,20 +276,20 @@ camera_bbox_area_history = {
 # processing lag between the two camera callbacks, tight enough that
 # a real second grab immediately after the first is never blocked.
 
-ID_LOCK_WINDOW_SEC = 0.3  # kept for reference, not used with single-camera counting
+ID_LOCK_WINDOW_SEC = 1.5  # kept for reference, not used with single-camera counting
 
 # Authoritative camera for counting and TTS announcements.
 # Camera 1 still runs detection, tracking, and overlay drawing but does
 # not increment counters or fire TTS. Single-camera counting naturally
 # prevents cross-camera duplicate counts without needing a lock.
-COUNTING_CAMERA_ID = 0
+COUNTING_CAMERA_ID = 2
 
 # Extra seconds the pipeline keeps recording after the door closes.
 # Pipeline remains in PLAYING state the entire time so all frames are
 # real camera output. TTS fires immediately in a parallel thread so
 # the customer hears the closing announcement without waiting.
 # Adjust between 5 and 10 to taste.
-RECORD_TAIL_S = 5
+RECORD_TAIL_S = 2
 
 # =====================================================================
 # HARDWARE CONTROL FUNCTIONS
