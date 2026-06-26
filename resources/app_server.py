@@ -413,16 +413,16 @@ def draw_counts(frame, class_counters, label):
     """
     class_names = {
         0:  "",
-        1:  "chickenKatsuCurry",
-        2:  "dakgangjeongRice",
-        3:  "dragonFruit",
-        4:  "guava",
-        5:  "kimchiFriedRice",
-        6:  "kimchiTuna",
-        7:  "mango",
-        8:  "mangoMilk",
-        9:  "pineappleHoney",
-        10: "pinkGuava",
+        1:  "ayamMasakMerahWithRice",
+        2:  "kampungFriedRice",
+        3:  "malatang",
+        4:  "nasiLemakAyamRendang",
+        5:  "nasiPadangMeatRendang",
+        6:  "prawnAndChickenWontonNoodles",
+        7:  "tehTarik",
+        8:  "thaiGreenChickenCurryWithRice",
+        9:  "uncleChinChickenRice",
+        
     }
 
     total_entry = sum(class_counters["entry"].values())
