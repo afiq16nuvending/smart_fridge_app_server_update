@@ -282,7 +282,7 @@ ID_LOCK_WINDOW_SEC = 1.5  # kept for reference, not used with single-camera coun
 # Camera 1 still runs detection, tracking, and overlay drawing but does
 # not increment counters or fire TTS. Single-camera counting naturally
 # prevents cross-camera duplicate counts without needing a lock.
-COUNTING_CAMERA_ID = 0
+COUNTING_CAMERA_ID = 2
 
 # Extra seconds the pipeline keeps recording after the door closes.
 # Pipeline remains in PLAYING state the entire time so all frames are
