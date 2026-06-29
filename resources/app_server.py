@@ -60,7 +60,7 @@ TRACKING CHANGES IN v2.4:
   same constant so early counts are still jitter-filtered. Currently 4.
 
 AUTHOR: Mike
-VERSION: 2.5
+VERSION: 2.6
 LAST UPDATED: 2026
 =====================================================================
 """
@@ -331,12 +331,41 @@ NET_END_GRACE_FRAMES = 300
 # missed the latter because that motion is nearly vertical.
 #
 # Tuning per machine: point this roughly from the interior toward the door.
-#   (1, 0)  = pure rightward  (old X-only behaviour)
-#   (1, 1)  = down-right diagonal  (this machine)
+#   (1, 0)  = pure rightward  (X-only - the cleaner mode, default)
+#   (1, 1)  = down-right diagonal  (more left-side reach, but vertical lift
+#                                   motions add noise)
 #   (0, 1)  = pure downward
 # The vector is normalised internally, so only its direction matters.
+# Default is X-only (Y=0): cleaner on the cases that work; the left-side
+# miss it leaves is fundamentally a camera-angle limit, not fixable here.
 EXIT_DIR_X = 1.0
 EXIT_DIR_Y = 0.0
+
+# --- v2.6 counting-only robustness (no pipeline changes) ----------------
+
+# Minimum detection confidence for a detection to FEED the counter.
+# DEFAULT 0.0 = DISABLED (every detection feeds the counter, like the
+# known-good version). Testing showed a 0.3 floor dropped the low-confidence
+# interior detections that make up RETURNS, freezing entry counts - so this
+# is off by default. Raise it (e.g. 0.25-0.30) ONLY if you see garbage
+# detections driving false counts, and watch the [LOWCONF] log.
+COUNT_CONF_MIN = 0.0
+
+# Anchor re-stitch across tracker ID churn. DEFAULT 0 = DISABLED. When the
+# known-good behaviour is wanted this stays off. Set STITCH_DIST_PX to ~70
+# to enable: a brand-new global_id appearing within this many px (|dx|+|dy|)
+# of a recent same-label track inherits its anchor, so displacement keeps
+# accumulating across an ID churn. Risk if enabled too loose: two distinct
+# same-product grabs at the same spot merge and the second is missed - which
+# is why it is off by default.
+STITCH_DIST_PX        = 0    # 0 = disabled; ~70 to enable anti-churn stitch
+STITCH_MAX_GAP_FRAMES = 8    # max frames since the old track was last seen
+
+# Per-product sanity flag. If one product's entry OR exit count within a
+# single transaction exceeds this, log a [SANITY] warning. This does NOT
+# clamp the count - it only surfaces a likely tracking glitch so it is
+# visible rather than silent.
+SANITY_PER_PRODUCT = 5
 
 # =====================================================================
 # HARDWARE CONTROL FUNCTIONS
@@ -1836,9 +1865,12 @@ class NetDisplacementCounter:
       fidget / static shelf item    -> 0
     """
 
-    def __init__(self, min_net_px=120, stale_frames=300):
+    def __init__(self, min_net_px=120, stale_frames=300,
+                 stitch_dist=70, stitch_gap=8):
         self.min_net_px   = min_net_px
         self.stale_frames = stale_frames
+        self.stitch_dist  = stitch_dist
+        self.stitch_gap   = stitch_gap
         self.tracks       = {}
         self.frame_no     = 0
         self._lock        = threading.Lock()
@@ -1849,6 +1881,27 @@ class NetDisplacementCounter:
             norm = 1.0
         self.ex = EXIT_DIR_X / norm
         self.ey = EXIT_DIR_Y / norm
+
+    def _find_stitch(self, global_id, x, y, label):
+        """Find a recently-active DIFFERENT track with the same label near
+        (x, y) - i.e. the same physical item whose ID the tracker churned.
+        Returns its global_id or None. Disabled when stitch_dist <= 0."""
+        if self.stitch_dist <= 0:
+            return None
+        best_gid, best_d = None, self.stitch_dist
+        for gid2, t2 in self.tracks.items():
+            if gid2 == global_id:
+                continue
+            if t2['label'] != label:
+                continue
+            if t2['last_frame'] == self.frame_no:
+                continue  # still active this frame -> a distinct object
+            if self.frame_no - t2['last_frame'] > self.stitch_gap:
+                continue
+            d = abs(x - t2['last_x']) + abs(y - t2['last_y'])
+            if d <= best_d:
+                best_d, best_gid = d, gid2
+        return best_gid
 
     def _project(self, dx, dy):
         """Signed travel along the exit axis. Positive = toward door (exit)."""
@@ -1866,28 +1919,50 @@ class NetDisplacementCounter:
                 for gid in stale:
                     del self.tracks[gid]
 
-    def observe(self, global_id, x, y, label):
+    def observe(self, global_id, x, y, label, conf=1.0):
         """Record a detection. Returns a commit event tuple if this
         observation crosses the threshold in a NEW direction, else None.
-        Event: (global_id, label, direction, anchor_proj_ref, proj_now, y, proj)."""
+        Event: (global_id, label, direction, proj, x, y, conf)."""
         with self._lock:
             t = self.tracks.get(global_id)
             if t is None:
-                self.tracks[global_id] = {
-                    'anchor_x':   x,
-                    'anchor_y':   y,
-                    'last_x':     x,
-                    'last_y':     y,
-                    'label':      label,
-                    'last_dir':   None,
-                    'last_frame': self.frame_no,
-                }
-                return None
-
-            t['last_x']     = x
-            t['last_y']     = y
-            t['label']      = label
-            t['last_frame'] = self.frame_no
+                # ID churn re-stitch: if this fresh id is really a churned
+                # continuation of a recent same-label track nearby, inherit
+                # its anchor + direction so displacement keeps accumulating.
+                donor = self._find_stitch(global_id, x, y, label)
+                if donor is not None:
+                    d = self.tracks.pop(donor)
+                    self.tracks[global_id] = {
+                        'anchor_x':   d['anchor_x'],
+                        'anchor_y':   d['anchor_y'],
+                        'last_x':     x,
+                        'last_y':     y,
+                        'label':      label,
+                        'last_dir':   d['last_dir'],
+                        'last_frame': self.frame_no,
+                        'conf':       conf,
+                    }
+                    t = self.tracks[global_id]
+                    # fall through to the projection check below: the
+                    # preserved anchor may already constitute a crossing.
+                else:
+                    self.tracks[global_id] = {
+                        'anchor_x':   x,
+                        'anchor_y':   y,
+                        'last_x':     x,
+                        'last_y':     y,
+                        'label':      label,
+                        'last_dir':   None,
+                        'last_frame': self.frame_no,
+                        'conf':       conf,
+                    }
+                    return None
+            else:
+                t['last_x']     = x
+                t['last_y']     = y
+                t['label']      = label
+                t['last_frame'] = self.frame_no
+                t['conf']       = conf
 
             proj = self._project(x - t['anchor_x'], y - t['anchor_y'])
             if abs(proj) < self.min_net_px:
@@ -1903,7 +1978,7 @@ class NetDisplacementCounter:
                 return None
 
             t['last_dir'] = direction
-            return (global_id, label, direction, int(proj), x, y, int(proj))
+            return (global_id, label, direction, int(proj), x, y, conf)
 
     def reset(self):
         """Clear all state between transactions."""
@@ -1917,11 +1992,13 @@ class NetDisplacementCounter:
 net_counter = NetDisplacementCounter(
     min_net_px=NET_DISPLACEMENT_MIN_PX,
     stale_frames=NET_END_GRACE_FRAMES,
+    stitch_dist=STITCH_DIST_PX,
+    stitch_gap=STITCH_MAX_GAP_FRAMES,
 )
 
 
 def commit_net_count(user_data, global_id, label, direction,
-                     y_center, proj_ref, x_now, proj, source="crossing"):
+                     y_center, proj, x_now, conf, source="crossing"):
     """
     Apply ONE committed count for a finished track: bump the counter, fire
     the directional TTS, update validated/invalidated product state, and log.
@@ -1964,8 +2041,16 @@ def commit_net_count(user_data, global_id, label, direction,
     tot_e = sum(td.class_counters['entry'].values())
     tot_x = sum(td.class_counters['exit'].values())
     print(f"[COUNT] g={global_id} '{label}' {direction} "
-          f"axisProj={proj:+d}px @x={x_now} y={y_center} "
+          f"axisProj={proj:+d}px @x={x_now} y={y_center} conf={conf:.2f} "
           f"src={source} totE={tot_e} totX={tot_x}")
+
+    # Per-product sanity flag: surface (do NOT clamp) an implausibly high
+    # count for one product in a single transaction - a likely tracking glitch.
+    this_count = td.class_counters[direction][label]
+    if this_count > SANITY_PER_PRODUCT:
+        print(f"[SANITY] '{label}' {direction} count={this_count} exceeds "
+              f"{SANITY_PER_PRODUCT} in one transaction - check for a "
+              f"tracking glitch (count NOT clamped)")
 
 # =====================================================================
 # CROSS-CAMERA TRACKING
@@ -2330,9 +2415,9 @@ def detection_callback(pad, info, callback_data):
     # STEP 4: Track active objects for cleanup
     active_local_track_ids = set()
 
-    # v2.5: advance the net-displacement frame clock once per counting-camera
-    # frame. Absent tracks accrue frames here; harvest() commits them once
-    # they have been gone for NET_END_GRACE_FRAMES.
+    # Advance the net-displacement frame clock once per counting-camera frame.
+    # Used for stale-track pruning and the ID re-stitch gap window; counting
+    # itself commits at the crossing inside observe().
     if stream_id == COUNTING_CAMERA_ID:
         net_counter.tick()
 
@@ -2397,11 +2482,20 @@ def detection_callback(pad, info, callback_data):
         # count mid-motion (works for returns that then sit static). Camera 1
         # still tracks/draws but never feeds the counter.
         if stream_id == COUNTING_CAMERA_ID:
-            ev = net_counter.observe(global_id, center[0], center[1], label)
-            if ev:
-                gid_e, lbl_e, dir_e, anchor_e, x_e, y_e, run_e = ev
-                commit_net_count(user_data, gid_e, lbl_e, dir_e, y_e,
-                                 anchor_e, x_e, run_e, source="crossing")
+            if confidence >= COUNT_CONF_MIN:
+                ev = net_counter.observe(global_id, center[0], center[1],
+                                         label, confidence)
+                if ev:
+                    gid_e, lbl_e, dir_e, proj_e, x_e, y_e, conf_e = ev
+                    commit_net_count(user_data, gid_e, lbl_e, dir_e, y_e,
+                                     proj_e, x_e, conf_e, source="crossing")
+            else:
+                # Dropped from counting as too low-confidence. Throttled log so
+                # you can see how often this happens before raising the floor.
+                if net_counter.frame_no % 30 == 0:
+                    print(f"[LOWCONF] '{label}' conf={confidence:.2f} "
+                          f"< {COUNT_CONF_MIN} @x={center[0]} y={center[1]} "
+                          f"(not fed to counter)")
 
     # STEP 7: Cleanup inactive tracks (also clears v2.2 label history)
     cleanup_inactive_tracks(stream_id, active_local_track_ids)
@@ -3533,7 +3627,7 @@ def main():
     print("GPIO and MQTT cleanup handlers registered")
 
     print("\n" + "="*60)
-    print("SMART FRIDGE SYSTEM STARTED (v2.5)")
+    print("SMART FRIDGE SYSTEM STARTED (v2.6)")
     print("="*60)
     print(f"Memory at startup: {psutil.Process().memory_info().rss / 1024 / 1024:.1f}MB")
     print(f"Available memory:  {psutil.virtual_memory().available / 1024 / 1024:.1f}MB")
@@ -3566,7 +3660,11 @@ def main():
     print(f"Counting method:   net-displacement, commit-on-crossing (2D axis)")
     print(f"Cross threshold:   {NET_DISPLACEMENT_MIN_PX}px along exit axis")
     print(f"Exit axis (x,y):   ({EXIT_DIR_X:+.1f}, {EXIT_DIR_Y:+.1f})  "
-          f"(image Y is down; door direction)")
+          f"({'X-only' if EXIT_DIR_Y == 0 else 'diagonal'}; image Y down)")
+    print(f"Conf floor:        {COUNT_CONF_MIN:.2f}  "
+          f"({'DISABLED' if COUNT_CONF_MIN <= 0 else 'below = not counted'})")
+    print(f"ID re-stitch:      {'DISABLED' if STITCH_DIST_PX <= 0 else f'<= {STITCH_DIST_PX}px / {STITCH_MAX_GAP_FRAMES}f'}")
+    print(f"Sanity flag:       > {SANITY_PER_PRODUCT}/product/transaction")
     print(f"Dedupe backstop:   (label, direction, lane)  "
           f"window={brief_id_lock.window_sec}s, "
           f"lane={brief_id_lock.lane_tolerance_px}px")
