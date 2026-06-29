@@ -316,13 +316,11 @@ DIRECTION_MIN_FRAMES = 4
 # missed). Tune from the [COUNT] log's netX values on real grabs.
 NET_DISPLACEMENT_MIN_PX = 120
 
-# Frames a track must be ABSENT before it's considered ended and committed.
-# Counted in frames, like keep-lost-frames. This should be >= the tracker's
-# keep-lost-frames so the app does not commit a track while the tracker is
-# still bridging a short detection dropout (which would split one grab into
-# two tracks). At low framerate each frame is a long time, so a large value
-# here means a longer delay before the count/beep fires.
-NET_END_GRACE_FRAMES = 12
+# v2.5.1: counting now commits at the displacement CROSSING (mid-motion),
+# not at track end, so this grace value no longer gates counting. It is kept
+# only as a memory-prune horizon: a track unseen this many frames is dropped
+# from the counter's table.
+NET_END_GRACE_FRAMES = 300
 
 # Which X direction is "exit" (item removed from fridge). On the counting
 # camera, items leave toward the door at the RIGHT edge, i.e. increasing X,
@@ -1804,88 +1802,103 @@ brief_id_lock = BriefIDLock(window_sec=0.5, lane_tolerance_px=80)
 
 class NetDisplacementCounter:
     """
-    Commit-once-per-track counter keyed on net horizontal displacement.
+    Commit-on-crossing counter with directional hysteresis.
 
-    Per counting-camera frame:
-      - tick()    advances the internal frame clock (call once per frame).
-      - observe() records a global_id's current X/Y/label and marks it seen
-                  this frame. first_x is locked on first sight; last_x and
-                  label update every frame.
-      - harvest() returns the count events for tracks that have been ABSENT
-                  for >= end_grace_frames, then drops them. Each returned
-                  track yields at most ONE event.
+    v2.5.1: counts at the moment an object's horizontal travel crosses a
+    threshold WHILE STILL MOVING, instead of waiting for the track to end.
+    This fixes the exit/entry asymmetry of the track-end version: an item
+    that is taken OUT leaves the frame (track ends) but an item that is
+    RETURNED stays in view as a static detection (track never ends), so
+    track-end counting silently dropped returns. Crossing-based counting
+    commits the entry the instant the inward motion is large enough.
 
-    At transaction end, flush_all() commits any tracks still open (e.g. the
-    item the customer was holding when the door shut).
+    Per counting-camera track we keep:
+      - anchor_x: the reference X. running net = current_x - anchor_x.
+      - last_committed_dir: the last direction we counted for this track.
 
-    A track only produces an event if |last_x - first_x| >= min_net_px.
-    Direction comes from the sign of net X (see EXIT_IS_POSITIVE_X).
+    On each observe(global_id, x, y, label):
+      running = x - anchor_x
+      if |running| >= min_px:
+          dir = exit/entry from sign of running (see EXIT_IS_POSITIVE_X)
+          if dir != last_committed_dir:   # genuine new direction
+              -> EMIT one count, set last_committed_dir = dir, anchor_x = x
+          else:                           # same direction, long pull
+              -> no count, just advance anchor_x = x  (prevents re-firing)
+
+    Consequences:
+      take-and-keep      -> crosses out -> 1 exit (then leaves frame)
+      take-and-put-back  -> out -> exit, then in past anchor -> entry (nets 0)
+      plain return       -> in -> 1 entry (even though item then sits static)
+      long single pull   -> 1 count (same-direction re-cross only advances anchor)
+      fidget at boundary  -> never reaches min_px -> 0
+      static shelf item   -> never moves -> 0 (even as its global_id churns)
+
+    NOTE: this measures horizontal (X) travel only. If in/out motion in a
+    given camera is diagonal or vertical (items pushed straight up into the
+    fridge), a 2D version keyed on a door->interior direction is needed.
     """
 
-    def __init__(self, min_net_px=120, end_grace_frames=12):
-        self.min_net_px       = min_net_px
-        self.end_grace_frames = end_grace_frames
-        self.tracks           = {}   # global_id -> trajectory dict
-        self.frame_no         = 0
-        self._lock            = threading.Lock()
+    def __init__(self, min_net_px=120, stale_frames=300):
+        self.min_net_px   = min_net_px
+        self.stale_frames = stale_frames   # prune tracks unseen this long
+        self.tracks       = {}             # global_id -> state dict
+        self.frame_no     = 0
+        self._lock        = threading.Lock()
 
-    def _direction_from_net(self, net):
-        if EXIT_IS_POSITIVE_X:
-            return 'exit' if net > 0 else 'entry'
-        return 'entry' if net > 0 else 'exit'
+    def _direction(self, running):
+        moved_positive = running > 0
+        is_exit = (moved_positive == EXIT_IS_POSITIVE_X)
+        return 'exit' if is_exit else 'entry'
 
     def tick(self):
+        """Advance frame clock and prune stale tracks (call once/frame)."""
         with self._lock:
             self.frame_no += 1
+            if self.frame_no % 60 == 0:  # prune occasionally, cheap
+                stale = [
+                    gid for gid, t in self.tracks.items()
+                    if self.frame_no - t['last_frame'] > self.stale_frames
+                ]
+                for gid in stale:
+                    del self.tracks[gid]
 
     def observe(self, global_id, x, y, label):
+        """Record a detection. Returns a commit event tuple if this
+        observation crosses the threshold in a NEW direction, else None.
+        Event: (global_id, label, direction, anchor_x, x, y, running)."""
         with self._lock:
             t = self.tracks.get(global_id)
             if t is None:
                 self.tracks[global_id] = {
-                    'first_x':    x,
+                    'anchor_x':   x,
                     'last_x':     x,
                     'last_y':     y,
                     'label':      label,
-                    'first_frame': self.frame_no,
-                    'last_frame':  self.frame_no,
+                    'last_dir':   None,
+                    'last_frame': self.frame_no,
                 }
-            else:
-                t['last_x']     = x
-                t['last_y']     = y
-                t['label']      = label   # keep latest smoothed label
-                t['last_frame'] = self.frame_no
+                return None
 
-    def harvest(self):
-        """Return [(global_id, label, direction, first_x, last_x, y, net), ...]
-        for tracks that ended, and drop them from the table."""
-        events = []
-        with self._lock:
-            ended = [
-                gid for gid, t in self.tracks.items()
-                if (self.frame_no - t['last_frame']) >= self.end_grace_frames
-            ]
-            for gid in ended:
-                t   = self.tracks.pop(gid)
-                net = t['last_x'] - t['first_x']
-                if abs(net) >= self.min_net_px:
-                    direction = self._direction_from_net(net)
-                    events.append((gid, t['label'], direction,
-                                   t['first_x'], t['last_x'], t['last_y'], net))
-        return events
+            t['last_x']     = x
+            t['last_y']     = y
+            t['label']      = label
+            t['last_frame'] = self.frame_no
 
-    def flush_all(self):
-        """Commit every still-open track (call at transaction end)."""
-        events = []
-        with self._lock:
-            for gid, t in list(self.tracks.items()):
-                net = t['last_x'] - t['first_x']
-                if abs(net) >= self.min_net_px:
-                    direction = self._direction_from_net(net)
-                    events.append((gid, t['label'], direction,
-                                   t['first_x'], t['last_x'], t['last_y'], net))
-            self.tracks.clear()
-        return events
+            running = x - t['anchor_x']
+            if abs(running) < self.min_net_px:
+                return None
+
+            direction = self._direction(running)
+            anchor_before = t['anchor_x']
+            t['anchor_x'] = x   # reset anchor on any crossing
+
+            if direction == t['last_dir']:
+                # same direction as last commit: long continued pull, just
+                # advanced the anchor above - do NOT count again.
+                return None
+
+            t['last_dir'] = direction
+            return (global_id, label, direction, anchor_before, x, y, running)
 
     def reset(self):
         """Clear all state between transactions."""
@@ -1894,15 +1907,16 @@ class NetDisplacementCounter:
             self.frame_no = 0
 
 
-# Global instance. Tune min_net_px / end_grace_frames via the constants above.
+# Global instance. Tune min_net_px (the crossing hysteresis distance) via
+# the NET_DISPLACEMENT_MIN_PX constant above.
 net_counter = NetDisplacementCounter(
     min_net_px=NET_DISPLACEMENT_MIN_PX,
-    end_grace_frames=NET_END_GRACE_FRAMES,
+    stale_frames=NET_END_GRACE_FRAMES,
 )
 
 
 def commit_net_count(user_data, global_id, label, direction,
-                     y_center, first_x, last_x, net, source="track_end"):
+                     y_center, anchor_x, last_x, net, source="crossing"):
     """
     Apply ONE committed count for a finished track: bump the counter, fire
     the directional TTS, update validated/invalidated product state, and log.
@@ -1945,7 +1959,7 @@ def commit_net_count(user_data, global_id, label, direction,
     tot_e = sum(td.class_counters['entry'].values())
     tot_x = sum(td.class_counters['exit'].values())
     print(f"[COUNT] g={global_id} '{label}' {direction} "
-          f"netX={net:+d} (x {first_x}->{last_x}) y={y_center} "
+          f"crossX={net:+d} (anchor {anchor_x}->{last_x}) y={y_center} "
           f"src={source} totE={tot_e} totX={tot_x}")
 
 # =====================================================================
@@ -2373,24 +2387,16 @@ def detection_callback(pad, info, callback_data):
         draw_trail(frame, track_id, center, color, global_id=global_id)
 
         # STEP 6: Net-displacement accumulation (counting camera only).
-        # v2.5: we no longer call analyze_movement_direction() or count
-        # mid-motion. Instead we just RECORD this global_id's current
-        # position; the decision (and the single count) happens once, at
-        # track end, in the harvest sweep after this loop. This removes the
-        # per-frame direction guess and the reversal re-arming that produced
-        # the Entry/Exit over-count. Camera 1 still tracks/draws but never
-        # feeds the counter.
+        # v2.5.1: observe() returns a commit event the moment this track's
+        # horizontal travel crosses the threshold in a NEW direction, so we
+        # count mid-motion (works for returns that then sit static). Camera 1
+        # still tracks/draws but never feeds the counter.
         if stream_id == COUNTING_CAMERA_ID:
-            net_counter.observe(global_id, center[0], center[1], label)
-
-    # STEP 6b: Net-displacement commit sweep (counting camera only).
-    # Commit one count for every track that has now ended (gone for
-    # NET_END_GRACE_FRAMES). This is the ONLY place mid-transaction counts
-    # are produced in v2.5.
-    if stream_id == COUNTING_CAMERA_ID:
-        for (gid, lbl, direction, fx, lx, yy, net) in net_counter.harvest():
-            commit_net_count(user_data, gid, lbl, direction, yy, fx, lx, net,
-                             source="track_end")
+            ev = net_counter.observe(global_id, center[0], center[1], label)
+            if ev:
+                gid_e, lbl_e, dir_e, anchor_e, x_e, y_e, run_e = ev
+                commit_net_count(user_data, gid_e, lbl_e, dir_e, y_e,
+                                 anchor_e, x_e, run_e, source="crossing")
 
     # STEP 7: Cleanup inactive tracks (also clears v2.2 label history)
     cleanup_inactive_tracks(stream_id, active_local_track_ids)
@@ -2631,14 +2637,6 @@ async def run_tracking(websocket: WebSocket):
             # speak_closing_summary() generates and plays the summary.
             # ---------------------------------------------------------
             tts_manager.speak_door_close()
-
-            # v2.5: flush any tracks still open when the door shut (e.g. the
-            # item the customer was holding). Commit them BEFORE the closing
-            # summary so the summary reflects the final counts.
-            if 'callback' in locals() and hasattr(callback, 'tracking_data'):
-                for (gid, lbl, direction, fx, lx, yy, net) in net_counter.flush_all():
-                    commit_net_count(callback, gid, lbl, direction, yy, fx, lx, net,
-                                     source="door_close_flush")
 
             if 'callback' in locals() and hasattr(callback, 'tracking_data'):
                 product_movement_announcer.speak_closing_summary(
@@ -3560,11 +3558,9 @@ def main():
 
     print(f"Label smoothing:   {LABEL_HISTORY_LEN}-frame window, "
           f"{LABEL_SMOOTH_MIN}-frame minimum")
-    print(f"Counting method:   net-displacement, commit-once-per-track")
-    print(f"Net min travel:    {NET_DISPLACEMENT_MIN_PX}px  "
-          f"(exit = {'+X' if EXIT_IS_POSITIVE_X else '-X'})")
-    print(f"Track end grace:   {NET_END_GRACE_FRAMES} frames absent "
-          f"(keep-lost-frames=15 in pipeline)")
+    print(f"Counting method:   net-displacement, commit-on-crossing")
+    print(f"Cross threshold:   {NET_DISPLACEMENT_MIN_PX}px  "
+          f"(exit = {'+X' if EXIT_IS_POSITIVE_X else '-X'}, X-axis only)")
     print(f"Dedupe backstop:   (label, direction, lane)  "
           f"window={brief_id_lock.window_sec}s, "
           f"lane={brief_id_lock.lane_tolerance_px}px")
