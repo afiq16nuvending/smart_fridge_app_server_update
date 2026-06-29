@@ -60,7 +60,7 @@ TRACKING CHANGES IN v2.4:
   same constant so early counts are still jitter-filtered. Currently 4.
 
 AUTHOR: Mike
-VERSION: 2.4
+VERSION: 2.5
 LAST UPDATED: 2026
 =====================================================================
 """
@@ -290,6 +290,45 @@ COUNTING_CAMERA_ID = 0
 # The bbox-stability gate uses this SAME constant so that when the floor
 # is lowered, early counts are still jitter-filtered.
 DIRECTION_MIN_FRAMES = 4
+
+# =====================================================================
+# v2.5 NET-DISPLACEMENT COUNTING
+# =====================================================================
+# v2.5 replaces per-frame direction counting (which over-counted any item
+# held/fidgeted at the boundary, because every direction flip re-armed a
+# new count) with COMMIT-ONCE-PER-TRACK by net displacement.
+#
+# How it decides: for each global_id on the counting camera we record where
+# it was first seen (first_x) and where it was last seen (last_x). When the
+# track ends (object gone for NET_END_GRACE_FRAMES frames), we look at the
+# net X travel:
+#   net = last_x - first_x
+#   |net| >= NET_DISPLACEMENT_MIN_PX  ->  count ONE in that direction
+#   |net| <  NET_DISPLACEMENT_MIN_PX  ->  count NOTHING (it just wobbled)
+# Direction from sign of net (see EXIT_IS_POSITIVE_X). One commit per track,
+# no re-arming. Take-and-keep -> 1 exit. Take-and-put-back -> ~0 net -> 0
+# (or 1 exit + 1 entry if it split into two tracks, which nets correctly).
+# Fidget-at-edge -> 0.
+
+# Minimum net horizontal travel (pixels, in the counting camera's frame)
+# for a track to count as a real take/return. Lower = counts smaller moves
+# (risk: noise counts). Higher = needs a bigger pull (risk: gentle takes
+# missed). Tune from the [COUNT] log's netX values on real grabs.
+NET_DISPLACEMENT_MIN_PX = 120
+
+# Frames a track must be ABSENT before it's considered ended and committed.
+# Counted in frames, like keep-lost-frames. This should be >= the tracker's
+# keep-lost-frames so the app does not commit a track while the tracker is
+# still bridging a short detection dropout (which would split one grab into
+# two tracks). At low framerate each frame is a long time, so a large value
+# here means a longer delay before the count/beep fires.
+NET_END_GRACE_FRAMES = 12
+
+# Which X direction is "exit" (item removed from fridge). On the counting
+# camera, items leave toward the door at the RIGHT edge, i.e. increasing X,
+# so exit = positive net X. If a machine is mirrored (door on the left),
+# set this False and exits become negative net X.
+EXIT_IS_POSITIVE_X = True
 
 # =====================================================================
 # HARDWARE CONTROL FUNCTIONS
@@ -1267,7 +1306,7 @@ class HailoDetectionCallback(app_callback_class):
             "queue name=hailo_postprocess0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
             "hailofilter function-name=filter_letterbox so-path=/home/afiq/hailo-rpi5-examples/basic_pipelines/../resources/libyolo_hailortpp_postprocess.so config-path=resources/labels.json qos=false ! "
             "queue name=hailo_track0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
-            "hailotracker name=hailo_tracker class-id=-1 kalman-dist-thr=0.8 iou-thr=0.9 init-iou-thr=0.7 keep-new-frames=1 keep-tracked-frames=1 keep-lost-frames=10 keep-past-metadata=true ! "
+            "hailotracker name=hailo_tracker class-id=-1 kalman-dist-thr=0.8 iou-thr=0.9 init-iou-thr=0.7 keep-new-frames=1 keep-tracked-frames=1 keep-lost-frames=15 keep-past-metadata=true ! "
             "hailostreamrouter name=sid src_0::input-streams=\"<sink_0>\" src_1::input-streams=\"<sink_1>\" "
             "compositor name=comp start-time-selection=0 sink_0::xpos=0 sink_0::ypos=0 sink_1::xpos=350 sink_1::ypos=0 ! "
             "queue name=hailo_video_q_0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
@@ -1368,6 +1407,7 @@ class HailoDetectionCallback(app_callback_class):
             # API credentials
             username = 'admin'
             password = '1234'
+            api_key  = '123456'
             headers  = {'x-api-key': api_key}
 
             while True:
@@ -1759,6 +1799,156 @@ class BriefIDLock:
 brief_id_lock = BriefIDLock(window_sec=0.5, lane_tolerance_px=80)
 
 # =====================================================================
+# v2.5 NET-DISPLACEMENT COUNTER
+# =====================================================================
+
+class NetDisplacementCounter:
+    """
+    Commit-once-per-track counter keyed on net horizontal displacement.
+
+    Per counting-camera frame:
+      - tick()    advances the internal frame clock (call once per frame).
+      - observe() records a global_id's current X/Y/label and marks it seen
+                  this frame. first_x is locked on first sight; last_x and
+                  label update every frame.
+      - harvest() returns the count events for tracks that have been ABSENT
+                  for >= end_grace_frames, then drops them. Each returned
+                  track yields at most ONE event.
+
+    At transaction end, flush_all() commits any tracks still open (e.g. the
+    item the customer was holding when the door shut).
+
+    A track only produces an event if |last_x - first_x| >= min_net_px.
+    Direction comes from the sign of net X (see EXIT_IS_POSITIVE_X).
+    """
+
+    def __init__(self, min_net_px=120, end_grace_frames=12):
+        self.min_net_px       = min_net_px
+        self.end_grace_frames = end_grace_frames
+        self.tracks           = {}   # global_id -> trajectory dict
+        self.frame_no         = 0
+        self._lock            = threading.Lock()
+
+    def _direction_from_net(self, net):
+        if EXIT_IS_POSITIVE_X:
+            return 'exit' if net > 0 else 'entry'
+        return 'entry' if net > 0 else 'exit'
+
+    def tick(self):
+        with self._lock:
+            self.frame_no += 1
+
+    def observe(self, global_id, x, y, label):
+        with self._lock:
+            t = self.tracks.get(global_id)
+            if t is None:
+                self.tracks[global_id] = {
+                    'first_x':    x,
+                    'last_x':     x,
+                    'last_y':     y,
+                    'label':      label,
+                    'first_frame': self.frame_no,
+                    'last_frame':  self.frame_no,
+                }
+            else:
+                t['last_x']     = x
+                t['last_y']     = y
+                t['label']      = label   # keep latest smoothed label
+                t['last_frame'] = self.frame_no
+
+    def harvest(self):
+        """Return [(global_id, label, direction, first_x, last_x, y, net), ...]
+        for tracks that ended, and drop them from the table."""
+        events = []
+        with self._lock:
+            ended = [
+                gid for gid, t in self.tracks.items()
+                if (self.frame_no - t['last_frame']) >= self.end_grace_frames
+            ]
+            for gid in ended:
+                t   = self.tracks.pop(gid)
+                net = t['last_x'] - t['first_x']
+                if abs(net) >= self.min_net_px:
+                    direction = self._direction_from_net(net)
+                    events.append((gid, t['label'], direction,
+                                   t['first_x'], t['last_x'], t['last_y'], net))
+        return events
+
+    def flush_all(self):
+        """Commit every still-open track (call at transaction end)."""
+        events = []
+        with self._lock:
+            for gid, t in list(self.tracks.items()):
+                net = t['last_x'] - t['first_x']
+                if abs(net) >= self.min_net_px:
+                    direction = self._direction_from_net(net)
+                    events.append((gid, t['label'], direction,
+                                   t['first_x'], t['last_x'], t['last_y'], net))
+            self.tracks.clear()
+        return events
+
+    def reset(self):
+        """Clear all state between transactions."""
+        with self._lock:
+            self.tracks.clear()
+            self.frame_no = 0
+
+
+# Global instance. Tune min_net_px / end_grace_frames via the constants above.
+net_counter = NetDisplacementCounter(
+    min_net_px=NET_DISPLACEMENT_MIN_PX,
+    end_grace_frames=NET_END_GRACE_FRAMES,
+)
+
+
+def commit_net_count(user_data, global_id, label, direction,
+                     y_center, first_x, last_x, net, source="track_end"):
+    """
+    Apply ONE committed count for a finished track: bump the counter, fire
+    the directional TTS, update validated/invalidated product state, and log.
+
+    BriefIDLock is kept as a backstop only - with once-per-track commits it
+    rarely fires, but it still catches the rare case of two tracks for the
+    same physical item committing in the same direction/lane within its
+    window. center Y is passed for that lane check.
+    """
+    if brief_id_lock.is_duplicate(label, direction, y_center):
+        print(f"[COUNT-SKIP] g={global_id} '{label}' {direction} "
+              f"suppressed by brief lock (src={source})")
+        return
+
+    td = user_data.tracking_data
+    td.class_counters[direction][label] += 1
+
+    if direction == "exit":
+        product_movement_announcer.on_exit(label)
+    else:
+        product_movement_announcer.on_entry(label)
+
+    td.counted_tracks.setdefault(direction, set()).add(global_id)
+
+    validation_result = user_data.validate_detected_product(label)
+    if validation_result['valid']:
+        slot = td.validated_products[direction].setdefault(
+            label, {"count": 0, "product_details": validation_result['product_details']}
+        )
+        slot["count"] += 1
+    else:
+        slot = td.invalidated_products[direction].setdefault(
+            label, {"count": 0, "raw_detection": {
+                "name": label, "confidence": 0.0,
+                "tracking_id": global_id, "bounding_box": {}
+            }}
+        )
+        slot["count"] += 1
+
+    tot_e = sum(td.class_counters['entry'].values())
+    tot_x = sum(td.class_counters['exit'].values())
+    print(f"[COUNT] g={global_id} '{label}' {direction} "
+          f"netX={net:+d} (x {first_x}->{last_x}) y={y_center} "
+          f"src={source} totE={tot_e} totX={tot_x}")
+
+# =====================================================================
 # CROSS-CAMERA TRACKING
 # =====================================================================
 
@@ -1953,6 +2143,9 @@ class ProductMovementAnnouncer:
         # v2.4: clear the BriefIDLock window so events from a previous
         # customer can't suppress this customer's first count.
         brief_id_lock.reset()
+        # v2.5: clear net-displacement trajectories and frame clock so a
+        # previous customer's open tracks can't leak into this transaction.
+        net_counter.reset()
         print("[MovementTTS] Announcer reset for new transaction")
 
     def _beep_and_speak(self, text: str, beep_path: str):
@@ -2118,6 +2311,12 @@ def detection_callback(pad, info, callback_data):
     # STEP 4: Track active objects for cleanup
     active_local_track_ids = set()
 
+    # v2.5: advance the net-displacement frame clock once per counting-camera
+    # frame. Absent tracks accrue frames here; harvest() commits them once
+    # they have been gone for NET_END_GRACE_FRAMES.
+    if stream_id == COUNTING_CAMERA_ID:
+        net_counter.tick()
+
     if hasattr(user_data, 'transaction_id') and user_data.transaction_id:
         transaction_memory_manager.track_frame(user_data.transaction_id)
 
@@ -2173,69 +2372,25 @@ def detection_callback(pad, info, callback_data):
 
         draw_trail(frame, track_id, center, color, global_id=global_id)
 
-        direction = analyze_movement_direction(
-            track_id, center, user_data.tracking_data,
-            stream_id, global_id, (x1, y1, x2, y2)
-        )
+        # STEP 6: Net-displacement accumulation (counting camera only).
+        # v2.5: we no longer call analyze_movement_direction() or count
+        # mid-motion. Instead we just RECORD this global_id's current
+        # position; the decision (and the single count) happens once, at
+        # track end, in the harvest sweep after this loop. This removes the
+        # per-frame direction guess and the reversal re-arming that produced
+        # the Entry/Exit over-count. Camera 1 still tracks/draws but never
+        # feeds the counter.
+        if stream_id == COUNTING_CAMERA_ID:
+            net_counter.observe(global_id, center[0], center[1], label)
 
-        # STEP 6: Update counters and announce
-        # v2.2: only the authoritative camera (stream_id == COUNTING_CAMERA_ID)
-        # is allowed to increment counters or fire TTS. Both cameras still
-        # run direction analysis above (so on-screen trails on camera 1 work),
-        # but only camera 0's events become real counts.
-        if direction and stream_id == COUNTING_CAMERA_ID:
-            already_counted = (
-                global_id in user_data.tracking_data.counted_tracks.get(direction, set())
-            )
-            direction_just_changed = (
-                global_id in global_last_counted_direction and
-                direction != global_last_counted_direction[global_id]
-            )
-            should_count = (not already_counted) or direction_just_changed
-
-            # v2.4: short-window dedupe via BriefIDLock.
-            # is_duplicate() RECORDS the event when it returns False, so
-            # call it only AFTER the should_count gate to avoid poisoning
-            # the window with events we never counted.
-            # Keyed on (label, direction, Y-lane) - NOT global_id - so a
-            # re-acquired can (fresh global_id, same label, same lane) is
-            # suppressed while two distinct same-product cans in different
-            # lanes BOTH count. center[1] is the Y center computed above.
-            if should_count and not brief_id_lock.is_duplicate(label, direction, center[1]):
-                user_data.tracking_data.class_counters[direction][label] += 1
-                print(f"[COUNT] g={global_id} L={track_id} '{label}' {direction} y={center[1]} "
-                      f"tot E={sum(user_data.tracking_data.class_counters['entry'].values())} "
-                      f"X={sum(user_data.tracking_data.class_counters['exit'].values())}")
-
-                if direction == "exit":
-                    product_movement_announcer.on_exit(label)
-                else:
-                    product_movement_announcer.on_entry(label)
-
-                if direction not in user_data.tracking_data.counted_tracks:
-                    user_data.tracking_data.counted_tracks[direction] = set()
-                user_data.tracking_data.counted_tracks[direction].add(global_id)
-
-                if validation_result['valid']:
-                    if label not in user_data.tracking_data.validated_products[direction]:
-                        user_data.tracking_data.validated_products[direction][label] = {
-                            "count":           0,
-                            "product_details": validation_result['product_details']
-                        }
-                    user_data.tracking_data.validated_products[direction][label]["count"] += 1
-                else:
-                    if label not in user_data.tracking_data.invalidated_products[direction]:
-                        user_data.tracking_data.invalidated_products[direction][label] = {
-                            "count":         0,
-                            "raw_detection": {
-                                "name":         label,
-                                "confidence":   confidence,
-                                "tracking_id":  global_id,
-                                "bounding_box": {"xmin": x1, "ymin": y1,
-                                                 "xmax": x2, "ymax": y2}
-                            }
-                        }
-                    user_data.tracking_data.invalidated_products[direction][label]["count"] += 1
+    # STEP 6b: Net-displacement commit sweep (counting camera only).
+    # Commit one count for every track that has now ended (gone for
+    # NET_END_GRACE_FRAMES). This is the ONLY place mid-transaction counts
+    # are produced in v2.5.
+    if stream_id == COUNTING_CAMERA_ID:
+        for (gid, lbl, direction, fx, lx, yy, net) in net_counter.harvest():
+            commit_net_count(user_data, gid, lbl, direction, yy, fx, lx, net,
+                             source="track_end")
 
     # STEP 7: Cleanup inactive tracks (also clears v2.2 label history)
     cleanup_inactive_tracks(stream_id, active_local_track_ids)
@@ -2476,6 +2631,14 @@ async def run_tracking(websocket: WebSocket):
             # speak_closing_summary() generates and plays the summary.
             # ---------------------------------------------------------
             tts_manager.speak_door_close()
+
+            # v2.5: flush any tracks still open when the door shut (e.g. the
+            # item the customer was holding). Commit them BEFORE the closing
+            # summary so the summary reflects the final counts.
+            if 'callback' in locals() and hasattr(callback, 'tracking_data'):
+                for (gid, lbl, direction, fx, lx, yy, net) in net_counter.flush_all():
+                    commit_net_count(callback, gid, lbl, direction, yy, fx, lx, net,
+                                     source="door_close_flush")
 
             if 'callback' in locals() and hasattr(callback, 'tracking_data'):
                 product_movement_announcer.speak_closing_summary(
@@ -3367,7 +3530,7 @@ def main():
     print("GPIO and MQTT cleanup handlers registered")
 
     print("\n" + "="*60)
-    print("SMART FRIDGE SYSTEM STARTED (v2.4)")
+    print("SMART FRIDGE SYSTEM STARTED (v2.5)")
     print("="*60)
     print(f"Memory at startup: {psutil.Process().memory_info().rss / 1024 / 1024:.1f}MB")
     print(f"Available memory:  {psutil.virtual_memory().available / 1024 / 1024:.1f}MB")
@@ -3397,9 +3560,12 @@ def main():
 
     print(f"Label smoothing:   {LABEL_HISTORY_LEN}-frame window, "
           f"{LABEL_SMOOTH_MIN}-frame minimum")
-    print(f"Direction floor:   {DIRECTION_MIN_FRAMES} frames "
-          f"(bbox-stability gate uses same floor)")
-    print(f"Dedupe key:        (label, direction, lane)  "
+    print(f"Counting method:   net-displacement, commit-once-per-track")
+    print(f"Net min travel:    {NET_DISPLACEMENT_MIN_PX}px  "
+          f"(exit = {'+X' if EXIT_IS_POSITIVE_X else '-X'})")
+    print(f"Track end grace:   {NET_END_GRACE_FRAMES} frames absent "
+          f"(keep-lost-frames=15 in pipeline)")
+    print(f"Dedupe backstop:   (label, direction, lane)  "
           f"window={brief_id_lock.window_sec}s, "
           f"lane={brief_id_lock.lane_tolerance_px}px")
     print(f"Exit beep:         880 Hz  ({BEEP_EXIT_PATH})")
