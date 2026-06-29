@@ -1263,7 +1263,7 @@ class HailoDetectionCallback(app_callback_class):
             "queue name=hailo_postprocess0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
             "hailofilter function-name=filter_letterbox so-path=/home/afiq/hailo-rpi5-examples/basic_pipelines/../resources/libyolo_hailortpp_postprocess.so config-path=resources/labels.json qos=false ! "
             "queue name=hailo_track0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
-            "hailotracker name=hailo_tracker class-id=-1 kalman-dist-thr=0.8 iou-thr=0.9 init-iou-thr=0.7 keep-new-frames=1 keep-tracked-frames=1 keep-lost-frames=1 keep-past-metadata=true ! "
+            "hailotracker name=hailo_tracker class-id=-1 kalman-dist-thr=0.8 iou-thr=0.9 init-iou-thr=0.7 keep-new-frames=1 keep-tracked-frames=1 keep-lost-frames=10 keep-past-metadata=true ! "
             "hailostreamrouter name=sid src_0::input-streams=\"<sink_0>\" src_1::input-streams=\"<sink_1>\" "
             "compositor name=comp start-time-selection=0 sink_0::xpos=0 sink_0::ypos=0 sink_1::xpos=350 sink_1::ypos=0 ! "
             "queue name=hailo_video_q_0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
@@ -2165,6 +2165,9 @@ def detection_callback(pad, info, callback_data):
             # items of the same product can BOTH count correctly.
             if should_count and not is_duplicate_count(global_id, direction):
                 user_data.tracking_data.class_counters[direction][label] += 1
+                print(f"[COUNT] g={global_id} L={track_id} '{label}' {direction} y={center[1]} "
+                      f"tot E={sum(user_data.tracking_data.class_counters['entry'].values())} "
+                      f"X={sum(user_data.tracking_data.class_counters['exit'].values())}")
 
                 if direction == "exit":
                     product_movement_announcer.on_exit(label)
