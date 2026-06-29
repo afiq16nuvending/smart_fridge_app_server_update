@@ -336,7 +336,7 @@ NET_END_GRACE_FRAMES = 300
 #   (0, 1)  = pure downward
 # The vector is normalised internally, so only its direction matters.
 EXIT_DIR_X = 1.0
-EXIT_DIR_Y = 1.0
+EXIT_DIR_Y = 0.0
 
 # =====================================================================
 # HARDWARE CONTROL FUNCTIONS
