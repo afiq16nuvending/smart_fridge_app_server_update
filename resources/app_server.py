@@ -39,17 +39,28 @@ TRACKING CHANGES IN v2.3:
   suppresses single-frame class flips.
 - Single authoritative counting camera (carried over): only camera 0
   increments counters and fires TTS. Camera 1 still tracks and draws.
-- Time-window dedupe is now keyed on (global_id, direction) instead of
-  (label, direction). This means two Cokes grabbed in quick succession
-  are BOTH counted (different global_ids) while a single physical object
-  that gets split into two global_ids by tracker glitches is still
-  suppressed. Trades silent miss-counts for recoverable over-counts.
 - Distinct beeps for entry vs exit: high 880 Hz beep for exit (item
   leaving), low 440 Hz beep for entry (item returning). Lets the
   operator distinguish events by ear without watching the screen.
 
+TRACKING CHANGES IN v2.4:
+- Duplicate suppression moved from the old (global_id, direction) deque
+  to BriefIDLock, keyed on (label, direction) + Y-lane position.
+  The old global_id key could NEVER catch the real over-count source:
+  a can the tracker drops mid-grab and re-acquires gets a FRESH
+  global_id, so the old key never matched the prior event and BOTH
+  counted. Label survives re-acquisition; global_id does not.
+  The Y-lane check exploits the mounting (cameras are top-down, in/out
+  motion is along X, so genuinely distinct cans separate along Y):
+  a re-grabbed can stays in ~the same Y lane and is collapsed, while
+  two real same-product cans in different lanes BOTH count.
+- Direction frame floor is now a named constant DIRECTION_MIN_FRAMES
+  (was a hardcoded 5 in two places inside analyze_movement_direction).
+  Lower it to count quicker grabs; the bbox-stability gate uses the
+  same constant so early counts are still jitter-filtered. Currently 4.
+
 AUTHOR: Mike
-VERSION: 2.3
+VERSION: 2.4
 LAST UPDATED: 2026
 =====================================================================
 """
@@ -245,13 +256,14 @@ camera_bbox_area_history = {
 }
 
 # =====================================================================
-# v2.2 TRACKING ROBUSTNESS STRUCTURES
+# v2.2 / v2.4 TRACKING ROBUSTNESS STRUCTURES
 # =====================================================================
 #
-# These structures support the three v2.2 tracking fixes:
-#   1. Class smoothing (track_label_history)
-#   2. Authoritative-camera counting (COUNTING_CAMERA_ID)
-#   3. Time-window dedupe (recent_count_events)
+# These structures support the tracking fixes:
+#   1. Class smoothing            (track_label_history)        [v2.2]
+#   2. Authoritative-camera count (COUNTING_CAMERA_ID)         [v2.2]
+#   3. Direction frame floor      (DIRECTION_MIN_FRAMES)       [v2.4]
+#   4. Brief duplicate lock       (BriefIDLock, see below)     [v2.4]
 # =====================================================================
 
 # Per-(camera_id, local_track_id) label history.
@@ -271,21 +283,13 @@ track_label_history = defaultdict(lambda: deque(maxlen=LABEL_HISTORY_LEN))
 # Both cameras still run detection, tracking, and overlay drawing.
 COUNTING_CAMERA_ID = 0
 
-# Recent count events for tracker-split duplicate suppression.
-# Each entry is (timestamp, global_id, direction). A new count event for
-# the SAME global_id within DEDUPE_WINDOW_SEC seconds is suppressed.
-#
-# v2.3 NOTE: keyed on global_id (not label). This means two Cokes
-# grabbed in quick succession are BOTH counted - they have different
-# global_ids. What still gets suppressed is a single physical object
-# that the tracker briefly loses and re-acquires under a new local
-# track ID, producing a fresh global_id for the same can within the
-# 1.5s window. That re-acquisition path is the only thing this dedupe
-# is for now; cross-camera duplicates are handled by COUNTING_CAMERA_ID
-# above.
-DEDUPE_WINDOW_SEC   = 1.5
-recent_count_events = deque(maxlen=200)
-recent_count_lock   = threading.Lock()
+# Frame floor for direction analysis - minimum history frames before an
+# entry/exit direction is trusted. Lower = quicker grabs counted; too low
+# = jitter gets counted. Old floor was a hardcoded 5 in two places inside
+# analyze_movement_direction(). Test 3 (eager) vs 4 (balanced).
+# The bbox-stability gate uses this SAME constant so that when the floor
+# is lowered, early counts are still jitter-filtered.
+DIRECTION_MIN_FRAMES = 4
 
 # =====================================================================
 # HARDWARE CONTROL FUNCTIONS
@@ -409,16 +413,16 @@ def draw_counts(frame, class_counters, label):
     """
     class_names = {
         0:  "",
-        1:  "ayamMasakMerahWithRice",
-        2:  "kampungFriedRice",
-        3:  "malatang",
-        4:  "nasiLemakAyamRendang",
-        5:  "nasiPadangMeatRendang",
-        6:  "prawnAndChickenWontonNoodles",
-        7:  "tehTarik",
-        8:  "thaiGreenChickenCurryWithRice",
-        9:  "uncleChinChickenRice",
-        
+        1:  "chickenKatsuCurry",
+        2:  "dakgangjeongRice",
+        3:  "dragonFruit",
+        4:  "guava",
+        5:  "kimchiFriedRice",
+        6:  "kimchiTuna",
+        7:  "mango",
+        8:  "mangoMilk",
+        9:  "pineappleHoney",
+        10: "pinkGuava",
     }
 
     total_entry = sum(class_counters["entry"].values())
@@ -1323,7 +1327,7 @@ class HailoDetectionCallback(app_callback_class):
 
         # Construct API endpoint URL
         api_endpoint = (f'https://stg-sfapi.nuboxtech.com/index.php/'
-                        f'mobile_app/machine/Machine_listing/machine_planogram/{machine_id}')
+                        f'mobile_app/machine/Machine_listing/machine_planogram/{machine_id')
 
         video_monitor_thread = threading.Thread(
             target=monitor_and_send_videos,
@@ -1364,7 +1368,6 @@ class HailoDetectionCallback(app_callback_class):
             # API credentials
             username = 'admin'
             password = '1234'
-            api_key  = '123456'
             headers  = {'x-api-key': api_key}
 
             while True:
@@ -1666,68 +1669,94 @@ def cleanup_label_history(camera_id, active_local_track_ids):
         del track_label_history[key]
 
 # =====================================================================
-# v2.2 TIME-WINDOW DEDUPE
+# v2.4 BRIEF DUPLICATE LOCK
 # =====================================================================
 
-def is_duplicate_count(global_id, direction, now=None):
+class BriefIDLock:
     """
-    Return True if a count event for (global_id, direction) has occurred
-    within the last DEDUPE_WINDOW_SEC seconds.
+    Short-window duplicate suppressor for count events.
 
-    v2.3 CHANGE: keyed on global_id, NOT label.
+    Keyed on (label, direction) + Y-lane position. This catches the REAL
+    over-count source - a can the tracker drops mid-grab and re-acquires
+    under a FRESH global_id - while letting two genuinely distinct cans
+    of the same product BOTH count.
 
-    What this catches:
-      - Same physical object gets two different global_ids in quick
-        succession because the tracker briefly lost it and re-acquired
-        it. Without dedupe, both global_ids would count.
+    Why not global_id (the v2.3 key):
+        A re-acquired can gets a brand-new global_id, so a global_id key
+        never matches the prior event and BOTH fire. Label survives
+        re-acquisition; global_id does not.
 
-    What this deliberately does NOT catch:
-      - Two distinct items of the same product (e.g. two Cokes) grabbed
-        within 1.5s. They have different global_ids and BOTH count
-        correctly. This is the v2.3 fix - v2.2's label-keyed dedupe
-        would have silently dropped the second Coke.
+    Why the Y-lane check:
+        Cameras are mounted top-down, so in/out (entry/exit) motion runs
+        along X. Two genuinely distinct cans therefore separate along Y.
+        A single re-grabbed can stays in ~the same Y lane and is
+        collapsed (suppressed); two real cans in different lanes both
+        pass (counted). lane_tolerance_px sets how close in Y two events
+        must be to be treated as the same physical object.
 
-    Cross-camera duplicates are not this function's concern - the
-    COUNTING_CAMERA_ID rule above means camera 1's events never reach
-    this function in the first place.
-
-    Side effect: if the event is NOT a duplicate, it is recorded.
-
-    Args:
-        global_id (int):           Global track ID for the object.
-        direction (str):           'entry' or 'exit'.
-        now       (float, optional): Override timestamp (for testing).
-
-    Returns:
-        bool: True if this is a duplicate event that should be suppressed.
+    Tuning:
+        window_sec        - how long after a count the lock stays armed
+                            for the same (label, direction, lane).
+                            Larger = more aggressive collapsing.
+        lane_tolerance_px - Y distance under which two events are treated
+                            as the same lane. Larger = more aggressive
+                            collapsing of nearby cans.
     """
-    if now is None:
-        now = time.time()
 
-    with recent_count_lock:
-        # Drop expired events from the front of the deque.
-        while recent_count_events and now - recent_count_events[0][0] > DEDUPE_WINDOW_SEC:
-            recent_count_events.popleft()
+    def __init__(self, window_sec=0.5, lane_tolerance_px=80):
+        self.window_sec        = window_sec
+        self.lane_tolerance_px = lane_tolerance_px
+        # Each entry: (timestamp, label, direction, y_center)
+        self._events = deque(maxlen=200)
+        self._lock   = threading.Lock()
 
-        # Check for any matching event still inside the window.
-        for ts, gid, direc in recent_count_events:
-            if gid == global_id and direc == direction:
-                return True
+    def is_duplicate(self, label, direction, y_center, now=None):
+        """
+        Return True if a count for (label, direction) in the same Y lane
+        has occurred within the last window_sec seconds.
 
-        # Not a duplicate - record this event so the NEXT call sees it.
-        recent_count_events.append((now, global_id, direction))
-        return False
+        Side effect: if NOT a duplicate, the event is recorded so the
+        next call can see it. Call this only AFTER the should_count gate
+        so events that were never counted don't poison the window.
+
+        Args:
+            label     (str):   Smoothed product label.
+            direction (str):   'entry' or 'exit'.
+            y_center  (int):   Y coordinate of the object's center.
+            now       (float): Override timestamp (for testing).
+
+        Returns:
+            bool: True if this is a duplicate that should be suppressed.
+        """
+        if now is None:
+            now = time.time()
+
+        with self._lock:
+            # Drop expired events from the front of the deque.
+            while self._events and now - self._events[0][0] > self.window_sec:
+                self._events.popleft()
+
+            # Same label + same direction + same Y lane still in window?
+            for ts, lbl, direc, y in self._events:
+                if lbl == label and direc == direction and \
+                   abs(y - y_center) <= self.lane_tolerance_px:
+                    return True
+
+            # Not a duplicate - record it for the NEXT call.
+            self._events.append((now, label, direction, y_center))
+            return False
+
+    def reset(self):
+        """
+        Clear the event window between transactions so count events from
+        a previous customer cannot suppress events for a new one.
+        """
+        with self._lock:
+            self._events.clear()
 
 
-def reset_dedupe_state():
-    """
-    Clear the dedupe deque between transactions so that count events
-    from a previous customer cannot suppress events for a new one.
-    Called from product_movement_announcer.reset() chain - see
-    run_tracking() PHASE 2 transaction setup.
-    """
-    with recent_count_lock:
-        recent_count_events.clear()
+# Global instance. Tune window_sec / lane_tolerance_px here.
+brief_id_lock = BriefIDLock(window_sec=0.5, lane_tolerance_px=80)
 
 # =====================================================================
 # CROSS-CAMERA TRACKING
@@ -1820,11 +1849,14 @@ def analyze_movement_direction(track_id, center, tracking_data,
 
     global_movement_history[global_id].appendleft((center, camera_id))
 
-    if len(camera_movement_history[camera_id][track_id]) < 5:
+    # v2.4: frame floor is now a named constant (was hardcoded 5).
+    if len(camera_movement_history[camera_id][track_id]) < DIRECTION_MIN_FRAMES:
         return None
 
     # CHECK 1: Bounding-box stability
-    if len(camera_bbox_area_history[camera_id][track_id]) >= 5:
+    # v2.4: gated on the SAME DIRECTION_MIN_FRAMES so that lowering the
+    # floor does not skip jitter filtering on the earliest counts.
+    if len(camera_bbox_area_history[camera_id][track_id]) >= DIRECTION_MIN_FRAMES:
         areas    = list(camera_bbox_area_history[camera_id][track_id])
         avg_area = sum(areas) / len(areas)
         variance = sum((a - avg_area) ** 2 for a in areas) / len(areas)
@@ -1918,9 +1950,9 @@ class ProductMovementAnnouncer:
 
     def reset(self):
         """Clear state. Call at the start of each new transaction."""
-        # v2.2: also clear the time-window dedupe deque so events
-        # from a previous customer can't poison the new transaction.
-        reset_dedupe_state()
+        # v2.4: clear the BriefIDLock window so events from a previous
+        # customer can't suppress this customer's first count.
+        brief_id_lock.reset()
         print("[MovementTTS] Announcer reset for new transaction")
 
     def _beep_and_speak(self, text: str, beep_path: str):
@@ -2032,14 +2064,18 @@ def detection_callback(pad, info, callback_data):
     Process each video frame: detect, track, validate, count, announce,
     and push data to the WebSocket.
 
-    v2.2 CHANGES (counting logic only):
+    COUNTING LOGIC (v2.2 -> v2.4):
       - Per-detection label is smoothed via get_smoothed_label() before
         being used for global ID lookup, counter increments, validation,
-        TTS, and websocket payload.
+        TTS, and websocket payload.                                  [v2.2]
       - Counter increments and TTS calls are gated by
-        stream_id == COUNTING_CAMERA_ID. Camera 1 still tracks and draws.
-      - A final time-window dedupe (is_duplicate_count) suppresses any
-        same-(label, direction) events that fire within DEDUPE_WINDOW_SEC.
+        stream_id == COUNTING_CAMERA_ID. Camera 1 still tracks/draws. [v2.2]
+      - Direction is trusted only after DIRECTION_MIN_FRAMES of history
+        (named constant, was a hardcoded 5).                         [v2.4]
+      - A final short-window dedupe (brief_id_lock.is_duplicate) keyed
+        on (label, direction, Y-lane) suppresses a can the tracker
+        dropped and re-acquired under a fresh global_id, while letting
+        two distinct same-product cans in different lanes both count. [v2.4]
       - The Hailo pipeline, the Gst probe wiring, and frame compositing
         are unchanged.
 
@@ -2157,13 +2193,15 @@ def detection_callback(pad, info, callback_data):
             )
             should_count = (not already_counted) or direction_just_changed
 
-            # v2.3: time-window dedupe.
-            # is_duplicate_count records the event when it returns False,
-            # so call it only AFTER the should_count gate to avoid
-            # poisoning the dedupe window with events we never counted.
-            # v2.3: keyed on global_id (not label) so that two distinct
-            # items of the same product can BOTH count correctly.
-            if should_count and not is_duplicate_count(global_id, direction):
+            # v2.4: short-window dedupe via BriefIDLock.
+            # is_duplicate() RECORDS the event when it returns False, so
+            # call it only AFTER the should_count gate to avoid poisoning
+            # the window with events we never counted.
+            # Keyed on (label, direction, Y-lane) - NOT global_id - so a
+            # re-acquired can (fresh global_id, same label, same lane) is
+            # suppressed while two distinct same-product cans in different
+            # lanes BOTH count. center[1] is the Y center computed above.
+            if should_count and not brief_id_lock.is_duplicate(label, direction, center[1]):
                 user_data.tracking_data.class_counters[direction][label] += 1
                 print(f"[COUNT] g={global_id} L={track_id} '{label}' {direction} y={center[1]} "
                       f"tot E={sum(user_data.tracking_data.class_counters['entry'].values())} "
@@ -2364,9 +2402,9 @@ async def run_tracking(websocket: WebSocket):
                 print(f"[Memory] Transaction {transaction_id} started")
 
             # Reset movement announcer for this transaction
-            # v2.2: announcer.reset() now also clears the time-window
-            # dedupe deque, so a previous customer's events cannot
-            # suppress this customer's first count.
+            # v2.4: announcer.reset() now also clears the BriefIDLock
+            # window, so a previous customer's events cannot suppress
+            # this customer's first count.
             product_movement_announcer.reset()
 
             door_monitor_active = True
@@ -3329,7 +3367,7 @@ def main():
     print("GPIO and MQTT cleanup handlers registered")
 
     print("\n" + "="*60)
-    print("SMART FRIDGE SYSTEM STARTED (v2.3)")
+    print("SMART FRIDGE SYSTEM STARTED (v2.4)")
     print("="*60)
     print(f"Memory at startup: {psutil.Process().memory_info().rss / 1024 / 1024:.1f}MB")
     print(f"Available memory:  {psutil.virtual_memory().available / 1024 / 1024:.1f}MB")
@@ -3340,9 +3378,30 @@ def main():
     print(f"MQTT topics:       AIfridge/{MQTT_MACHINE_ID}/rpi/connectionStatus")
     print(f"                   AIfridge/{MQTT_MACHINE_ID}/rpi/doorStatus")
     print(f"Counting camera:   {COUNTING_CAMERA_ID}  (other cameras: display only)")
+
+    # Resolve the udev symlinks so the banner shows which real /dev/videoN
+    # the counting/display cameras landed on THIS boot. The symlinks are
+    # serial-pinned (see /etc/udev/rules.d/99-fridge-cameras.rules), so the
+    # videoN target may differ each reboot but cam_count always = the top
+    # (counting) camera. A "MISSING" here means udev did not bind - the
+    # pipeline would then fail to open the source, so this is the early
+    # warning instead of a silent miscount.
+    for nick in ("/dev/cam_count", "/dev/cam_display"):
+        try:
+            if os.path.islink(nick) or os.path.exists(nick):
+                print(f"Camera symlink:    {nick} -> {os.path.realpath(nick)}")
+            else:
+                print(f"Camera symlink:    {nick} -> MISSING (udev rule not applied?)")
+        except Exception as e:
+            print(f"Camera symlink:    {nick} -> error resolving: {e}")
+
     print(f"Label smoothing:   {LABEL_HISTORY_LEN}-frame window, "
           f"{LABEL_SMOOTH_MIN}-frame minimum")
-    print(f"Dedupe key:        (global_id, direction), window={DEDUPE_WINDOW_SEC}s")
+    print(f"Direction floor:   {DIRECTION_MIN_FRAMES} frames "
+          f"(bbox-stability gate uses same floor)")
+    print(f"Dedupe key:        (label, direction, lane)  "
+          f"window={brief_id_lock.window_sec}s, "
+          f"lane={brief_id_lock.lane_tolerance_px}px")
     print(f"Exit beep:         880 Hz  ({BEEP_EXIT_PATH})")
     print(f"Entry beep:        440 Hz  ({BEEP_ENTRY_PATH})")
     print("\nPress Ctrl+C to stop")
@@ -3360,5 +3419,5 @@ if __name__ == "__main__":
     main()
 
 # =====================================================================
-# END OF SMART FRIDGE DETECTION SYSTEM v2.3
+# END OF SMART FRIDGE DETECTION SYSTEM v2.4
 # =====================================================================
