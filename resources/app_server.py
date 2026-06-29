@@ -298,17 +298,17 @@ DIRECTION_MIN_FRAMES = 4
 # held/fidgeted at the boundary, because every direction flip re-armed a
 # new count) with COMMIT-ONCE-PER-TRACK by net displacement.
 #
-# How it decides: for each global_id on the counting camera we record where
-# it was first seen (first_x) and where it was last seen (last_x). When the
-# track ends (object gone for NET_END_GRACE_FRAMES frames), we look at the
-# net X travel:
-#   net = last_x - first_x
-#   |net| >= NET_DISPLACEMENT_MIN_PX  ->  count ONE in that direction
-#   |net| <  NET_DISPLACEMENT_MIN_PX  ->  count NOTHING (it just wobbled)
-# Direction from sign of net (see EXIT_IS_POSITIVE_X). One commit per track,
-# no re-arming. Take-and-keep -> 1 exit. Take-and-put-back -> ~0 net -> 0
-# (or 1 exit + 1 entry if it split into two tracks, which nets correctly).
-# Fidget-at-edge -> 0.
+# How it decides: for each global_id on the counting camera we hold an anchor
+# point and the last direction we counted. Each frame we project the travel
+# since the anchor onto the exit axis (EXIT_DIR_X, EXIT_DIR_Y):
+#   proj = (x - anchor_x)*ex + (y - anchor_y)*ey
+#   |proj| >= NET_DISPLACEMENT_MIN_PX and a NEW direction -> count ONE, then
+#       reset the anchor and lock that direction.
+#   same direction again -> just advance the anchor (no double count).
+#   |proj| < threshold -> nothing (wobble / static).
+# Counting commits AT THE CROSSING (mid-motion), so returns that end up
+# sitting static are still counted. Take-and-keep -> 1 exit. Take-and-put-
+# back -> 1 exit + 1 entry (nets 0). Fidget / static shelf item -> 0.
 
 # Minimum net horizontal travel (pixels, in the counting camera's frame)
 # for a track to count as a real take/return. Lower = counts smaller moves
@@ -322,11 +322,21 @@ NET_DISPLACEMENT_MIN_PX = 120
 # from the counter's table.
 NET_END_GRACE_FRAMES = 300
 
-# Which X direction is "exit" (item removed from fridge). On the counting
-# camera, items leave toward the door at the RIGHT edge, i.e. increasing X,
-# so exit = positive net X. If a machine is mirrored (door on the left),
-# set this False and exits become negative net X.
-EXIT_IS_POSITIVE_X = True
+# Direction of "exit" (item leaving the fridge) in IMAGE space. Image Y
+# points DOWN. On this camera the door/hand access is at the BOTTOM and the
+# interior shelves are UP and to the LEFT, so "out" = toward bottom-right =
+# (+X, +Y) and "in" = toward upper-left = (-X, -Y). Counting projects each
+# track's travel onto this vector, so it catches BOTH right-edge exits
+# (mostly +X) and deep/left placements (mostly -Y) - the X-only version
+# missed the latter because that motion is nearly vertical.
+#
+# Tuning per machine: point this roughly from the interior toward the door.
+#   (1, 0)  = pure rightward  (old X-only behaviour)
+#   (1, 1)  = down-right diagonal  (this machine)
+#   (0, 1)  = pure downward
+# The vector is normalised internally, so only its direction matters.
+EXIT_DIR_X = 1.0
+EXIT_DIR_Y = 1.0
 
 # =====================================================================
 # HARDWARE CONTROL FUNCTIONS
@@ -1802,59 +1812,53 @@ brief_id_lock = BriefIDLock(window_sec=0.5, lane_tolerance_px=80)
 
 class NetDisplacementCounter:
     """
-    Commit-on-crossing counter with directional hysteresis.
+    Commit-on-crossing counter with directional hysteresis, measured along
+    a 2D door->interior axis (EXIT_DIR_X, EXIT_DIR_Y).
 
-    v2.5.1: counts at the moment an object's horizontal travel crosses a
-    threshold WHILE STILL MOVING, instead of waiting for the track to end.
-    This fixes the exit/entry asymmetry of the track-end version: an item
-    that is taken OUT leaves the frame (track ends) but an item that is
-    RETURNED stays in view as a static detection (track never ends), so
-    track-end counting silently dropped returns. Crossing-based counting
-    commits the entry the instant the inward motion is large enough.
+    v2.5.2: travel is projected onto the exit-direction unit vector instead
+    of using raw X. This catches deep/left placements whose motion is mostly
+    vertical (and which the X-only version missed) while preserving right-
+    edge behaviour. Setting EXIT_DIR = (1, 0) reproduces the old X-only mode.
 
-    Per counting-camera track we keep:
-      - anchor_x: the reference X. running net = current_x - anchor_x.
-      - last_committed_dir: the last direction we counted for this track.
+    Per counting-camera track we keep an anchor point and the last committed
+    direction. On each observe():
+      proj = (cur - anchor) . exit_dir       # signed travel along the axis
+      if |proj| >= min_px:
+          dir = exit if proj > 0 else entry
+          if dir != last_committed_dir:  -> EMIT count, reset anchor, lock dir
+          else:                          -> advance anchor only (no re-fire)
 
-    On each observe(global_id, x, y, label):
-      running = x - anchor_x
-      if |running| >= min_px:
-          dir = exit/entry from sign of running (see EXIT_IS_POSITIVE_X)
-          if dir != last_committed_dir:   # genuine new direction
-              -> EMIT one count, set last_committed_dir = dir, anchor_x = x
-          else:                           # same direction, long pull
-              -> no count, just advance anchor_x = x  (prevents re-firing)
-
-    Consequences:
-      take-and-keep      -> crosses out -> 1 exit (then leaves frame)
-      take-and-put-back  -> out -> exit, then in past anchor -> entry (nets 0)
-      plain return       -> in -> 1 entry (even though item then sits static)
-      long single pull   -> 1 count (same-direction re-cross only advances anchor)
-      fidget at boundary  -> never reaches min_px -> 0
-      static shelf item   -> never moves -> 0 (even as its global_id churns)
-
-    NOTE: this measures horizontal (X) travel only. If in/out motion in a
-    given camera is diagonal or vertical (items pushed straight up into the
-    fridge), a 2D version keyed on a door->interior direction is needed.
+    Behaviour (same as before, now axis-aware):
+      take-and-keep / plain take    -> 1 exit
+      plain return (any side)       -> 1 entry
+      take-and-put-back             -> exit + entry (nets 0)
+      long single pull              -> 1 count
+      fidget / static shelf item    -> 0
     """
 
     def __init__(self, min_net_px=120, stale_frames=300):
         self.min_net_px   = min_net_px
-        self.stale_frames = stale_frames   # prune tracks unseen this long
-        self.tracks       = {}             # global_id -> state dict
+        self.stale_frames = stale_frames
+        self.tracks       = {}
         self.frame_no     = 0
         self._lock        = threading.Lock()
 
-    def _direction(self, running):
-        moved_positive = running > 0
-        is_exit = (moved_positive == EXIT_IS_POSITIVE_X)
-        return 'exit' if is_exit else 'entry'
+        # Normalise the exit-direction vector once.
+        norm = (EXIT_DIR_X ** 2 + EXIT_DIR_Y ** 2) ** 0.5
+        if norm == 0:
+            norm = 1.0
+        self.ex = EXIT_DIR_X / norm
+        self.ey = EXIT_DIR_Y / norm
+
+    def _project(self, dx, dy):
+        """Signed travel along the exit axis. Positive = toward door (exit)."""
+        return dx * self.ex + dy * self.ey
 
     def tick(self):
         """Advance frame clock and prune stale tracks (call once/frame)."""
         with self._lock:
             self.frame_no += 1
-            if self.frame_no % 60 == 0:  # prune occasionally, cheap
+            if self.frame_no % 60 == 0:
                 stale = [
                     gid for gid, t in self.tracks.items()
                     if self.frame_no - t['last_frame'] > self.stale_frames
@@ -1865,12 +1869,13 @@ class NetDisplacementCounter:
     def observe(self, global_id, x, y, label):
         """Record a detection. Returns a commit event tuple if this
         observation crosses the threshold in a NEW direction, else None.
-        Event: (global_id, label, direction, anchor_x, x, y, running)."""
+        Event: (global_id, label, direction, anchor_proj_ref, proj_now, y, proj)."""
         with self._lock:
             t = self.tracks.get(global_id)
             if t is None:
                 self.tracks[global_id] = {
                     'anchor_x':   x,
+                    'anchor_y':   y,
                     'last_x':     x,
                     'last_y':     y,
                     'label':      label,
@@ -1884,21 +1889,21 @@ class NetDisplacementCounter:
             t['label']      = label
             t['last_frame'] = self.frame_no
 
-            running = x - t['anchor_x']
-            if abs(running) < self.min_net_px:
+            proj = self._project(x - t['anchor_x'], y - t['anchor_y'])
+            if abs(proj) < self.min_net_px:
                 return None
 
-            direction = self._direction(running)
-            anchor_before = t['anchor_x']
+            direction = 'exit' if proj > 0 else 'entry'
             t['anchor_x'] = x   # reset anchor on any crossing
+            t['anchor_y'] = y
 
             if direction == t['last_dir']:
-                # same direction as last commit: long continued pull, just
-                # advanced the anchor above - do NOT count again.
+                # same direction as last commit: long continued motion, anchor
+                # already advanced - do NOT count again.
                 return None
 
             t['last_dir'] = direction
-            return (global_id, label, direction, anchor_before, x, y, running)
+            return (global_id, label, direction, int(proj), x, y, int(proj))
 
     def reset(self):
         """Clear all state between transactions."""
@@ -1916,7 +1921,7 @@ net_counter = NetDisplacementCounter(
 
 
 def commit_net_count(user_data, global_id, label, direction,
-                     y_center, anchor_x, last_x, net, source="crossing"):
+                     y_center, proj_ref, x_now, proj, source="crossing"):
     """
     Apply ONE committed count for a finished track: bump the counter, fire
     the directional TTS, update validated/invalidated product state, and log.
@@ -1959,7 +1964,7 @@ def commit_net_count(user_data, global_id, label, direction,
     tot_e = sum(td.class_counters['entry'].values())
     tot_x = sum(td.class_counters['exit'].values())
     print(f"[COUNT] g={global_id} '{label}' {direction} "
-          f"crossX={net:+d} (anchor {anchor_x}->{last_x}) y={y_center} "
+          f"axisProj={proj:+d}px @x={x_now} y={y_center} "
           f"src={source} totE={tot_e} totX={tot_x}")
 
 # =====================================================================
@@ -3558,9 +3563,10 @@ def main():
 
     print(f"Label smoothing:   {LABEL_HISTORY_LEN}-frame window, "
           f"{LABEL_SMOOTH_MIN}-frame minimum")
-    print(f"Counting method:   net-displacement, commit-on-crossing")
-    print(f"Cross threshold:   {NET_DISPLACEMENT_MIN_PX}px  "
-          f"(exit = {'+X' if EXIT_IS_POSITIVE_X else '-X'}, X-axis only)")
+    print(f"Counting method:   net-displacement, commit-on-crossing (2D axis)")
+    print(f"Cross threshold:   {NET_DISPLACEMENT_MIN_PX}px along exit axis")
+    print(f"Exit axis (x,y):   ({EXIT_DIR_X:+.1f}, {EXIT_DIR_Y:+.1f})  "
+          f"(image Y is down; door direction)")
     print(f"Dedupe backstop:   (label, direction, lane)  "
           f"window={brief_id_lock.window_sec}s, "
           f"lane={brief_id_lock.lane_tolerance_px}px")
