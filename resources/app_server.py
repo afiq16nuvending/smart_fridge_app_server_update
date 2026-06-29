@@ -1327,7 +1327,7 @@ class HailoDetectionCallback(app_callback_class):
 
         # Construct API endpoint URL
         api_endpoint = (f'https://stg-sfapi.nuboxtech.com/index.php/'
-                        f'mobile_app/machine/Machine_listing/machine_planogram/{machine_id')
+                        f'mobile_app/machine/Machine_listing/machine_planogram/{machine_id}')
 
         video_monitor_thread = threading.Thread(
             target=monitor_and_send_videos,
