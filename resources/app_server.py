@@ -314,7 +314,7 @@ DIRECTION_MIN_FRAMES = 4
 # for a track to count as a real take/return. Lower = counts smaller moves
 # (risk: noise counts). Higher = needs a bigger pull (risk: gentle takes
 # missed). Tune from the [COUNT] log's netX values on real grabs.
-NET_DISPLACEMENT_MIN_PX = 120
+NET_DISPLACEMENT_MIN_PX = 78
 
 # v2.5.1: counting now commits at the displacement CROSSING (mid-motion),
 # not at track end, so this grace value no longer gates counting. It is kept
