@@ -166,7 +166,7 @@ data_deque: Dict[int, deque] = {}
 # In production, this is read automatically from the WebSocket
 # start_preview message via os.environ['MACHINE_ID'].
 
-MQTT_MACHINE_ID = "209"    # change this to your test machine ID
+MQTT_MACHINE_ID = "171"    # change this to your test machine ID
 
 # Global MQTT client instance - initialised in main(), used everywhere
 mqtt_client: MQTTClient = None
@@ -1351,7 +1351,7 @@ class HailoDetectionCallback(app_callback_class):
             "queue name=hailo_display_q_0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
             "fpsdisplaysink video-sink=ximagesink name=hailo_display sync=false text-overlay=true "
             "v4l2src device=/dev/cam_count name=source_0 ! "
-            "image/jpeg, width=1024, height=576, framerate=25/1 ! "
+            "image/jpeg, width=640, height=360, framerate=25/1 ! "
             "jpegdec ! "
             "queue name=source_scale_q_0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
             "videoscale name=source_videoscale_0 n-threads=2 ! "
@@ -1366,11 +1366,11 @@ class HailoDetectionCallback(app_callback_class):
             "queue name=hailo_draw_0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
             "hailooverlay ! "
             "videoscale n-threads=8 ! "
-            "video/x-raw,width=1024,height=576 ! "
+            "video/x-raw,width=640,height=360 ! "
             "queue name=comp_q_0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
             "comp.sink_0 "
             "v4l2src device=/dev/cam_display name=source_2 ! "
-            "image/jpeg, width=1024, height=576, framerate=25/1 ! "
+            "image/jpeg, width=640, height=360, framerate=25/1 ! "
             "jpegdec ! "
             "queue name=source_scale_q_2 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
             "videoscale name=source_videoscale_2 n-threads=2 ! "
@@ -1385,7 +1385,7 @@ class HailoDetectionCallback(app_callback_class):
             "queue name=hailo_draw_1 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
             "hailooverlay ! "
             "videoscale n-threads=8 ! "
-            "video/x-raw,width=1024,height=576 ! "
+            "video/x-raw,width=640,height=360 ! "
             "queue name=comp_q_1 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
             "comp.sink_1"
         )
