@@ -166,7 +166,7 @@ data_deque: Dict[int, deque] = {}
 # In production, this is read automatically from the WebSocket
 # start_preview message via os.environ['MACHINE_ID'].
 
-MQTT_MACHINE_ID = "170"    # change this to your test machine ID
+MQTT_MACHINE_ID = "169"    # change this to your test machine ID
 
 # Global MQTT client instance - initialised in main(), used everywhere
 mqtt_client: MQTTClient = None
@@ -489,16 +489,16 @@ def draw_counts(frame, class_counters, label):
     """
     class_names = {
         0:  "",
-        1:  "chickenKatsuCurry",
-        2:  "dakgangjeongRice",
-        3:  "dragonFruit",
-        4:  "guava",
-        5:  "kimchiFriedRice",
-        6:  "kimchiTuna",
-        7:  "mango",
-        8:  "mangoMilk",
-        9:  "pineappleHoney",
-        10: "pinkGuava",
+        1:  "ayamMasakMerahWithRice",
+        2:  "chickenAndMushroom",
+        3:  "malatang",
+        4:  "nasiLemakAyamRendang",
+        5:  "nasiPadangMeatRendang",
+        6:  "prawnAndChickenWontonNoodles",
+        7:  "seafoodAndPrawn",
+        8:  "tehTarik",
+        9:  "thaiGreenChickenCurryWithRice",
+        10: "uncleChinChickenRice",
     }
 
     total_entry = sum(class_counters["entry"].values())
