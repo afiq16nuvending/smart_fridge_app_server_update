@@ -166,7 +166,7 @@ data_deque: Dict[int, deque] = {}
 # In production, this is read automatically from the WebSocket
 # start_preview message via os.environ['MACHINE_ID'].
 
-MQTT_MACHINE_ID = "211"    # change this to your test machine ID
+MQTT_MACHINE_ID = "166"    # change this to your test machine ID
 
 # Global MQTT client instance - initialised in main(), used everywhere
 mqtt_client: MQTTClient = None
@@ -314,7 +314,7 @@ DIRECTION_MIN_FRAMES = 4
 # for a track to count as a real take/return. Lower = counts smaller moves
 # (risk: noise counts). Higher = needs a bigger pull (risk: gentle takes
 # missed). Tune from the [COUNT] log's netX values on real grabs.
-NET_DISPLACEMENT_MIN_PX = 78
+NET_DISPLACEMENT_MIN_PX = 70
 
 # v2.5.1: counting now commits at the displacement CROSSING (mid-motion),
 # not at track end, so this grace value no longer gates counting. It is kept
@@ -338,8 +338,32 @@ NET_END_GRACE_FRAMES = 300
 # The vector is normalised internally, so only its direction matters.
 # Default is X-only (Y=0): cleaner on the cases that work; the left-side
 # miss it leaves is fundamentally a camera-angle limit, not fixable here.
-EXIT_DIR_X = 1.0
-EXIT_DIR_Y = 0.0
+EXIT_DIR_X = 0.0
+EXIT_DIR_Y = 1.0
+
+# --- Dual-camera counting (DEDICATED single-class machine only) ---------
+#
+# On a machine that stocks ONLY ONE product, both cameras can safely count
+# and a grab seen by BOTH is merged into one count. This is NOT safe on a
+# multi-product machine: the merge is keyed on (direction, time) with NO
+# label matching, so on a shared machine two different products taken at the
+# same instant would wrongly merge. Leave OFF unless the machine is a
+# dedicated single-class box (this one is vanillaCrepe-only).
+#
+# When ON: camera 0 and camera 1 each run their own displacement counter
+# (both on the EXIT_DIR axis above). When one camera commits a direction and
+# the OTHER camera already committed the SAME direction within the dedupe
+# window, the second is treated as the same physical grab and suppressed -
+# so a grab both cameras see counts once, but a grab only ONE camera catches
+# still counts (that's the coverage win).
+DUAL_CAMERA_COUNTING   = True
+
+# Cross-camera merge window (seconds). A same-direction commit from the other
+# camera within this window is treated as the same grab and merged.
+#   too LOW  -> the same grab seen slightly apart by the two cameras counts twice
+#   too HIGH -> two genuinely fast consecutive grabs merge into one (undercount)
+# Start ~1.2 and tune within 0.5-2.0 using the [DUAL] log's gap= value.
+DUAL_DEDUPE_WINDOW_SEC = 0.8
 
 # --- v2.6 counting-only robustness (no pipeline changes) ----------------
 
@@ -487,18 +511,18 @@ def draw_counts(frame, class_counters, label):
         class_counters (dict):       Dict with 'entry' and 'exit' counts.
         label          (str):        Current product label.
     """
-     class_names = {
+    class_names = {
         0:  "",
-        1:  "ayamMasakMerahWithRice",
-        2:  "chickenAndMushroom",
-        3:  "malatang",
-        4:  "nasiLemakAyamRendang",
-        5:  "nasiPadangMeatRendang",
-        6:  "prawnAndChickenWontonNoodles",
-        7:  "seafoodAndPrawn",
-        8:  "tehTarik",
-        9:  "thaiGreenChickenCurryWithRice",
-        10: "uncleChinChickenRice",
+        1:  "chickenKatsuCurry",
+        2:  "dakgangjeongRice",
+        3:  "dragonFruit",
+        4:  "guava",
+        5:  "kimchiFriedRice",
+        6:  "kimchiTuna",
+        7:  "mango",
+        8:  "mangoMilk",
+        9:  "pineappleHoney",
+        10: "pinkGuava",
     }
 
     total_entry = sum(class_counters["entry"].values())
@@ -1351,7 +1375,7 @@ class HailoDetectionCallback(app_callback_class):
             "queue name=hailo_display_q_0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
             "fpsdisplaysink video-sink=ximagesink name=hailo_display sync=false text-overlay=true "
             "v4l2src device=/dev/cam_count name=source_0 ! "
-            "image/jpeg, width=1024, height=576, framerate=25/1 ! "
+            "image/jpeg, width=640, height=360, framerate=25/1 ! "
             "jpegdec ! "
             "queue name=source_scale_q_0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
             "videoscale name=source_videoscale_0 n-threads=2 ! "
@@ -1366,11 +1390,11 @@ class HailoDetectionCallback(app_callback_class):
             "queue name=hailo_draw_0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
             "hailooverlay ! "
             "videoscale n-threads=8 ! "
-            "video/x-raw,width=1024,height=576 ! "
+            "video/x-raw,width=640,height=360 ! "
             "queue name=comp_q_0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
             "comp.sink_0 "
             "v4l2src device=/dev/cam_display name=source_2 ! "
-            "image/jpeg, width=1024, height=576, framerate=25/1 ! "
+            "image/jpeg, width=640, height=360, framerate=25/1 ! "
             "jpegdec ! "
             "queue name=source_scale_q_2 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
             "videoscale name=source_videoscale_2 n-threads=2 ! "
@@ -1385,7 +1409,7 @@ class HailoDetectionCallback(app_callback_class):
             "queue name=hailo_draw_1 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
             "hailooverlay ! "
             "videoscale n-threads=8 ! "
-            "video/x-raw,width=1024,height=576 ! "
+            "video/x-raw,width=640,height=360 ! "
             "queue name=comp_q_1 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
             "comp.sink_1"
         )
@@ -1987,14 +2011,55 @@ class NetDisplacementCounter:
             self.frame_no = 0
 
 
-# Global instance. Tune min_net_px (the crossing hysteresis distance) via
-# the NET_DISPLACEMENT_MIN_PX constant above.
-net_counter = NetDisplacementCounter(
-    min_net_px=NET_DISPLACEMENT_MIN_PX,
-    stale_frames=NET_END_GRACE_FRAMES,
-    stitch_dist=STITCH_DIST_PX,
-    stitch_gap=STITCH_MAX_GAP_FRAMES,
-)
+# Per-camera counter instances. Camera 0 is always the counter. Camera 1 is
+# added only for DUAL_CAMERA_COUNTING (dedicated single-class machine). Each
+# camera keeps its OWN anchors/tracks so the two views can't corrupt each
+# other. Both use the same EXIT_DIR axis and thresholds.
+def _make_counter():
+    return NetDisplacementCounter(
+        min_net_px=NET_DISPLACEMENT_MIN_PX,
+        stale_frames=NET_END_GRACE_FRAMES,
+        stitch_dist=STITCH_DIST_PX,
+        stitch_gap=STITCH_MAX_GAP_FRAMES,
+    )
+
+net_counters = {0: _make_counter(), 1: _make_counter()}
+# Back-compat alias: anything still referring to the single counter uses cam 0.
+net_counter = net_counters[0]
+
+
+# --- Cross-camera merge (single-class dedupe by direction + time) --------
+# Records accepted counts as (timestamp, direction, camera). A commit from
+# one camera is MERGED (suppressed) if the OTHER camera already committed the
+# same direction within DUAL_DEDUPE_WINDOW_SEC. Same-camera repeats are NOT
+# merged here (the counter's own direction-lock handles those), so two real
+# grabs on one camera still both count.
+_dual_recent = deque(maxlen=64)
+_dual_lock   = threading.Lock()
+
+
+def dual_accept(direction, camera_id, now=None):
+    """Return (accept, gap) - accept=False means this commit is the same grab
+    the OTHER camera already counted (merge/suppress). gap = seconds since that
+    other-camera sighting, or None. Records the commit when accepted."""
+    if now is None:
+        now = time.time()
+    with _dual_lock:
+        # prune expired
+        while _dual_recent and now - _dual_recent[0][0] > DUAL_DEDUPE_WINDOW_SEC:
+            _dual_recent.popleft()
+        # look for a same-direction commit from a DIFFERENT camera
+        for ts, d, cam in _dual_recent:
+            if d == direction and cam != camera_id:
+                return (False, now - ts)   # merge: same grab, other camera
+        _dual_recent.append((now, direction, camera_id))
+        return (True, None)
+
+
+def dual_reset():
+    """Clear cross-camera merge state between transactions."""
+    with _dual_lock:
+        _dual_recent.clear()
 
 
 def commit_net_count(user_data, global_id, label, direction,
@@ -2249,7 +2314,10 @@ class ProductMovementAnnouncer:
         brief_id_lock.reset()
         # v2.5: clear net-displacement trajectories and frame clock so a
         # previous customer's open tracks can't leak into this transaction.
-        net_counter.reset()
+        # Reset BOTH per-camera counters and the cross-camera merge window.
+        for _c in net_counters.values():
+            _c.reset()
+        dual_reset()
         print("[MovementTTS] Announcer reset for new transaction")
 
     def _beep_and_speak(self, text: str, beep_path: str):
@@ -2415,11 +2483,10 @@ def detection_callback(pad, info, callback_data):
     # STEP 4: Track active objects for cleanup
     active_local_track_ids = set()
 
-    # Advance the net-displacement frame clock once per counting-camera frame.
-    # Used for stale-track pruning and the ID re-stitch gap window; counting
-    # itself commits at the crossing inside observe().
-    if stream_id == COUNTING_CAMERA_ID:
-        net_counter.tick()
+    # Advance the net-displacement frame clock for each counting stream.
+    # Camera 0 always counts; camera 1 also counts when dual-camera mode is on.
+    if stream_id == COUNTING_CAMERA_ID or (DUAL_CAMERA_COUNTING and stream_id in net_counters):
+        net_counters[stream_id].tick()
 
     if hasattr(user_data, 'transaction_id') and user_data.transaction_id:
         transaction_memory_manager.track_frame(user_data.transaction_id)
@@ -2481,19 +2548,37 @@ def detection_callback(pad, info, callback_data):
         # horizontal travel crosses the threshold in a NEW direction, so we
         # count mid-motion (works for returns that then sit static). Camera 1
         # still tracks/draws but never feeds the counter.
-        if stream_id == COUNTING_CAMERA_ID:
+        counts_this_stream = (stream_id == COUNTING_CAMERA_ID) or \
+                             (DUAL_CAMERA_COUNTING and stream_id in net_counters)
+        if counts_this_stream:
+            counter = net_counters[stream_id]
             if confidence >= COUNT_CONF_MIN:
-                ev = net_counter.observe(global_id, center[0], center[1],
-                                         label, confidence)
+                ev = counter.observe(global_id, center[0], center[1],
+                                     label, confidence)
                 if ev:
                     gid_e, lbl_e, dir_e, proj_e, x_e, y_e, conf_e = ev
-                    commit_net_count(user_data, gid_e, lbl_e, dir_e, y_e,
-                                     proj_e, x_e, conf_e, source="crossing")
+                    if DUAL_CAMERA_COUNTING:
+                        # Merge with the other camera if it just counted the
+                        # same direction (same physical grab seen by both).
+                        accept, gap = dual_accept(dir_e, stream_id)
+                        if accept:
+                            print(f"[DUAL] cam{stream_id} {dir_e} '{lbl_e}' "
+                                  f"COUNTED (first camera to see this grab)")
+                            commit_net_count(user_data, gid_e, lbl_e, dir_e,
+                                             y_e, proj_e, x_e, conf_e,
+                                             source=f"cam{stream_id}")
+                        else:
+                            print(f"[DUAL] cam{stream_id} {dir_e} '{lbl_e}' "
+                                  f"MERGED (other cam counted it {gap:.2f}s ago) "
+                                  f"- not double counted")
+                    else:
+                        commit_net_count(user_data, gid_e, lbl_e, dir_e, y_e,
+                                         proj_e, x_e, conf_e, source="crossing")
             else:
                 # Dropped from counting as too low-confidence. Throttled log so
                 # you can see how often this happens before raising the floor.
-                if net_counter.frame_no % 30 == 0:
-                    print(f"[LOWCONF] '{label}' conf={confidence:.2f} "
+                if counter.frame_no % 30 == 0:
+                    print(f"[LOWCONF] cam{stream_id} '{label}' conf={confidence:.2f} "
                           f"< {COUNT_CONF_MIN} @x={center[0]} y={center[1]} "
                           f"(not fed to counter)")
 
@@ -3515,7 +3600,10 @@ async def websocket_endpoint(websocket: WebSocket):
         if transaction_memory_manager.global_stats['total_transactions'] % 10 == 0:
             transaction_memory_manager.print_stats()
 
-        await websocket.close()
+        try:
+            await websocket.close()
+        except RuntimeError:
+            pass  # already closed by the client or an earlier teardown step
         print("WebSocket connection closed")
 
 # =====================================================================
@@ -3637,7 +3725,12 @@ def main():
     print(f"MQTT machine ID:   {MQTT_MACHINE_ID}")
     print(f"MQTT topics:       AIfridge/{MQTT_MACHINE_ID}/rpi/connectionStatus")
     print(f"                   AIfridge/{MQTT_MACHINE_ID}/rpi/doorStatus")
-    print(f"Counting camera:   {COUNTING_CAMERA_ID}  (other cameras: display only)")
+    if DUAL_CAMERA_COUNTING:
+        print(f"Counting mode:     DUAL-CAMERA (cam 0 + cam 1, single-class)")
+        print(f"                   merge window={DUAL_DEDUPE_WINDOW_SEC}s "
+              f"(shared grab counts once)")
+    else:
+        print(f"Counting camera:   {COUNTING_CAMERA_ID}  (other cameras: display only)")
 
     # Resolve the udev symlinks so the banner shows which real /dev/videoN
     # the counting/display cameras landed on THIS boot. The symlinks are
