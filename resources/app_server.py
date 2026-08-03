@@ -46,21 +46,36 @@ TRACKING CHANGES IN v2.3:
 TRACKING CHANGES IN v2.4:
 - Duplicate suppression moved from the old (global_id, direction) deque
   to BriefIDLock, keyed on (label, direction) + Y-lane position.
-  The old global_id key could NEVER catch the real over-count source:
-  a can the tracker drops mid-grab and re-acquires gets a FRESH
-  global_id, so the old key never matched the prior event and BOTH
-  counted. Label survives re-acquisition; global_id does not.
-  The Y-lane check exploits the mounting (cameras are top-down, in/out
-  motion is along X, so genuinely distinct cans separate along Y):
-  a re-grabbed can stays in ~the same Y lane and is collapsed, while
-  two real same-product cans in different lanes BOTH count.
-- Direction frame floor is now a named constant DIRECTION_MIN_FRAMES
-  (was a hardcoded 5 in two places inside analyze_movement_direction).
-  Lower it to count quicker grabs; the bbox-stability gate uses the
-  same constant so early counts are still jitter-filtered. Currently 4.
+- Direction frame floor is now a named constant DIRECTION_MIN_FRAMES.
+
+PERFORMANCE CHANGES IN v2.7 (1024x576 record-cam variant):
+- Pipeline capture caps set to 1024x576 for both cameras.
+- Frame-drop / choppiness fix. The detection_callback runs SYNCHRONOUSLY on
+  the GStreamer streaming thread (it's a buffer pad probe on identity_callback),
+  so every millisecond it spends is added straight to that branch's latency,
+  and the leaky=downstream queues drop frames when it blows the ~40ms/frame
+  budget at 25fps. During a transaction the callback ballooned (drawing scales
+  with item count, and everything ran twice - once per camera), which is why
+  the video was smooth at idle but choppy mid-grab.
+  The callback is now split by role:
+    * RECORD_CAMERA_ID  (cam_display, stream 1): the ONLY camera whose pixels
+      are pulled every frame, drawn on, and shipped to the recorder process.
+    * COUNTING_CAMERA_ID (cam_count, stream 0): counts off bbox CENTERS - it
+      never needs a numpy frame copy for counting. It pulls a frame only every
+      15th frame, purely for the camera-cover brightness check.
+  Trails (up to 30 cv2.line calls per track) are no longer drawn - they were
+  the draw cost that grew worst mid-grab. Boxes + labels remain on the record
+  cam. The websocket payload rebuild + deposit price scan (previously 50x/s
+  across both cams) are gated to the counting cam every 6 frames.
+  Counting behaviour is UNCHANGED: same net_counter.observe()/commit path,
+  same bbox math. The live ximagesink still shows both cams with boxes because
+  those come from hailooverlay in the pipeline, not from these cv2 draws.
+- NORMALIZE_RECORD_TO_360: optional toggle to downscale the saved video to
+  640x360 on the record cam (lighter IPC + encode). Default False = record at
+  native 576 so this variant can be tested at full resolution first.
 
 AUTHOR: Mike
-VERSION: 2.6
+VERSION: 2.7 (1024x576)
 LAST UPDATED: 2026
 =====================================================================
 """
@@ -90,6 +105,7 @@ import io
 import tempfile
 import subprocess
 import wave
+import shutil
 
 # Concurrency and Threading
 import threading
@@ -166,7 +182,7 @@ data_deque: Dict[int, deque] = {}
 # In production, this is read automatically from the WebSocket
 # start_preview message via os.environ['MACHINE_ID'].
 
-MQTT_MACHINE_ID = "166"    # change this to your test machine ID
+MQTT_MACHINE_ID = "171"    # change this to your test machine ID
 
 # Global MQTT client instance - initialised in main(), used everywhere
 mqtt_client: MQTTClient = None
@@ -208,6 +224,16 @@ cover_alert_thread           = None
 camera_covered_sound_playing = False
 price_alert_sound_playing    = False
 last_alerted_label           = None
+
+# Per-stream callback counter, used only for cheap frame throttling
+# (cover check, etc). Keyed by stream_id.
+_cb_seq = defaultdict(int)
+
+# Set for the entire time the deposit-exceeded siren+TTS is actually
+# audible. Product entry/exit announcements check this before playing so
+# they never talk over (or get cut off by) the deposit alert; the deposit
+# alert also actively preempts whatever is currently playing when it fires.
+deposit_alert_active = threading.Event()
 
 current_pipeline_app = None
 pipeline_lock        = threading.Lock()
@@ -267,128 +293,54 @@ camera_bbox_area_history = {
 # =====================================================================
 
 # Per-(camera_id, local_track_id) label history.
-# Used by get_smoothed_label() to return the dominant label over
-# the last LABEL_HISTORY_LEN frames instead of the raw per-frame label.
-# This prevents single-frame class flickers (e.g. coke -> sprite -> coke)
-# from causing the global ID system to register a second product
-# or increment the wrong counter.
 LABEL_HISTORY_LEN  = 15
 LABEL_SMOOTH_MIN   = 5     # need >= this many samples before smoothing kicks in
 track_label_history = defaultdict(lambda: deque(maxlen=LABEL_HISTORY_LEN))
 
 # Authoritative camera for counting and TTS announcements.
-# Camera 1 (the lower camera) was empirically the source of cross-camera
-# duplicate exits because items leave its FOV last, after camera 0 has
-# already lost the track. Demoting it to display-only kills that path.
-# Both cameras still run detection, tracking, and overlay drawing.
+# cam_count (the top-down camera) is stream 0. Only this camera increments
+# counters and fires TTS. The other camera still tracks and (on the record
+# cam) draws.
 COUNTING_CAMERA_ID = 0
 
-# Frame floor for direction analysis - minimum history frames before an
-# entry/exit direction is trusted. Lower = quicker grabs counted; too low
-# = jitter gets counted. Old floor was a hardcoded 5 in two places inside
-# analyze_movement_direction(). Test 3 (eager) vs 4 (balanced).
-# The bbox-stability gate uses this SAME constant so that when the floor
-# is lowered, early counts are still jitter-filtered.
+# Camera whose frames get drawn on and recorded to the transaction video.
+# cam_display (stream 1) is the review angle. It is the ONLY camera whose
+# pixels are pulled every frame. cam_count needs no pixels for counting
+# (it works off bbox centers), so keeping the recording on cam_display
+# removes an entire full-frame numpy copy + draw pass every frame.
+RECORD_CAMERA_ID = 1
+
+# Optional: downscale the saved transaction video to 640x360 even when the
+# pipeline runs at 1024x576. Lighter IPC to the recorder process and lighter
+# XVID encode. Default False so this variant is tested at native 576 first;
+# flip to True if the recorder still can't keep pace at full resolution.
+NORMALIZE_RECORD_TO_360 = False
+
+# Frame floor for direction analysis.
 DIRECTION_MIN_FRAMES = 4
 
 # =====================================================================
 # v2.5 NET-DISPLACEMENT COUNTING
 # =====================================================================
-# v2.5 replaces per-frame direction counting (which over-counted any item
-# held/fidgeted at the boundary, because every direction flip re-armed a
-# new count) with COMMIT-ONCE-PER-TRACK by net displacement.
-#
-# How it decides: for each global_id on the counting camera we hold an anchor
-# point and the last direction we counted. Each frame we project the travel
-# since the anchor onto the exit axis (EXIT_DIR_X, EXIT_DIR_Y):
-#   proj = (x - anchor_x)*ex + (y - anchor_y)*ey
-#   |proj| >= NET_DISPLACEMENT_MIN_PX and a NEW direction -> count ONE, then
-#       reset the anchor and lock that direction.
-#   same direction again -> just advance the anchor (no double count).
-#   |proj| < threshold -> nothing (wobble / static).
-# Counting commits AT THE CROSSING (mid-motion), so returns that end up
-# sitting static are still counted. Take-and-keep -> 1 exit. Take-and-put-
-# back -> 1 exit + 1 entry (nets 0). Fidget / static shelf item -> 0.
 
-# Minimum net horizontal travel (pixels, in the counting camera's frame)
-# for a track to count as a real take/return. Lower = counts smaller moves
-# (risk: noise counts). Higher = needs a bigger pull (risk: gentle takes
-# missed). Tune from the [COUNT] log's netX values on real grabs.
+# Minimum net travel (pixels, in the counting camera's frame) for a track
+# to count as a real take/return.
 NET_DISPLACEMENT_MIN_PX = 70
 
-# v2.5.1: counting now commits at the displacement CROSSING (mid-motion),
-# not at track end, so this grace value no longer gates counting. It is kept
-# only as a memory-prune horizon: a track unseen this many frames is dropped
-# from the counter's table.
+# Memory-prune horizon: a track unseen this many frames is dropped.
 NET_END_GRACE_FRAMES = 300
 
-# Direction of "exit" (item leaving the fridge) in IMAGE space. Image Y
-# points DOWN. On this camera the door/hand access is at the BOTTOM and the
-# interior shelves are UP and to the LEFT, so "out" = toward bottom-right =
-# (+X, +Y) and "in" = toward upper-left = (-X, -Y). Counting projects each
-# track's travel onto this vector, so it catches BOTH right-edge exits
-# (mostly +X) and deep/left placements (mostly -Y) - the X-only version
-# missed the latter because that motion is nearly vertical.
-#
-# Tuning per machine: point this roughly from the interior toward the door.
-#   (1, 0)  = pure rightward  (X-only - the cleaner mode, default)
-#   (1, 1)  = down-right diagonal  (more left-side reach, but vertical lift
-#                                   motions add noise)
-#   (0, 1)  = pure downward
-# The vector is normalised internally, so only its direction matters.
-# Default is X-only (Y=0): cleaner on the cases that work; the left-side
-# miss it leaves is fundamentally a camera-angle limit, not fixable here.
+# Direction of "exit" (item leaving the fridge) in IMAGE space.
 EXIT_DIR_X = 0.0
 EXIT_DIR_Y = 1.0
 
-# --- Dual-camera counting (DEDICATED single-class machine only) ---------
-#
-# On a machine that stocks ONLY ONE product, both cameras can safely count
-# and a grab seen by BOTH is merged into one count. This is NOT safe on a
-# multi-product machine: the merge is keyed on (direction, time) with NO
-# label matching, so on a shared machine two different products taken at the
-# same instant would wrongly merge. Leave OFF unless the machine is a
-# dedicated single-class box (this one is vanillaCrepe-only).
-#
-# When ON: camera 0 and camera 1 each run their own displacement counter
-# (both on the EXIT_DIR axis above). When one camera commits a direction and
-# the OTHER camera already committed the SAME direction within the dedupe
-# window, the second is treated as the same physical grab and suppressed -
-# so a grab both cameras see counts once, but a grab only ONE camera catches
-# still counts (that's the coverage win).
-DUAL_CAMERA_COUNTING   = True
-
-# Cross-camera merge window (seconds). A same-direction commit from the other
-# camera within this window is treated as the same grab and merged.
-#   too LOW  -> the same grab seen slightly apart by the two cameras counts twice
-#   too HIGH -> two genuinely fast consecutive grabs merge into one (undercount)
-# Start ~1.2 and tune within 0.5-2.0 using the [DUAL] log's gap= value.
-DUAL_DEDUPE_WINDOW_SEC = 0.8
-
 # --- v2.6 counting-only robustness (no pipeline changes) ----------------
 
-# Minimum detection confidence for a detection to FEED the counter.
-# DEFAULT 0.0 = DISABLED (every detection feeds the counter, like the
-# known-good version). Testing showed a 0.3 floor dropped the low-confidence
-# interior detections that make up RETURNS, freezing entry counts - so this
-# is off by default. Raise it (e.g. 0.25-0.30) ONLY if you see garbage
-# detections driving false counts, and watch the [LOWCONF] log.
 COUNT_CONF_MIN = 0.0
 
-# Anchor re-stitch across tracker ID churn. DEFAULT 0 = DISABLED. When the
-# known-good behaviour is wanted this stays off. Set STITCH_DIST_PX to ~70
-# to enable: a brand-new global_id appearing within this many px (|dx|+|dy|)
-# of a recent same-label track inherits its anchor, so displacement keeps
-# accumulating across an ID churn. Risk if enabled too loose: two distinct
-# same-product grabs at the same spot merge and the second is missed - which
-# is why it is off by default.
 STITCH_DIST_PX        = 0    # 0 = disabled; ~70 to enable anti-churn stitch
 STITCH_MAX_GAP_FRAMES = 8    # max frames since the old track was last seen
 
-# Per-product sanity flag. If one product's entry OR exit count within a
-# single transaction exceeds this, log a [SANITY] warning. This does NOT
-# clamp the count - it only surfaces a likely tracking glitch so it is
-# visible rather than silent.
 SANITY_PER_PRODUCT = 5
 
 # =====================================================================
@@ -399,9 +351,6 @@ def trigger_buzzer(duration=0.5):
     """
     Trigger the buzzer for a specified duration.
     Active LOW: GPIO.LOW = ON, GPIO.HIGH = OFF.
-
-    Args:
-        duration (float): Seconds to keep buzzer on.
     """
     GPIO.output(BUZZER_PIN, GPIO.LOW)
     time.sleep(duration)
@@ -409,14 +358,7 @@ def trigger_buzzer(duration=0.5):
 
 
 def blink_led(pin, times, delay):
-    """
-    Blink an LED a specified number of times.
-
-    Args:
-        pin   (int):   GPIO pin number.
-        times (int):   Number of blink cycles.
-        delay (float): Delay between ON/OFF states in seconds.
-    """
+    """Blink an LED a specified number of times."""
     for _ in range(times):
         GPIO.output(pin, GPIO.HIGH)
         time.sleep(delay)
@@ -428,11 +370,6 @@ def control_door(pin, action, duration=0.5):
     """
     Control the electromagnetic door lock.
     GPIO.LOW = unlocked, GPIO.HIGH = locked.
-
-    Args:
-        pin      (int):   GPIO pin for the door lock.
-        action   (str):   'unlock' or 'lock'.
-        duration (float): How long to keep door unlocked.
     """
     if action.lower() == 'unlock':
         print("Unlocking door...")
@@ -452,15 +389,7 @@ def control_door(pin, action, duration=0.5):
 # =====================================================================
 
 def compute_color_for_labels(label):
-    """
-    Compute a unique BGR color for each product class ID.
-
-    Args:
-        label (int): Class ID of the detected object.
-
-    Returns:
-        tuple: BGR color tuple for OpenCV drawing.
-    """
+    """Compute a unique BGR color for each product class ID."""
     palette = (2 ** 11 - 1, 2 ** 15 - 1, 2 ** 20 - 1)
     if label == 0:
         color = (85, 45, 255)
@@ -478,12 +407,9 @@ def draw_trail(frame, track_id, center, color, global_id=None):
     """
     Draw movement trail (breadcrumb path) for a tracked object.
 
-    Args:
-        frame     (np.ndarray): Video frame to draw on.
-        track_id  (int):        Local track ID.
-        center    (tuple):      Current center point (x, y).
-        color     (tuple):      BGR color for the trail.
-        global_id (int):        Global ID across cameras (optional).
+    NOTE (v2.7): no longer called from detection_callback - trail drawing
+    was up to 30 cv2.line calls per track per frame and was the draw cost
+    that grew worst mid-grab. Kept here in case it's wanted for debugging.
     """
     if global_id is not None:
         global_trails[global_id].appendleft(center)
@@ -503,14 +429,7 @@ def draw_trail(frame, track_id, center, color, global_id=None):
 # =====================================================================
 
 def draw_counts(frame, class_counters, label):
-    """
-    Draw entry/exit counts on the video frame.
-
-    Args:
-        frame          (np.ndarray): Video frame to draw on.
-        class_counters (dict):       Dict with 'entry' and 'exit' counts.
-        label          (str):        Current product label.
-    """
+    """Draw entry/exit counts on the video frame."""
     class_names = {
         0:  "",
         1:  "chickenKatsuCurry",
@@ -553,12 +472,7 @@ def draw_counts(frame, class_counters, label):
 # =====================================================================
 
 def draw_zone(frame):
-    """
-    Draw detection zone overlay on the frame.
-
-    Args:
-        frame (np.ndarray): Video frame to draw on.
-    """
+    """Draw detection zone overlay on the frame."""
     height, width = frame.shape[:2]
     cv2.rectangle(frame, (0, 0), (width, height), (0, 255, 0), 2)
     cv2.putText(frame, "Detection Zone", (10, 30),
@@ -569,11 +483,7 @@ def draw_zone(frame):
 # =====================================================================
 
 def handle_alert_state():
-    """
-    Blink the red LED continuously while the price exceeds the deposit.
-    Runs in a separate daemon thread. Exits when 'blink' flag is False
-    or the door closes.
-    """
+    """Blink the red LED continuously while the price exceeds the deposit."""
     global blink
 
     while blink:
@@ -591,17 +501,7 @@ def handle_alert_state():
 # =====================================================================
 
 def calculate_total_price_and_control_buzzer(current_data, deposit, label=None):
-    """
-    Calculate total price of taken items and trigger alerts if deposit exceeded.
-
-    Args:
-        current_data (dict):  Current detection data with validated products.
-        deposit      (float): Customer's deposit amount.
-        label        (str):   Current product label (optional).
-
-    Returns:
-        float: Total price of products taken.
-    """
+    """Calculate total price of taken items and trigger alerts if deposit exceeded."""
     global blink, alert_thread, price_alert_sound_playing, last_alerted_label
 
     total_product_price = 0
@@ -636,7 +536,20 @@ def calculate_total_price_and_control_buzzer(current_data, deposit, label=None):
 
         if products_list and (not price_alert_sound_playing or last_alerted_label != products_str):
             price_alert_sound_playing = True
-            tts_manager.speak_deposit(products_list)
+
+            def _siren_then_speak(plist=list(products_list)):
+                deposit_alert_active.set()
+                try:
+                    tts_manager.stop_all_audio()  # preempt anything playing
+                    try:
+                        tts_manager.play_mp3_sync(SIREN_DEPOSIT_PATH, volume=1.0)
+                    except Exception as e:
+                        print(f"[DepositAlert] siren error: {e}")
+                    if price_alert_sound_playing:
+                        tts_manager.speak_deposit_sync(plist)
+                finally:
+                    deposit_alert_active.clear()
+            threading.Thread(target=_siren_then_speak, daemon=True).start()
             last_alerted_label = products_str
             print(f"Price alert: ${total_product_price:.2f} > ${deposit:.2f}")
             print(f"Please return: {products_str}")
@@ -663,12 +576,7 @@ def calculate_total_price_and_control_buzzer(current_data, deposit, label=None):
 # =====================================================================
 
 def check_door_status():
-    """
-    Monitor door switch continuously. Returns True when door closes.
-
-    Returns:
-        bool: True when door is detected as closed.
-    """
+    """Monitor door switch continuously. Returns True when door closes."""
     while True:
         door_sw = 1  # TODO: Replace with GPIO.input(DOOR_SWITCH_PIN)
         with print_lock:
@@ -682,16 +590,7 @@ def check_door_status():
 # =====================================================================
 
 def is_frame_dark(frame, threshold=40):
-    """
-    Detect if the camera is covered by checking frame brightness.
-
-    Args:
-        frame     (np.ndarray): Input video frame.
-        threshold (int):        Brightness threshold (0-255).
-
-    Returns:
-        bool: True if frame is abnormally dark.
-    """
+    """Detect if the camera is covered by checking frame brightness."""
     global camera_covered_sound_playing
 
     if len(frame.shape) == 3:
@@ -707,12 +606,7 @@ def is_frame_dark(frame, threshold=40):
 # =====================================================================
 
 def setup_cover_alert_sound():
-    """
-    Generate and cache the camera-cover warning MP3.
-
-    Returns:
-        str: Path to the generated alert MP3 file.
-    """
+    """Generate and cache the camera-cover warning MP3."""
     alert_dir  = "sounds/cover_alerts"
     alert_file = os.path.join(alert_dir, "camera_covered.mp3")
 
@@ -731,16 +625,7 @@ def setup_cover_alert_sound():
 # =====================================================================
 
 def _generate_beep_wav(path, freq, duration, volume):
-    """
-    Internal helper: synthesise a single sine-wave beep WAV file.
-    Skipped if the file already exists.
-
-    Args:
-        path     (str):   Output file path.
-        freq     (int):   Tone frequency in Hz.
-        duration (float): Beep length in seconds.
-        volume   (float): Amplitude scale 0.0-1.0.
-    """
+    """Internal helper: synthesise a single sine-wave beep WAV file."""
     if os.path.exists(path):
         return
 
@@ -748,7 +633,6 @@ def _generate_beep_wav(path, freq, duration, volume):
     n_samples   = int(sample_rate * duration)
     t           = np.linspace(0, duration, n_samples, endpoint=False)
 
-    # Sine wave with a short fade-out to avoid a hard click at the end
     sine     = np.sin(2 * np.pi * freq * t)
     fade_len = int(n_samples * 0.2)
     fade     = np.ones(n_samples)
@@ -764,41 +648,56 @@ def _generate_beep_wav(path, freq, duration, volume):
     print(f"Beep generated: {path} (freq={freq}Hz, dur={duration}s)")
 
 
-# Two distinct beep paths - one for each direction. Stored as module
-# constants so the announcer can reference them without hardcoding paths.
 BEEP_EXIT_PATH  = "sounds/beep_exit.wav"   # high tone  - item leaving fridge
 BEEP_ENTRY_PATH = "sounds/beep_entry.wav"  # low tone   - item returning
 
+SIREN_DEPOSIT_PATH = "sounds/siren_deposit_3s0_loud.wav"
+SIREN_DURATION_SEC = 3.0
+
+
+def _generate_siren_wav(path, duration=SIREN_DURATION_SEC,
+                        f_low=700, f_high=1400, sweep_hz=2.5,
+                        volume=1.0, drive=1.6):
+    """Rising/falling alarm siren, generated once and cached like the beeps."""
+    if os.path.exists(path):
+        return
+
+    sample_rate = 22050
+    n = int(sample_rate * duration)
+    t = np.linspace(0, duration, n, endpoint=False)
+
+    f_center  = (f_low + f_high) / 2
+    f_dev     = (f_high - f_low) / 2
+    inst_freq = f_center + f_dev * np.sin(2 * np.pi * sweep_hz * t)
+    phase     = 2 * np.pi * np.cumsum(inst_freq) / sample_rate
+    sine      = np.sin(phase)
+
+    limited = np.tanh(sine * drive)
+
+    fade_n = int(sample_rate * 0.05)
+    env = np.ones(n)
+    env[:fade_n]  = np.linspace(0, 1, fade_n)
+    env[-fade_n:] = np.linspace(1, 0, fade_n)
+
+    samples = (limited * env * volume * 32767).astype(np.int16)
+    with wave.open(path, 'w') as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(samples.tobytes())
+    print(f"Siren generated: {path} ({duration}s, {f_low}-{f_high}Hz sweep, "
+          f"drive={drive})")
+
 
 def generate_beep_files():
-    """
-    Generate both entry and exit beep WAV files on disk.
-
-    EXIT  -> 880 Hz (high A, bright/attention-grabbing)
-             "something is leaving the fridge"
-    ENTRY -> 440 Hz (low A, softer pitch)
-             "something came back"
-
-    The one-octave gap between the two is intentional - the human ear
-    distinguishes octave-spaced tones much more reliably than tones a few
-    Hz apart, so the operator can tell entry from exit at a glance even
-    in a noisy retail environment.
-
-    Both files are only generated once - skipped if they already exist.
-    """
+    """Generate both entry and exit beep WAV files on disk."""
     _generate_beep_wav(BEEP_EXIT_PATH,  freq=880, duration=0.12, volume=0.8)
     _generate_beep_wav(BEEP_ENTRY_PATH, freq=440, duration=0.18, volume=0.8)
+    _generate_siren_wav(SIREN_DEPOSIT_PATH)   # deposit + cover alert siren
 
 
-# Backwards-compatible shim: older code paths and main() may still call
-# generate_beep_file() with the original signature. Route it to the new
-# pair generator so existing call sites keep working without edits.
 def generate_beep_file(path=None, freq=None, duration=None, volume=None):
-    """
-    Backwards-compatible wrapper. Generates BOTH beep files.
-    Original signature args are ignored - kept only so existing
-    callers don't break.
-    """
+    """Backwards-compatible wrapper. Generates BOTH beep files."""
     generate_beep_files()
 
 # =====================================================================
@@ -806,11 +705,7 @@ def generate_beep_file(path=None, freq=None, duration=None, volume=None):
 # =====================================================================
 
 def handle_cover_alert():
-    """
-    Play audio alert repeatedly while camera is covered.
-    Runs in a separate daemon thread. Exits when camera is uncovered
-    or door closes.
-    """
+    """Play audio alert repeatedly while camera is covered."""
     global camera_covered
 
     alert_sound = setup_cover_alert_sound()
@@ -820,8 +715,17 @@ def handle_cover_alert():
         if GPIO.input(DOOR_SWITCH_PIN) == 0:
             print("Door closed - stopping alert sound")
             break
-        tts_manager.play_mp3_async(alert_sound, volume=0.8)
-        time.sleep(3.0)
+        try:
+            tts_manager.play_mp3_sync(SIREN_DEPOSIT_PATH, volume=1.0)
+        except Exception as e:
+            print(f"[CoverAlert] siren error: {e}")
+        if not camera_covered:
+            break   # uncovered during the siren - skip the speech
+        try:
+            tts_manager.play_mp3_sync(alert_sound, volume=0.8)
+        except Exception as e:
+            print(f"[CoverAlert] TTS error: {e}")
+        time.sleep(0.5)
 
     print("Camera uncovered - stopping alert sound")
 
@@ -833,12 +737,10 @@ def display_user_data_frame(user_data):
     """
     Main video display loop with recording capability.
 
-    Displays live video feed and records to filesystem.
-    Monitors door status for shutdown.
-
-    Args:
-        user_data: Container with get_frame(), shutdown_event,
-                   transaction_id, machine_id, user_id, machine_identifier.
+    Runs in a separate multiprocessing.Process, so its XVID encode and
+    imshow do NOT contend for the GIL with the detection callback. It
+    records whatever frame the callback hands to set_frame() - in v2.7
+    that is the record cam (cam_display) only.
     """
     door_monitor_thread = threading.Thread(target=check_door_status)
     door_monitor_thread.daemon = True
@@ -886,7 +788,7 @@ def display_user_data_frame(user_data):
                     output_video  = cv2.VideoWriter(
                         filename, fourcc, actual_fps, (width, height), isColor=True
                     )
-                    print(f"Started recording to: {filename}")
+                    print(f"Started recording to: {filename} ({width}x{height})")
 
                 if output_video is not None:
                     output_video.write(frame.copy())
@@ -926,35 +828,16 @@ def display_user_data_frame(user_data):
 
 def stream_video_to_api(video_path, dataset_name, transaction_id,
                         machine_id, user_id, machine_identifier):
-    """
-    Upload a recorded transaction video to the backend API.
-
-    Args:
-        video_path         (str): Local path to the video file.
-        dataset_name       (str): Name for the dataset.
-        transaction_id     (str): Unique transaction identifier.
-        machine_id         (str): Machine identifier.
-        user_id            (str): User identifier.
-        machine_identifier (str): Machine identifier string.
-
-    Returns:
-        bool: True if upload successful, False otherwise.
-    """
-    # API endpoint URL
+    """Upload a recorded transaction video to the backend API."""
     api_url = "https://stg-sfapi.nuboxtech.com/index.php/shopping_app/machine/TransactionDataset/insert_transactionDataset"
 
-    # Authentication credentials
     username = 'admin'
     password = '1234'
     api_key  = '123456'
 
-    # Get current timestamp for database record
     current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
-    # Extract filename from path
     filename = os.path.basename(video_path)
 
-    # Prepare payload (form data)
     payload = {
         'machine_id':       machine_id,
         'created_by':       user_id,
@@ -964,7 +847,6 @@ def stream_video_to_api(video_path, dataset_name, transaction_id,
         'created_datetime': current_time
     }
 
-    # Prepare headers
     headers = {'x-api-key': api_key}
 
     print(f"Streaming video to API: {video_path}")
@@ -1025,16 +907,11 @@ def remove_lock_file(video_path):
 # VIDEO MONITORING THREAD
 # =====================================================================
 
-def monitor_and_send_videos(video_dir, machine_id, machine_identifier, user_id):
-    """
-    Background thread that watches for completed videos and uploads them.
+FAILED_UPLOAD_VIDEO_DIR = "/home/afiq/hailo-rpi5-examples/saved_videos"
 
-    Args:
-        video_dir          (str): Directory to watch for video files.
-        machine_id         (str): Machine identifier for upload metadata.
-        machine_identifier (str): Machine name/code.
-        user_id            (str): User identifier.
-    """
+
+def monitor_and_send_videos(video_dir, machine_id, machine_identifier, user_id):
+    """Background thread that watches for completed videos and uploads them."""
     processed_videos = set()
     processing_lock  = threading.Lock()
 
@@ -1068,17 +945,29 @@ def monitor_and_send_videos(video_dir, machine_id, machine_identifier, user_id):
                         except Exception:
                             transaction_id = None
 
-                        stream_video_to_api(
+                        upload_success = stream_video_to_api(
                             video_path, dataset_name, transaction_id,
                             machine_id, user_id, machine_identifier
                         )
 
-                        try:
-                            if os.path.exists(video_path):
-                                os.remove(video_path)
-                                print(f"Deleted video: {video_path}")
-                        except Exception as e:
-                            print(f"Error deleting video: {e}")
+                        if upload_success:
+                            try:
+                                if os.path.exists(video_path):
+                                    os.remove(video_path)
+                                    print(f"Deleted video: {video_path}")
+                            except Exception as e:
+                                print(f"Error deleting video: {e}")
+                        else:
+                            try:
+                                os.makedirs(FAILED_UPLOAD_VIDEO_DIR, exist_ok=True)
+                                failed_path = os.path.join(
+                                    FAILED_UPLOAD_VIDEO_DIR, os.path.basename(video_path)
+                                )
+                                if os.path.exists(video_path):
+                                    shutil.move(video_path, failed_path)
+                                    print(f"Upload failed - video saved to: {failed_path}")
+                            except Exception as e:
+                                print(f"Error saving failed-upload video: {e}")
 
                         with processing_lock:
                             processed_videos.add(video_path)
@@ -1103,16 +992,7 @@ def monitor_and_send_videos(video_dir, machine_id, machine_identifier, user_id):
 # =====================================================================
 
 def is_file_complete_enhanced(file_path, stable_time=5):
-    """
-    Check that a video file is no longer being written to.
-
-    Args:
-        file_path   (str): Path to video file.
-        stable_time (int): Seconds the file must be stable.
-
-    Returns:
-        bool: True if file is complete and ready for upload.
-    """
+    """Check that a video file is no longer being written to."""
     try:
         if not os.path.exists(file_path):
             return False
@@ -1151,9 +1031,7 @@ def is_file_complete_enhanced(file_path, stable_time=5):
 # =====================================================================
 
 class WebSocketDataManager:
-    """
-    Thread-safe manager for real-time detection data updates.
-    """
+    """Thread-safe manager for real-time detection data updates."""
 
     def __init__(self):
         self.current_data = {
@@ -1183,9 +1061,7 @@ class WebSocketDataManager:
 # =====================================================================
 
 class TrackingData:
-    """
-    Central container for all per-transaction tracking state.
-    """
+    """Central container for all per-transaction tracking state."""
 
     def __init__(self):
         self.shutdown_event = Event()
@@ -1235,9 +1111,7 @@ class TrackingData:
 # =====================================================================
 
 class HailoDetectionCallback(app_callback_class):
-    """
-    Callback class for the Hailo AI detection pipeline.
-    """
+    """Callback class for the Hailo AI detection pipeline."""
 
     def __init__(self, websocket=None, deposit=0.0, machine_id=None,
                  machine_identifier=None, user_id=None, transaction_id=None):
@@ -1358,7 +1232,12 @@ class HailoDetectionCallback(app_callback_class):
     def get_fallback_pipeline_string(self):
         """
         Return the hardcoded GStreamer pipeline string.
-        NOTE: The GStreamer pipeline is NEVER modified.
+        NOTE: The GStreamer pipeline is NEVER modified except for the
+        capture resolution. This variant captures both cameras at
+        1024x576 (was 640x360). The post-hailooverlay composite is still
+        scaled to 640x360 for the live ximagesink only - it does not
+        affect the recorded frame, which comes from the identity probe
+        BEFORE the overlay at native 1024x576.
         """
         return (
             "hailoroundrobin mode=0 name=fun ! "
@@ -1375,7 +1254,7 @@ class HailoDetectionCallback(app_callback_class):
             "queue name=hailo_display_q_0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
             "fpsdisplaysink video-sink=ximagesink name=hailo_display sync=false text-overlay=true "
             "v4l2src device=/dev/cam_count name=source_0 ! "
-            "image/jpeg, width=640, height=360, framerate=25/1 ! "
+            "image/jpeg, width=1024, height=576, framerate=25/1 ! "
             "jpegdec ! "
             "queue name=source_scale_q_0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
             "videoscale name=source_videoscale_0 n-threads=2 ! "
@@ -1394,7 +1273,7 @@ class HailoDetectionCallback(app_callback_class):
             "queue name=comp_q_0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
             "comp.sink_0 "
             "v4l2src device=/dev/cam_display name=source_2 ! "
-            "image/jpeg, width=640, height=360, framerate=25/1 ! "
+            "image/jpeg, width=1024, height=576, framerate=25/1 ! "
             "jpegdec ! "
             "queue name=source_scale_q_2 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
             "videoscale name=source_videoscale_2 n-threads=2 ! "
@@ -1419,13 +1298,11 @@ class HailoDetectionCallback(app_callback_class):
     # -----------------------------------------------------------------
 
     def fetch_and_store_initial_planogram(self, machine_id):
-        # API authentication credentials
         username = 'admin'
         password = '1234'
         api_key  = '123456'
         headers  = {'x-api-key': api_key}
 
-        # Construct API endpoint URL
         api_endpoint = (f'https://stg-sfapi.nuboxtech.com/index.php/'
                         f'mobile_app/machine/Machine_listing/machine_planogram/{machine_id}')
 
@@ -1465,7 +1342,6 @@ class HailoDetectionCallback(app_callback_class):
 
     def start_planogram_refresh_thread(self):
         def refresh_planogram():
-            # API credentials
             username = 'admin'
             password = '1234'
             api_key  = '123456'
@@ -1479,7 +1355,6 @@ class HailoDetectionCallback(app_callback_class):
                         time.sleep(1000)
                         continue
 
-                    # Construct API endpoint
                     refresh_endpoint = (f'https://stg-sfapi.nuboxtech.com/index.php/'
                                         f'mobile_app/machine/Machine_listing/'
                                         f'machine_planogram/{refresh_machine_id}')
@@ -1548,12 +1423,7 @@ class HailoDetectionCallback(app_callback_class):
 # =====================================================================
 
 class HailoDetectionApp:
-    """
-    Manages the GStreamer pipeline and Hailo detection lifecycle.
-    NOTE: The GStreamer pipeline string is NEVER modified.
-    All detection logic is injected via buffer probes on the existing
-    identity elements.
-    """
+    """Manages the GStreamer pipeline and Hailo detection lifecycle."""
 
     def __init__(self, app_callback, user_data):
         self.app_callback = app_callback
@@ -1716,26 +1586,7 @@ class HailoDetectionApp:
 # =====================================================================
 
 def get_smoothed_label(camera_id, local_track_id, raw_label):
-    """
-    Return the dominant label observed for this (camera, local_track_id)
-    over the last LABEL_HISTORY_LEN frames. This kills single-frame class
-    flickers that would otherwise cause spurious second global IDs or
-    increment the wrong product counter.
-
-    Behavior:
-    - If raw_label is empty/None: return it unchanged (nothing to smooth).
-    - For the first LABEL_SMOOTH_MIN frames: return raw_label
-      (not enough samples yet to trust the histogram).
-    - After that: return the most common label in the rolling window.
-
-    Args:
-        camera_id      (int): Camera ID (0 or 1).
-        local_track_id (int): Local track ID assigned by hailotracker.
-        raw_label      (str): Per-frame label from the current detection.
-
-    Returns:
-        str: Smoothed label.
-    """
+    """Return the dominant label over the last LABEL_HISTORY_LEN frames."""
     if not raw_label:
         return raw_label
 
@@ -1746,22 +1597,12 @@ def get_smoothed_label(camera_id, local_track_id, raw_label):
     if len(history) < LABEL_SMOOTH_MIN:
         return raw_label
 
-    # Counter.most_common ties go to insertion order; that's fine here -
-    # if two labels are exactly tied we just keep whichever appeared first.
     dominant_label, _ = Counter(history).most_common(1)[0]
     return dominant_label
 
 
 def cleanup_label_history(camera_id, active_local_track_ids):
-    """
-    Drop label-history entries for tracks that are no longer active.
-    Called from the same place as cleanup_inactive_tracks() so that
-    the new structure is garbage-collected on the same cadence.
-
-    Args:
-        camera_id              (int): Camera ID (0 or 1).
-        active_local_track_ids (set): Currently active local track IDs.
-    """
+    """Drop label-history entries for tracks that are no longer active."""
     stale = [
         key for key in track_label_history.keys()
         if key[0] == camera_id and key[1] not in active_local_track_ids
@@ -1774,89 +1615,35 @@ def cleanup_label_history(camera_id, active_local_track_ids):
 # =====================================================================
 
 class BriefIDLock:
-    """
-    Short-window duplicate suppressor for count events.
-
-    Keyed on (label, direction) + Y-lane position. This catches the REAL
-    over-count source - a can the tracker drops mid-grab and re-acquires
-    under a FRESH global_id - while letting two genuinely distinct cans
-    of the same product BOTH count.
-
-    Why not global_id (the v2.3 key):
-        A re-acquired can gets a brand-new global_id, so a global_id key
-        never matches the prior event and BOTH fire. Label survives
-        re-acquisition; global_id does not.
-
-    Why the Y-lane check:
-        Cameras are mounted top-down, so in/out (entry/exit) motion runs
-        along X. Two genuinely distinct cans therefore separate along Y.
-        A single re-grabbed can stays in ~the same Y lane and is
-        collapsed (suppressed); two real cans in different lanes both
-        pass (counted). lane_tolerance_px sets how close in Y two events
-        must be to be treated as the same physical object.
-
-    Tuning:
-        window_sec        - how long after a count the lock stays armed
-                            for the same (label, direction, lane).
-                            Larger = more aggressive collapsing.
-        lane_tolerance_px - Y distance under which two events are treated
-                            as the same lane. Larger = more aggressive
-                            collapsing of nearby cans.
-    """
+    """Short-window duplicate suppressor for count events."""
 
     def __init__(self, window_sec=0.5, lane_tolerance_px=80):
         self.window_sec        = window_sec
         self.lane_tolerance_px = lane_tolerance_px
-        # Each entry: (timestamp, label, direction, y_center)
         self._events = deque(maxlen=200)
         self._lock   = threading.Lock()
 
     def is_duplicate(self, label, direction, y_center, now=None):
-        """
-        Return True if a count for (label, direction) in the same Y lane
-        has occurred within the last window_sec seconds.
-
-        Side effect: if NOT a duplicate, the event is recorded so the
-        next call can see it. Call this only AFTER the should_count gate
-        so events that were never counted don't poison the window.
-
-        Args:
-            label     (str):   Smoothed product label.
-            direction (str):   'entry' or 'exit'.
-            y_center  (int):   Y coordinate of the object's center.
-            now       (float): Override timestamp (for testing).
-
-        Returns:
-            bool: True if this is a duplicate that should be suppressed.
-        """
         if now is None:
             now = time.time()
 
         with self._lock:
-            # Drop expired events from the front of the deque.
             while self._events and now - self._events[0][0] > self.window_sec:
                 self._events.popleft()
 
-            # Same label + same direction + same Y lane still in window?
             for ts, lbl, direc, y in self._events:
                 if lbl == label and direc == direction and \
                    abs(y - y_center) <= self.lane_tolerance_px:
                     return True
 
-            # Not a duplicate - record it for the NEXT call.
             self._events.append((now, label, direction, y_center))
             return False
 
     def reset(self):
-        """
-        Clear the event window between transactions so count events from
-        a previous customer cannot suppress events for a new one.
-        """
         with self._lock:
             self._events.clear()
 
 
-# Global instance. Tune window_sec / lane_tolerance_px here.
 brief_id_lock = BriefIDLock(window_sec=0.5, lane_tolerance_px=80)
 
 # =====================================================================
@@ -1864,30 +1651,8 @@ brief_id_lock = BriefIDLock(window_sec=0.5, lane_tolerance_px=80)
 # =====================================================================
 
 class NetDisplacementCounter:
-    """
-    Commit-on-crossing counter with directional hysteresis, measured along
-    a 2D door->interior axis (EXIT_DIR_X, EXIT_DIR_Y).
-
-    v2.5.2: travel is projected onto the exit-direction unit vector instead
-    of using raw X. This catches deep/left placements whose motion is mostly
-    vertical (and which the X-only version missed) while preserving right-
-    edge behaviour. Setting EXIT_DIR = (1, 0) reproduces the old X-only mode.
-
-    Per counting-camera track we keep an anchor point and the last committed
-    direction. On each observe():
-      proj = (cur - anchor) . exit_dir       # signed travel along the axis
-      if |proj| >= min_px:
-          dir = exit if proj > 0 else entry
-          if dir != last_committed_dir:  -> EMIT count, reset anchor, lock dir
-          else:                          -> advance anchor only (no re-fire)
-
-    Behaviour (same as before, now axis-aware):
-      take-and-keep / plain take    -> 1 exit
-      plain return (any side)       -> 1 entry
-      take-and-put-back             -> exit + entry (nets 0)
-      long single pull              -> 1 count
-      fidget / static shelf item    -> 0
-    """
+    """Commit-on-crossing counter with directional hysteresis, measured
+    along a 2D door->interior axis (EXIT_DIR_X, EXIT_DIR_Y)."""
 
     def __init__(self, min_net_px=120, stale_frames=300,
                  stitch_dist=70, stitch_gap=8):
@@ -1899,7 +1664,6 @@ class NetDisplacementCounter:
         self.frame_no     = 0
         self._lock        = threading.Lock()
 
-        # Normalise the exit-direction vector once.
         norm = (EXIT_DIR_X ** 2 + EXIT_DIR_Y ** 2) ** 0.5
         if norm == 0:
             norm = 1.0
@@ -1907,9 +1671,6 @@ class NetDisplacementCounter:
         self.ey = EXIT_DIR_Y / norm
 
     def _find_stitch(self, global_id, x, y, label):
-        """Find a recently-active DIFFERENT track with the same label near
-        (x, y) - i.e. the same physical item whose ID the tracker churned.
-        Returns its global_id or None. Disabled when stitch_dist <= 0."""
         if self.stitch_dist <= 0:
             return None
         best_gid, best_d = None, self.stitch_dist
@@ -1919,7 +1680,7 @@ class NetDisplacementCounter:
             if t2['label'] != label:
                 continue
             if t2['last_frame'] == self.frame_no:
-                continue  # still active this frame -> a distinct object
+                continue
             if self.frame_no - t2['last_frame'] > self.stitch_gap:
                 continue
             d = abs(x - t2['last_x']) + abs(y - t2['last_y'])
@@ -1944,15 +1705,9 @@ class NetDisplacementCounter:
                     del self.tracks[gid]
 
     def observe(self, global_id, x, y, label, conf=1.0):
-        """Record a detection. Returns a commit event tuple if this
-        observation crosses the threshold in a NEW direction, else None.
-        Event: (global_id, label, direction, proj, x, y, conf)."""
         with self._lock:
             t = self.tracks.get(global_id)
             if t is None:
-                # ID churn re-stitch: if this fresh id is really a churned
-                # continuation of a recent same-label track nearby, inherit
-                # its anchor + direction so displacement keeps accumulating.
                 donor = self._find_stitch(global_id, x, y, label)
                 if donor is not None:
                     d = self.tracks.pop(donor)
@@ -1967,8 +1722,6 @@ class NetDisplacementCounter:
                         'conf':       conf,
                     }
                     t = self.tracks[global_id]
-                    # fall through to the projection check below: the
-                    # preserved anchor may already constitute a crossing.
                 else:
                     self.tracks[global_id] = {
                         'anchor_x':   x,
@@ -1993,12 +1746,10 @@ class NetDisplacementCounter:
                 return None
 
             direction = 'exit' if proj > 0 else 'entry'
-            t['anchor_x'] = x   # reset anchor on any crossing
+            t['anchor_x'] = x
             t['anchor_y'] = y
 
             if direction == t['last_dir']:
-                # same direction as last commit: long continued motion, anchor
-                # already advanced - do NOT count again.
                 return None
 
             t['last_dir'] = direction
@@ -2011,68 +1762,17 @@ class NetDisplacementCounter:
             self.frame_no = 0
 
 
-# Per-camera counter instances. Camera 0 is always the counter. Camera 1 is
-# added only for DUAL_CAMERA_COUNTING (dedicated single-class machine). Each
-# camera keeps its OWN anchors/tracks so the two views can't corrupt each
-# other. Both use the same EXIT_DIR axis and thresholds.
-def _make_counter():
-    return NetDisplacementCounter(
-        min_net_px=NET_DISPLACEMENT_MIN_PX,
-        stale_frames=NET_END_GRACE_FRAMES,
-        stitch_dist=STITCH_DIST_PX,
-        stitch_gap=STITCH_MAX_GAP_FRAMES,
-    )
-
-net_counters = {0: _make_counter(), 1: _make_counter()}
-# Back-compat alias: anything still referring to the single counter uses cam 0.
-net_counter = net_counters[0]
-
-
-# --- Cross-camera merge (single-class dedupe by direction + time) --------
-# Records accepted counts as (timestamp, direction, camera). A commit from
-# one camera is MERGED (suppressed) if the OTHER camera already committed the
-# same direction within DUAL_DEDUPE_WINDOW_SEC. Same-camera repeats are NOT
-# merged here (the counter's own direction-lock handles those), so two real
-# grabs on one camera still both count.
-_dual_recent = deque(maxlen=64)
-_dual_lock   = threading.Lock()
-
-
-def dual_accept(direction, camera_id, now=None):
-    """Return (accept, gap) - accept=False means this commit is the same grab
-    the OTHER camera already counted (merge/suppress). gap = seconds since that
-    other-camera sighting, or None. Records the commit when accepted."""
-    if now is None:
-        now = time.time()
-    with _dual_lock:
-        # prune expired
-        while _dual_recent and now - _dual_recent[0][0] > DUAL_DEDUPE_WINDOW_SEC:
-            _dual_recent.popleft()
-        # look for a same-direction commit from a DIFFERENT camera
-        for ts, d, cam in _dual_recent:
-            if d == direction and cam != camera_id:
-                return (False, now - ts)   # merge: same grab, other camera
-        _dual_recent.append((now, direction, camera_id))
-        return (True, None)
-
-
-def dual_reset():
-    """Clear cross-camera merge state between transactions."""
-    with _dual_lock:
-        _dual_recent.clear()
+net_counter = NetDisplacementCounter(
+    min_net_px=NET_DISPLACEMENT_MIN_PX,
+    stale_frames=NET_END_GRACE_FRAMES,
+    stitch_dist=STITCH_DIST_PX,
+    stitch_gap=STITCH_MAX_GAP_FRAMES,
+)
 
 
 def commit_net_count(user_data, global_id, label, direction,
                      y_center, proj, x_now, conf, source="crossing"):
-    """
-    Apply ONE committed count for a finished track: bump the counter, fire
-    the directional TTS, update validated/invalidated product state, and log.
-
-    BriefIDLock is kept as a backstop only - with once-per-track commits it
-    rarely fires, but it still catches the rare case of two tracks for the
-    same physical item committing in the same direction/lane within its
-    window. center Y is passed for that lane check.
-    """
+    """Apply ONE committed count for a finished track."""
     if brief_id_lock.is_duplicate(label, direction, y_center):
         print(f"[COUNT-SKIP] g={global_id} '{label}' {direction} "
               f"suppressed by brief lock (src={source})")
@@ -2109,8 +1809,6 @@ def commit_net_count(user_data, global_id, label, direction,
           f"axisProj={proj:+d}px @x={x_now} y={y_center} conf={conf:.2f} "
           f"src={source} totE={tot_e} totX={tot_x}")
 
-    # Per-product sanity flag: surface (do NOT clamp) an implausibly high
-    # count for one product in a single transaction - a likely tracking glitch.
     this_count = td.class_counters[direction][label]
     if this_count > SANITY_PER_PRODUCT:
         print(f"[SANITY] '{label}' {direction} count={this_count} exceeds "
@@ -2122,19 +1820,7 @@ def commit_net_count(user_data, global_id, label, direction,
 # =====================================================================
 
 def get_global_track_id(camera_id, local_track_id, features=None, label=None):
-    """
-    Get or create a global track ID for cross-camera tracking.
-
-    v2.2 NOTE: This function is now called with the SMOOTHED label
-    (see get_smoothed_label() above). Feeding the smoothed label here
-    means the (camera_id, local_track_id) -> global_id mapping is
-    stable across single-frame class flickers.
-
-    The label-matching cross-camera fallback is preserved but in v2.2
-    practice the authoritative-counting-camera rule means cross-camera
-    matches no longer affect the count - they only affect on-screen
-    display continuity.
-    """
+    """Get or create a global track ID for cross-camera tracking."""
     global global_track_counter, local_to_global_id_map
     global global_track_labels, active_objects_per_camera
 
@@ -2192,7 +1878,6 @@ def cleanup_inactive_tracks(camera_id, active_local_track_ids):
                 if not active_objects_per_camera[cam_id][label]:
                     del active_objects_per_camera[cam_id][label]
 
-    # v2.2: also drop label history for inactive tracks
     cleanup_label_history(camera_id, active_local_track_ids)
 
 # =====================================================================
@@ -2208,13 +1893,9 @@ def analyze_movement_direction(track_id, center, tracking_data,
 
     global_movement_history[global_id].appendleft((center, camera_id))
 
-    # v2.4: frame floor is now a named constant (was hardcoded 5).
     if len(camera_movement_history[camera_id][track_id]) < DIRECTION_MIN_FRAMES:
         return None
 
-    # CHECK 1: Bounding-box stability
-    # v2.4: gated on the SAME DIRECTION_MIN_FRAMES so that lowering the
-    # floor does not skip jitter filtering on the earliest counts.
     if len(camera_bbox_area_history[camera_id][track_id]) >= DIRECTION_MIN_FRAMES:
         areas    = list(camera_bbox_area_history[camera_id][track_id])
         avg_area = sum(areas) / len(areas)
@@ -2223,10 +1904,6 @@ def analyze_movement_direction(track_id, center, tracking_data,
         if std_dev > avg_area * 0.8:
             return None
 
-    # CHECK 2: Total displacement
-    # NOTE: cameras are mounted top-down looking into the fridge, so
-    # in/out (entry/exit) motion is horizontal (X-axis) in-frame, not
-    # vertical (Y-axis). Index 0 = x, index 1 = y in (cx, cy) centers.
     history            = camera_movement_history[camera_id][track_id]
     first_x            = history[-1][0]
     last_x             = history[0][0]
@@ -2234,7 +1911,6 @@ def analyze_movement_direction(track_id, center, tracking_data,
     if total_displacement < 30:
         return None
 
-    # CHECK 3: Directional consistency
     deltas      = [history[i-1][0] - history[i][0] for i in range(1, len(history))]
     n_positive  = sum(1 for d in deltas if d > 0)
     n_negative  = sum(1 for d in deltas if d < 0)
@@ -2242,14 +1918,12 @@ def analyze_movement_direction(track_id, center, tracking_data,
     if consistency < 0.8:
         return None
 
-    # CHECK 4: Average movement per frame
     avg_movement = sum(deltas) / len(deltas)
     if abs(avg_movement) < 5:
         return None
 
     current_direction = 'exit' if avg_movement > 0 else 'entry'
 
-    # Handle direction reversal (customer changes mind)
     if global_id in global_last_counted_direction:
         if current_direction != global_last_counted_direction[global_id]:
             old_dir = global_last_counted_direction[global_id]
@@ -2264,15 +1938,7 @@ def analyze_movement_direction(track_id, center, tracking_data,
 # =====================================================================
 
 def number_to_words(n):
-    """
-    Convert an integer (1-20) to its spoken word equivalent.
-
-    Args:
-        n (int): Number to convert.
-
-    Returns:
-        str: Word representation, or the digit string for numbers > 20.
-    """
+    """Convert an integer (1-20) to its spoken word equivalent."""
     words = {
         1: "one",   2: "two",      3: "three",  4: "four",
         5: "five",  6: "six",      7: "seven",  8: "eight",
@@ -2288,8 +1954,6 @@ def number_to_words(n):
 
 SPEECH_NAMES: Dict[str, str] = {
     # Add friendlier spoken names for product labels here if needed.
-    # Example:
-    #   "100plus":          "100 plus",
     #   "mangoMilk":        "mango milk",
     #   "kimchiFriedRice":  "kimchi fried rice",
     #   "chickenKatsuCurry":"chicken katsu curry",
@@ -2300,38 +1964,31 @@ SPEECH_NAMES: Dict[str, str] = {
 
 
 class ProductMovementAnnouncer:
-    """
-    Real-time TTS announcer for product entry and exit events.
-    """
+    """Real-time TTS announcer for product entry and exit events."""
 
     def __init__(self):
         self._lock = threading.Lock()
 
     def reset(self):
         """Clear state. Call at the start of each new transaction."""
-        # v2.4: clear the BriefIDLock window so events from a previous
-        # customer can't suppress this customer's first count.
         brief_id_lock.reset()
-        # v2.5: clear net-displacement trajectories and frame clock so a
-        # previous customer's open tracks can't leak into this transaction.
-        # Reset BOTH per-camera counters and the cross-camera merge window.
-        for _c in net_counters.values():
-            _c.reset()
-        dual_reset()
+        net_counter.reset()
         print("[MovementTTS] Announcer reset for new transaction")
 
     def _beep_and_speak(self, text: str, beep_path: str):
-        """
-        Play a beep then speak text. Beep file is direction-specific:
-        BEEP_EXIT_PATH  for "removed" announcements (high tone)
-        BEEP_ENTRY_PATH for "returned" announcements (low tone)
-        """
+        """Play a beep then speak text."""
         def _run():
+            if deposit_alert_active.is_set():
+                print(f"[MovementTTS] Skipped (deposit alert priority): '{text}'")
+                return
             try:
                 if beep_path and os.path.exists(beep_path):
                     tts_manager.play_mp3_sync(beep_path, volume=0.6)
             except Exception as e:
                 print(f"[MovementTTS] Beep error: {e}")
+            if deposit_alert_active.is_set():
+                print(f"[MovementTTS] Skipped speech (deposit alert priority): '{text}'")
+                return
             tts_manager.speak_async(text, lang='en')
 
         threading.Thread(target=_run, daemon=True).start()
@@ -2339,22 +1996,17 @@ class ProductMovementAnnouncer:
     def on_exit(self, label: str):
         spoken_name = SPEECH_NAMES.get(label, label)
         text        = f"one {spoken_name} removed"
-        # High beep for exit - matches "something is leaving" intuition
         self._beep_and_speak(text, BEEP_EXIT_PATH)
         print(f"[MovementTTS] EXIT - '{text}'")
 
     def on_entry(self, label: str):
         spoken_name = SPEECH_NAMES.get(label, label)
         text        = f"one {spoken_name} returned"
-        # Low beep for entry - softer, signals "something came back"
         self._beep_and_speak(text, BEEP_ENTRY_PATH)
         print(f"[MovementTTS] ENTRY - '{text}'")
 
     def speak_closing_summary(self, class_counters: dict):
-        """
-        Speak end-of-transaction summary synchronously (blocks until done).
-        Called from run_tracking() after speak_door_close().
-        """
+        """Speak end-of-transaction summary synchronously (blocks until done)."""
         try:
             all_labels = (set(class_counters["exit"].keys()) |
                           set(class_counters["entry"].keys()))
@@ -2406,18 +2058,13 @@ class ProductMovementAnnouncer:
             print(f"[MovementTTS] Error in closing summary: {e}")
 
     def play_mp3_sync(self, file_path, volume=0.8):
-        """Play an audio file synchronously through pygame (blocking)."""
+        """Play an audio file synchronously (blocking) via tts_manager."""
         try:
-            pygame.mixer.music.load(file_path)
-            pygame.mixer.music.set_volume(volume)
-            pygame.mixer.music.play()
-            while pygame.mixer.music.get_busy():
-                time.sleep(0.1)
+            tts_manager.play_mp3_sync(file_path, volume=volume)
         except Exception as e:
             print(f"[MovementTTS] play_mp3_sync error: {e}")
 
 
-# Global instance
 product_movement_announcer = ProductMovementAnnouncer()
 
 # =====================================================================
@@ -2427,22 +2074,25 @@ product_movement_announcer = ProductMovementAnnouncer()
 def detection_callback(pad, info, callback_data):
     """
     Process each video frame: detect, track, validate, count, announce,
-    and push data to the WebSocket.
+    and (on the record cam) draw + hand the frame to the recorder.
 
-    COUNTING LOGIC (v2.2 -> v2.4):
-      - Per-detection label is smoothed via get_smoothed_label() before
-        being used for global ID lookup, counter increments, validation,
-        TTS, and websocket payload.                                  [v2.2]
-      - Counter increments and TTS calls are gated by
-        stream_id == COUNTING_CAMERA_ID. Camera 1 still tracks/draws. [v2.2]
-      - Direction is trusted only after DIRECTION_MIN_FRAMES of history
-        (named constant, was a hardcoded 5).                         [v2.4]
-      - A final short-window dedupe (brief_id_lock.is_duplicate) keyed
-        on (label, direction, Y-lane) suppresses a can the tracker
-        dropped and re-acquired under a fresh global_id, while letting
-        two distinct same-product cans in different lanes both count. [v2.4]
-      - The Hailo pipeline, the Gst probe wiring, and frame compositing
-        are unchanged.
+    v2.7 SPLIT BY ROLE (this is the choppiness fix):
+      - This probe runs SYNCHRONOUSLY on the GStreamer streaming thread, so
+        its per-frame cost is added straight to that branch's latency. When
+        it overran the ~40ms/frame budget the leaky queues dropped frames -
+        smooth at idle, choppy mid-grab (draw cost scales with item count,
+        and everything used to run on BOTH cameras).
+      - COUNTING_CAMERA_ID (cam_count, stream 0): counts off bbox CENTERS.
+        It pulls NO frame for counting. It pulls a frame only every 15th
+        frame for the cover check.
+      - RECORD_CAMERA_ID (cam_display, stream 1): the only cam pulled every
+        frame, drawn on (boxes + labels, NO trails), and recorded.
+      - Websocket payload + deposit price scan: counting cam only, every 6
+        frames (was 50x/s across both cams).
+
+    Counting behaviour is IDENTICAL to v2.6 - same observe()/commit path.
+    The live ximagesink still shows both cams with boxes (from hailooverlay
+    in the pipeline, not from these cv2 draws).
 
     Returns:
         Gst.PadProbeReturn.OK: Always continue pipeline processing.
@@ -2460,38 +2110,53 @@ def detection_callback(pad, info, callback_data):
     if not all([format, width, height]):
         return Gst.PadProbeReturn.OK
 
-    # STEP 1: Get AI detections from Hailo
+    is_counting = (stream_id == COUNTING_CAMERA_ID)
+    is_record   = (stream_id == RECORD_CAMERA_ID)
+    _cb_seq[stream_id] += 1
+
+    # STEP 1: detections (counting cam counts, record cam draws)
     roi        = hailo.get_roi_from_buffer(buffer)
     detections = roi.get_objects_typed(hailo.HAILO_DETECTION)
 
-    # STEP 2: Get video frame for visualization
-    frame = get_numpy_from_buffer(buffer, format, width, height)
+    # STEP 2: pull pixels ONLY when needed.
+    #   record cam   -> every frame (drawn + recorded)
+    #   counting cam -> every 15th frame, purely for the cover check
+    # Counting works off bbox centers, so cam_count pays no full-frame copy
+    # on the other 14/15 frames. At 1024x576 that copy is ~1.7MB, so this is
+    # the change that matters most on the high-res machines.
+    frame = None
+    if is_record:
+        frame = get_numpy_from_buffer(buffer, format, width, height)
+    elif is_counting and _cb_seq[stream_id] % 15 == 0:
+        frame = get_numpy_from_buffer(buffer, format, width, height)
 
-    # STEP 3: Camera cover detection
-    if is_frame_dark(frame):
-        if not camera_covered:
-            camera_covered = True
-            if cover_alert_thread is None or not cover_alert_thread.is_alive():
-                cover_alert_thread = threading.Thread(
-                    target=handle_cover_alert, daemon=True
-                )
-                cover_alert_thread.start()
-    else:
-        if camera_covered:
-            camera_covered = False
+    # STEP 3: camera-cover detection (throttled). is_frame_dark is a full
+    # cvtColor + mean; ~0.5s alert latency is fine. Runs on whichever cam has
+    # a frame this tick (record cam every 15th frame, counting cam every 15th
+    # frame) - so covering EITHER camera still triggers the alert.
+    if frame is not None and _cb_seq[stream_id] % 15 == 0:
+        if is_frame_dark(frame):
+            if not camera_covered:
+                camera_covered = True
+                if cover_alert_thread is None or not cover_alert_thread.is_alive():
+                    cover_alert_thread = threading.Thread(
+                        target=handle_cover_alert, daemon=True
+                    )
+                    cover_alert_thread.start()
+        else:
+            if camera_covered:
+                camera_covered = False
 
-    # STEP 4: Track active objects for cleanup
+    # STEP 4: track bookkeeping
     active_local_track_ids = set()
 
-    # Advance the net-displacement frame clock for each counting stream.
-    # Camera 0 always counts; camera 1 also counts when dual-camera mode is on.
-    if stream_id == COUNTING_CAMERA_ID or (DUAL_CAMERA_COUNTING and stream_id in net_counters):
-        net_counters[stream_id].tick()
+    if is_counting:
+        net_counter.tick()
 
     if hasattr(user_data, 'transaction_id') and user_data.transaction_id:
         transaction_memory_manager.track_frame(user_data.transaction_id)
 
-    # STEP 5: Process each detection
+    # STEP 5: per-detection
     for detection in detections:
         raw_label  = detection.get_label()
         bbox       = detection.get_bbox()
@@ -2504,20 +2169,12 @@ def detection_callback(pad, info, callback_data):
             track_id = track[0].get_id()
             active_local_track_ids.add(track_id)
 
-        # ----- v2.2 LABEL SMOOTHING -----
-        # Replace the per-frame label with the dominant label across the
-        # last LABEL_HISTORY_LEN frames for this (camera, track). Every
-        # downstream use - global-id lookup, counter increment, validation,
-        # TTS, WebSocket payload - uses the smoothed label.
-        label = get_smoothed_label(stream_id, track_id, raw_label)
-        # --------------------------------
-
-        x1     = int(bbox.xmin() * width)
-        y1     = int(bbox.ymin() * height)
-        x2     = int(bbox.xmax() * width)
-        y2     = int(bbox.ymax() * height)
-        center = (int((x1 + x2) / 2), int((y1 + y2) / 2))
-
+        label     = get_smoothed_label(stream_id, track_id, raw_label)
+        x1        = int(bbox.xmin() * width)
+        y1        = int(bbox.ymin() * height)
+        x2        = int(bbox.xmax() * width)
+        y2        = int(bbox.ymax() * height)
+        center    = (int((x1 + x2) / 2), int((y1 + y2) / 2))
         global_id = get_global_track_id(stream_id, track_id, None, label)
 
         if hasattr(user_data, 'transaction_id') and user_data.transaction_id:
@@ -2525,114 +2182,80 @@ def detection_callback(pad, info, callback_data):
                 user_data.transaction_id, track_id, global_id
             )
 
-        validation_result = user_data.validate_detected_product(label)
-
-        color = compute_color_for_labels(class_id)
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-
-        # v2.2: overlay shows "*" next to label if it was smoothed (i.e.
-        # raw_label != smoothed label) so the operator can see flicker
-        # being suppressed during testing. Remove the asterisk handling
-        # if you want a cleaner display in production.
-        flicker_marker = "" if raw_label == label else "*"
-        label_text = (f"{label}{flicker_marker} L:{track_id} G:{global_id} "
-                      f"{'Valid' if validation_result['valid'] else 'Invalid'}")
-        text_color = (0, 255, 0) if validation_result['valid'] else (0, 0, 255)
-        cv2.putText(frame, label_text, (x1, y1 - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, text_color, 2)
-
-        draw_trail(frame, track_id, center, color, global_id=global_id)
-
-        # STEP 6: Net-displacement accumulation (counting camera only).
-        # v2.5.1: observe() returns a commit event the moment this track's
-        # horizontal travel crosses the threshold in a NEW direction, so we
-        # count mid-motion (works for returns that then sit static). Camera 1
-        # still tracks/draws but never feeds the counter.
-        counts_this_stream = (stream_id == COUNTING_CAMERA_ID) or \
-                             (DUAL_CAMERA_COUNTING and stream_id in net_counters)
-        if counts_this_stream:
-            counter = net_counters[stream_id]
-            if confidence >= COUNT_CONF_MIN:
-                ev = counter.observe(global_id, center[0], center[1],
+        # COUNTING: authoritative cam only, off bbox center (no pixels).
+        if is_counting and confidence >= COUNT_CONF_MIN:
+            ev = net_counter.observe(global_id, center[0], center[1],
                                      label, confidence)
-                if ev:
-                    gid_e, lbl_e, dir_e, proj_e, x_e, y_e, conf_e = ev
-                    if DUAL_CAMERA_COUNTING:
-                        # Merge with the other camera if it just counted the
-                        # same direction (same physical grab seen by both).
-                        accept, gap = dual_accept(dir_e, stream_id)
-                        if accept:
-                            print(f"[DUAL] cam{stream_id} {dir_e} '{lbl_e}' "
-                                  f"COUNTED (first camera to see this grab)")
-                            commit_net_count(user_data, gid_e, lbl_e, dir_e,
-                                             y_e, proj_e, x_e, conf_e,
-                                             source=f"cam{stream_id}")
-                        else:
-                            print(f"[DUAL] cam{stream_id} {dir_e} '{lbl_e}' "
-                                  f"MERGED (other cam counted it {gap:.2f}s ago) "
-                                  f"- not double counted")
-                    else:
-                        commit_net_count(user_data, gid_e, lbl_e, dir_e, y_e,
-                                         proj_e, x_e, conf_e, source="crossing")
-            else:
-                # Dropped from counting as too low-confidence. Throttled log so
-                # you can see how often this happens before raising the floor.
-                if counter.frame_no % 30 == 0:
-                    print(f"[LOWCONF] cam{stream_id} '{label}' conf={confidence:.2f} "
-                          f"< {COUNT_CONF_MIN} @x={center[0]} y={center[1]} "
-                          f"(not fed to counter)")
+            if ev:
+                gid_e, lbl_e, dir_e, proj_e, x_e, y_e, conf_e = ev
+                commit_net_count(user_data, gid_e, lbl_e, dir_e, y_e,
+                                 proj_e, x_e, conf_e, source="crossing")
+        elif is_counting and net_counter.frame_no % 30 == 0:
+            print(f"[LOWCONF] '{label}' conf={confidence:.2f} "
+                  f"< {COUNT_CONF_MIN} @x={center[0]} y={center[1]} "
+                  f"(not fed to counter)")
 
-    # STEP 7: Cleanup inactive tracks (also clears v2.2 label history)
+        # DRAWING: record cam only. Boxes + label, NO trails (trails were the
+        # per-track draw cost that grew worst mid-grab). validate here (record
+        # cam only) rather than per detection on both cams every frame.
+        if is_record and frame is not None:
+            validation_result = user_data.validate_detected_product(label)
+            color = compute_color_for_labels(class_id)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            flicker_marker = "" if raw_label == label else "*"
+            label_text = (f"{label}{flicker_marker} L:{track_id} G:{global_id} "
+                          f"{'Valid' if validation_result['valid'] else 'Invalid'}")
+            text_color = (0, 255, 0) if validation_result['valid'] else (0, 0, 255)
+            cv2.putText(frame, label_text, (x1, y1 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, text_color, 2)
+
+    # STEP 7: cleanup inactive tracks (also clears v2.2 label history)
     cleanup_inactive_tracks(stream_id, active_local_track_ids)
 
-    # STEP 8: Update FPS timestamp
+    # STEP 8: FPS timestamp
     user_data.tracking_data.last_time = time.time()
 
-    # STEP 9: Draw on-screen counters
     current_label = next((det.get_label() for det in detections), None)
-    draw_counts(frame, user_data.tracking_data.class_counters, current_label)
 
-    # STEP 10: Convert RGB -> BGR for OpenCV
-    frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+    # STEP 9-11: counters + colour convert + hand frame to recorder (record cam)
+    if is_record and frame is not None:
+        draw_counts(frame, user_data.tracking_data.class_counters, current_label)
+        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        if NORMALIZE_RECORD_TO_360 and frame.shape[0] > 360:
+            frame = cv2.resize(frame, (640, 360), interpolation=cv2.INTER_AREA)
+        user_data.set_frame(frame)
 
-    # STEP 11: Store frame per camera and combine
-    if stream_id == 0:
-        user_data.frame_left = frame
-    elif stream_id == 1:
-        user_data.frame_right = frame
-
-    if hasattr(user_data, "frame_left") and hasattr(user_data, "frame_right"):
-        combined_frame = np.hstack((user_data.frame_left, user_data.frame_right))
-        user_data.set_frame(combined_frame)
-
-    # STEP 12: Update WebSocket data
-    websocket_data = {
-        "validated_products": {
-            "entry": {
-                product: {"count": d["count"], "product_details": d["product_details"]}
-                for product, d in user_data.tracking_data.validated_products["entry"].items()
+    # STEP 12-13: websocket payload + deposit price check. Shared tracking_data,
+    # so counting cam only + throttled: values change at most once per commit,
+    # and the 1s websocket sender re-pushes regardless. Was 50x/s across both
+    # cams (2 cams * 25fps), now ~4x/s.
+    if is_counting and net_counter.frame_no % 6 == 0:
+        websocket_data = {
+            "validated_products": {
+                "entry": {
+                    product: {"count": d["count"], "product_details": d["product_details"]}
+                    for product, d in user_data.tracking_data.validated_products["entry"].items()
+                },
+                "exit": {
+                    product: {"count": d["count"], "product_details": d["product_details"]}
+                    for product, d in user_data.tracking_data.validated_products["exit"].items()
+                }
             },
-            "exit": {
-                product: {"count": d["count"], "product_details": d["product_details"]}
-                for product, d in user_data.tracking_data.validated_products["exit"].items()
-            }
-        },
-        "invalidated_products": {
-            "entry": {
-                product: {"count": d["count"], "raw_detection": d["raw_detection"]}
-                for product, d in user_data.tracking_data.invalidated_products["entry"].items()
-            },
-            "exit": {
-                product: {"count": d["count"], "raw_detection": d["raw_detection"]}
-                for product, d in user_data.tracking_data.invalidated_products["exit"].items()
+            "invalidated_products": {
+                "entry": {
+                    product: {"count": d["count"], "raw_detection": d["raw_detection"]}
+                    for product, d in user_data.tracking_data.invalidated_products["entry"].items()
+                },
+                "exit": {
+                    product: {"count": d["count"], "raw_detection": d["raw_detection"]}
+                    for product, d in user_data.tracking_data.invalidated_products["exit"].items()
+                }
             }
         }
-    }
-    user_data.tracking_data.websocket_data_manager.update_data(websocket_data)
+        user_data.tracking_data.websocket_data_manager.update_data(websocket_data)
 
-    # STEP 13: Price check and deposit alert
-    current_data = user_data.tracking_data.websocket_data_manager.get_current_data()
-    calculate_total_price_and_control_buzzer(current_data, user_data.deposit, current_label)
+        current_data = user_data.tracking_data.websocket_data_manager.get_current_data()
+        calculate_total_price_and_control_buzzer(current_data, user_data.deposit, current_label)
 
     return Gst.PadProbeReturn.OK
 
@@ -2641,9 +2264,7 @@ def detection_callback(pad, info, callback_data):
 # =====================================================================
 
 async def run_tracking(websocket: WebSocket):
-    """
-    Orchestrate the full lifecycle of one customer transaction.
-    """
+    """Orchestrate the full lifecycle of one customer transaction."""
     global unlock_data, done, current_pipeline_app
 
     unlock_data        = 0
@@ -2678,18 +2299,10 @@ async def run_tracking(websocket: WebSocket):
                           f"machine: {machine_id}, user: {user_id}, "
                           f"tx: {transaction_id}")
 
-                    # --------------------------------------------------
-                    # MQTT: connect now that machine_id is confirmed.
-                    # store_machine_id_env() will be called inside
-                    # HailoDetectionCallback, so os.environ['MACHINE_ID']
-                    # is set before mqtt_client.connect() resolves topics.
-                    # We set it here explicitly for the MQTT LWT topic.
-                    # --------------------------------------------------
                     if machine_id:
                         os.environ['MACHINE_ID'] = str(machine_id)
                     if mqtt_client is not None:
                         mqtt_client.connect()
-                    # --------------------------------------------------
 
                     break
                 else:
@@ -2746,10 +2359,6 @@ async def run_tracking(websocket: WebSocket):
                 transaction_memory_manager.start_transaction(transaction_id)
                 print(f"[Memory] Transaction {transaction_id} started")
 
-            # Reset movement announcer for this transaction
-            # v2.4: announcer.reset() now also clears the BriefIDLock
-            # window, so a previous customer's events cannot suppress
-            # this customer's first count.
             product_movement_announcer.reset()
 
             door_monitor_active = True
@@ -2812,21 +2421,12 @@ async def run_tracking(websocket: WebSocket):
 
             detection_app.run()
 
-            # ---------------------------------------------------------
-            # DOOR CLOSE TTS + CLOSING SUMMARY
-            # Both called here inside run_tracking, before the websocket
-            # finally block, so cleanup_websocket_sounds() cannot
-            # call stop_all_audio() and cut off the audio.
-            # speak_door_close() blocks until done, then
-            # speak_closing_summary() generates and plays the summary.
-            # ---------------------------------------------------------
             tts_manager.speak_door_close()
 
             if 'callback' in locals() and hasattr(callback, 'tracking_data'):
                 product_movement_announcer.speak_closing_summary(
                     callback.tracking_data.class_counters
                 )
-            # ---------------------------------------------------------
 
             if transaction_id:
                 transaction_memory_manager.end_transaction(transaction_id)
@@ -2863,13 +2463,8 @@ async def run_tracking(websocket: WebSocket):
         if 'detection_app' in locals():
             detection_app.pipeline.set_state(Gst.State.NULL)
 
-        # --------------------------------------------------------------
-        # MQTT: disconnect cleanly after tracking ends.
-        # This publishes "offline" explicitly before the LWT fires.
-        # --------------------------------------------------------------
         if mqtt_client is not None:
             mqtt_client.disconnect()
-        # --------------------------------------------------------------
 
         cv2.destroyAllWindows()
 
@@ -3127,7 +2722,6 @@ class TransactionMemoryManager:
                 global_movement_history[gid].clear()
                 del global_movement_history[gid]
 
-        # v2.2: also clear label-history entries belonging to this txn
         for key in list(track_label_history.keys()):
             _, local_id = key
             if local_id in tracks:
@@ -3235,7 +2829,6 @@ class TransactionMemoryManager:
         print("="*60 + "\n")
 
 
-# Global instance
 transaction_memory_manager = TransactionMemoryManager()
 
 # =====================================================================
@@ -3245,8 +2838,8 @@ transaction_memory_manager = TransactionMemoryManager()
 class TTSManager:
 
     def __init__(self):
-        self.tts_lock           = Lock()
         self.audio_lock         = Lock()
+        self.tts_lock           = self.audio_lock
         self.deposit_sounds_dir = "sounds/deposits"
         self.init_audio_player()
 
@@ -3430,6 +3023,39 @@ class TTSManager:
             except Exception:
                 pass
 
+    def speak_deposit_sync(self, label):
+        """Blocking version of speak_deposit()."""
+        try:
+            if isinstance(label, str) and "," in label:
+                label = [item.strip() for item in label.split(",")]
+
+            filepath = self.generate_deposit_audio_file(label)
+
+            if filepath and os.path.exists(filepath):
+                self.play_mp3_sync(filepath, volume=0.8)
+            else:
+                if isinstance(label, str):
+                    text = f"Deposit exceeded. Please return the {label} immediately"
+                elif isinstance(label, (list, tuple)):
+                    if len(label) == 1:
+                        text = f"Deposit exceeded. Please return the {label[0]} immediately"
+                    elif len(label) == 2:
+                        text = (f"Deposit exceeded. Please return the "
+                                f"{label[0]} and {label[1]} immediately")
+                    else:
+                        items_text = ", ".join(label[:-1]) + f", and {label[-1]}"
+                        text = f"Deposit exceeded. Please return the {items_text} immediately"
+                else:
+                    text = f"Deposit exceeded. Please return the {label} immediately"
+                self.speak_sync(text)
+
+        except Exception as e:
+            print(f"Error in speak_deposit_sync: {e}")
+            try:
+                self.speak_sync("Deposit exceeded. Please return the items immediately")
+            except Exception:
+                pass
+
     def generate_door_audio_files(self):
         try:
             gTTS(text="Open the door",        lang='en', slow=False).save("sounds/door_open.mp3")
@@ -3461,6 +3087,22 @@ class TTSManager:
                     self.fallback_speak(text)
 
         threading.Thread(target=_speak, daemon=True).start()
+
+    def speak_sync(self, text, lang='en'):
+        """Blocking version of speak_async()."""
+        with self.tts_lock:
+            try:
+                tts = gTTS(text=text, lang=lang, slow=False)
+                buf = io.BytesIO()
+                tts.write_to_fp(buf)
+                buf.seek(0)
+                pygame.mixer.music.load(buf)
+                pygame.mixer.music.play()
+                while pygame.mixer.music.get_busy():
+                    time.sleep(0.1)
+            except Exception as e:
+                print(f"gTTS error: {e}")
+                self.fallback_speak(text)
 
     def speak_english(self, text):
         self.speak_async(text, lang='en')
@@ -3502,7 +3144,6 @@ class TTSManager:
             pass
 
 
-# Global TTS manager instance
 tts_manager = TTSManager()
 
 # =====================================================================
@@ -3600,10 +3241,7 @@ async def websocket_endpoint(websocket: WebSocket):
         if transaction_memory_manager.global_stats['total_transactions'] % 10 == 0:
             transaction_memory_manager.print_stats()
 
-        try:
-            await websocket.close()
-        except RuntimeError:
-            pass  # already closed by the client or an earlier teardown step
+        await websocket.close()
         print("WebSocket connection closed")
 
 # =====================================================================
@@ -3673,6 +3311,7 @@ def main():
 
     print("Creating required directories...")
     os.makedirs('saved_videos',    exist_ok=True)
+    os.makedirs(FAILED_UPLOAD_VIDEO_DIR, exist_ok=True)
     os.makedirs('camera_images',   exist_ok=True)
     os.makedirs('sounds',          exist_ok=True)
     os.makedirs('sounds/deposits', exist_ok=True)
@@ -3699,23 +3338,17 @@ def main():
 
     print("[Memory] Transaction memory management initialised")
 
-    # ------------------------------------------------------------------
-    # MQTT SETUP
-    # Set machine ID in environment so mqtt_client topics resolve
-    # correctly from the moment connect() is called.
-    # ------------------------------------------------------------------
     os.environ['MACHINE_ID'] = str(MQTT_MACHINE_ID)
     mqtt_client = MQTTClient()
     mqtt_client.connect()
     print(f"[MQTT] Client created and connected for machine_id={MQTT_MACHINE_ID}")
-    # ------------------------------------------------------------------
 
     atexit.register(GPIO.cleanup)
     atexit.register(lambda: mqtt_client.disconnect() if mqtt_client else None)
     print("GPIO and MQTT cleanup handlers registered")
 
     print("\n" + "="*60)
-    print("SMART FRIDGE SYSTEM STARTED (v2.6)")
+    print("SMART FRIDGE SYSTEM STARTED (v2.7 / 1024x576)")
     print("="*60)
     print(f"Memory at startup: {psutil.Process().memory_info().rss / 1024 / 1024:.1f}MB")
     print(f"Available memory:  {psutil.virtual_memory().available / 1024 / 1024:.1f}MB")
@@ -3725,20 +3358,11 @@ def main():
     print(f"MQTT machine ID:   {MQTT_MACHINE_ID}")
     print(f"MQTT topics:       AIfridge/{MQTT_MACHINE_ID}/rpi/connectionStatus")
     print(f"                   AIfridge/{MQTT_MACHINE_ID}/rpi/doorStatus")
-    if DUAL_CAMERA_COUNTING:
-        print(f"Counting mode:     DUAL-CAMERA (cam 0 + cam 1, single-class)")
-        print(f"                   merge window={DUAL_DEDUPE_WINDOW_SEC}s "
-              f"(shared grab counts once)")
-    else:
-        print(f"Counting camera:   {COUNTING_CAMERA_ID}  (other cameras: display only)")
+    print(f"Capture res:       1024x576 @ 25fps (both cameras)")
+    print(f"Counting camera:   {COUNTING_CAMERA_ID}  (cam_count, top-down)")
+    print(f"Record camera:     {RECORD_CAMERA_ID}  (cam_display, review angle)")
+    print(f"Record normalize:  {'640x360' if NORMALIZE_RECORD_TO_360 else 'native 576'}")
 
-    # Resolve the udev symlinks so the banner shows which real /dev/videoN
-    # the counting/display cameras landed on THIS boot. The symlinks are
-    # serial-pinned (see /etc/udev/rules.d/99-fridge-cameras.rules), so the
-    # videoN target may differ each reboot but cam_count always = the top
-    # (counting) camera. A "MISSING" here means udev did not bind - the
-    # pipeline would then fail to open the source, so this is the early
-    # warning instead of a silent miscount.
     for nick in ("/dev/cam_count", "/dev/cam_display"):
         try:
             if os.path.islink(nick) or os.path.exists(nick):
@@ -3778,5 +3402,5 @@ if __name__ == "__main__":
     main()
 
 # =====================================================================
-# END OF SMART FRIDGE DETECTION SYSTEM v2.4
+# END OF SMART FRIDGE DETECTION SYSTEM v2.7 (1024x576)
 # =====================================================================
